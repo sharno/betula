@@ -1,0 +1,20 @@
+[package]
+name = "betula-bench"
+version = "0.1.0"
+description = "Benchmarks betula against SlateDB on an S3-compatible store"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+betula.workspace = true
+bytes.workspace = true
+clap.workspace = true
+futures.workspace = true
+hdrhistogram.workspace = true
+object_store.workspace = true
+slatedb.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true

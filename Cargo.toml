@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/betula", "crates/betula-bench"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+betula = { path = "crates/betula" }
+anyhow = "1"
+async-trait = "0.1"
+bytes = { version = "1.12", features = ["serde"] }
+clap = { version = "4.6", features = ["derive", "env"] }
+crc32fast = "1.5"
+futures = "0.3"
+hdrhistogram = "7.5"
+imbl = "7"
+object_store = { version = "0.14.2", features = ["aws"] }
+parking_lot = "0.12"
+postcard = { version = "1.1", features = ["use-std"] }
+proptest = "1.7"
+quick_cache = "0.7"
+serde = { version = "1", features = ["derive", "rc"] }
+slatedb = "0.18.1"
+thiserror = "2"
+tokio = { version = "1.47", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+debug = 1

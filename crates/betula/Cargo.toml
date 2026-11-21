@@ -1,0 +1,24 @@
+[package]
+name = "betula"
+version = "0.1.0"
+description = "Copy-on-write B-epsilon tree on object storage"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+crc32fast.workspace = true
+futures.workspace = true
+imbl.workspace = true
+object_store.workspace = true
+parking_lot.workspace = true
+postcard.workspace = true
+quick_cache.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+object_store = { workspace = true }
