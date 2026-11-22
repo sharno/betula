@@ -125,10 +125,14 @@ impl ObjectStore for Metered {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        // Counted as one put; part bytes are not tracked.
+        // One PUT per part (that's how stores bill multipart uploads), with
+        // the part's bytes.
         self.pause().await;
-        Self::add(&self.counters.puts, 1);
-        self.inner.put_multipart_opts(location, opts).await
+        let inner = self.inner.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(MeteredUpload {
+            inner,
+            counters: self.counters.clone(),
+        }))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
@@ -199,5 +203,28 @@ impl ObjectStore for Metered {
         self.pause().await;
         Self::add(&self.counters.copies, 1);
         self.inner.copy_opts(from, to, options).await
+    }
+}
+
+#[derive(Debug)]
+struct MeteredUpload {
+    inner: Box<dyn MultipartUpload>,
+    counters: Arc<Counters>,
+}
+
+#[async_trait]
+impl MultipartUpload for MeteredUpload {
+    fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        Metered::add(&self.counters.puts, 1);
+        Metered::add(&self.counters.put_bytes, data.content_length() as u64);
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> Result<PutResult> {
+        self.inner.complete().await
+    }
+
+    async fn abort(&mut self) -> Result<()> {
+        self.inner.abort().await
     }
 }

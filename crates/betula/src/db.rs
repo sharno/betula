@@ -430,6 +430,7 @@ impl Shared {
         app.next_segment = out.leaves.next();
         let msgs = view.tails.mem().to_sorted_vec();
         let msg_count = msgs.len();
+        let msg_bytes = view.tails.mem().bytes();
         let plan = tree::apply(
             &self.nodes,
             &self.cfg.tree,
@@ -475,10 +476,14 @@ impl Shared {
         .await?
         {
             Publish::Published => {
+                let bytes_of = |id: SegmentId| new.iter().find(|(s, _)| *s == id).map_or(0, |(_, b)| *b);
                 tracing::debug!(
                     manifest = next_id.0,
                     msgs = msg_count,
-                    segment_bytes = new.iter().map(|(_, b)| b).sum::<u64>(),
+                    msg_bytes,
+                    inner_bytes = bytes_of(out.inner),
+                    leaf_bytes = bytes_of(out.leaves),
+                    moved_bytes = victims.iter().map(|v| view.manifest.segments.get(v).map_or(0, |u| u.live)).sum::<u64>(),
                     freed = plan.freed.len(),
                     victims = victims.len(),
                     elapsed = ?started.elapsed(),
