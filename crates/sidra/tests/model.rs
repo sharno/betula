@@ -13,17 +13,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use betula::{
-    ApplierRole, CacheConfig, CheckpointConfig, CleanerConfig, Clock, Db, DbReader, Durability,
-    Error, Gc, KeyRange, LeaseConfig, PollConfig, ReaderSettings, SegmentId, Settings, TreeConfig,
-    WalConfig, Warm, WriteBatch, WriteOptions,
-};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use proptest::prelude::*;
+use sidra::{
+    ApplierRole, CacheConfig, CheckpointConfig, CleanerConfig, Clock, Db, DbReader, Durability,
+    Error, Gc, KeyRange, LeaseConfig, PollConfig, ReaderSettings, SegmentId, Settings, TreeConfig,
+    WalConfig, Warm, WriteBatch, WriteOptions,
+};
 
 const ROOT: &str = "db";
 const WRITERS: usize = 3;
@@ -76,7 +76,7 @@ fn tiny_config() -> Settings {
             interval: Duration::from_millis(5),
             max_interval: Duration::from_millis(20),
             discovery_interval: Duration::from_millis(20),
-            follow: betula::Follow::AllWriters,
+            follow: sidra::Follow::AllWriters,
         },
         lease: LeaseConfig {
             interval: Duration::from_millis(5),
@@ -598,7 +598,7 @@ async fn manifest_only_writers_see_others_after_apply() {
     let clock = ManualClock::new();
     let applier = open(&os, &clock).await;
     let mut cfg = tiny_config();
-    cfg.poll.follow = betula::Follow::ManifestOnly;
+    cfg.poll.follow = sidra::Follow::ManifestOnly;
     cfg.applier = ApplierRole::Never;
     let quiet = Db::builder(ROOT, os.clone())
         .with_settings(cfg)
@@ -614,8 +614,8 @@ async fn manifest_only_writers_see_others_after_apply() {
         None,
         "not pulled before apply"
     );
-    let fresh = betula::ReadOptions {
-        freshness: betula::Freshness::Latest,
+    let fresh = sidra::ReadOptions {
+        freshness: sidra::Freshness::Latest,
     };
     assert_eq!(
         quiet.get_with("k", fresh).await.unwrap().as_deref(),

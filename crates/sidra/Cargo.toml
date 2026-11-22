@@ -1,5 +1,5 @@
 [package]
-name = "betula"
+name = "sidra"
 version = "0.1.0"
 description = "Copy-on-write B-epsilon tree on object storage"
 edition.workspace = true

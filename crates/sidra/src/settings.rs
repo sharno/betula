@@ -1,8 +1,8 @@
 //! Settings for writers and readers. Every field has a default, so a config
 //! file or the environment only needs to name what it changes.
 //!
-//! Sources, later ones winning: defaults, then a TOML file (`BETULA_CONFIG`
-//! or an explicit path), then `BETULA_*` environment variables, with `__`
+//! Sources, later ones winning: defaults, then a TOML file (`SIDRA_CONFIG`
+//! or an explicit path), then `SIDRA_*` environment variables, with `__`
 //! separating sections:
 //!
 //! ```toml
@@ -14,7 +14,7 @@
 //! ```
 //!
 //! ```sh
-//! BETULA_WAL__FLUSH_INTERVAL=20ms BETULA_APPLIER__MODE=never
+//! SIDRA_WAL__FLUSH_INTERVAL=20ms SIDRA_APPLIER__MODE=never
 //! ```
 
 use std::path::Path;
@@ -30,8 +30,8 @@ use crate::nodes::{CacheConfig, Warm};
 use crate::segments::CleanerConfig;
 use crate::tree::TreeConfig;
 
-const ENV_PREFIX: &str = "BETULA_";
-const CONFIG_FILE_VAR: &str = "BETULA_CONFIG";
+const ENV_PREFIX: &str = "SIDRA_";
+const CONFIG_FILE_VAR: &str = "SIDRA_CONFIG";
 
 /// Writer settings.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -102,8 +102,8 @@ impl Default for ReaderSettings {
 macro_rules! loaders {
     ($ty:ty) => {
         impl $ty {
-            /// Defaults, then the file named by `BETULA_CONFIG` if set, then
-            /// `BETULA_*` environment variables.
+            /// Defaults, then the file named by `SIDRA_CONFIG` if set, then
+            /// `SIDRA_*` environment variables.
             pub fn load() -> Result<Self> {
                 let figment = Figment::from(Serialized::defaults(Self::default()));
                 let figment = match std::env::var_os(CONFIG_FILE_VAR) {
@@ -113,7 +113,7 @@ macro_rules! loaders {
                 extract(figment.merge(Env::prefixed(ENV_PREFIX).split("__")))
             }
 
-            /// Defaults, then `path`, then `BETULA_*` environment variables.
+            /// Defaults, then `path`, then `SIDRA_*` environment variables.
             pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
                 extract(
                     Figment::from(Serialized::defaults(Self::default()))

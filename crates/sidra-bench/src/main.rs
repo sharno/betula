@@ -1,4 +1,4 @@
-//! Benchmarks betula against SlateDB on an S3-compatible store (e.g. RustFS).
+//! Benchmarks sidra against SlateDB on an S3-compatible store (e.g. RustFS).
 
 mod engine;
 mod metered;
@@ -16,21 +16,21 @@ use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 
-use engine::{BetulaParams, Engine, EngineKind};
+use engine::{Engine, EngineKind, SidraParams};
 use metered::{Counters, Metered};
 
 #[derive(Parser, Debug)]
-#[command(about = "Benchmark betula vs SlateDB on an S3-compatible store")]
+#[command(about = "Benchmark sidra vs SlateDB on an S3-compatible store")]
 struct Args {
     #[arg(long, default_value = "http://127.0.0.1:9100")]
     endpoint: String,
     #[arg(long, default_value = "bench")]
     bucket: String,
-    #[arg(long, env = "BENCH_ACCESS_KEY", default_value = "betula")]
+    #[arg(long, env = "BENCH_ACCESS_KEY", default_value = "sidra")]
     access_key: String,
-    #[arg(long, env = "BENCH_SECRET_KEY", default_value = "betula-secret")]
+    #[arg(long, env = "BENCH_SECRET_KEY", default_value = "sidra-secret")]
     secret_key: String,
-    #[arg(long, value_delimiter = ',', default_values = ["betula", "slatedb"])]
+    #[arg(long, value_delimiter = ',', default_values = ["sidra", "slatedb"])]
     engines: Vec<EngineKind>,
     /// Keys loaded before the read phases.
     #[arg(long, default_value_t = 200_000)]
@@ -61,29 +61,29 @@ struct Args {
     internal_kib: usize,
     #[arg(long, default_value_t = 32)]
     fanout: usize,
-    /// betula: load buffered runs in the background on open instead of
+    /// sidra: load buffered runs in the background on open instead of
     /// before returning.
     #[arg(long)]
     warm_background: bool,
-    /// betula: buffered runs per child before it is flushed.
+    /// sidra: buffered runs per child before it is flushed.
     #[arg(long, default_value_t = 16)]
     max_runs: usize,
     #[arg(long, default_value_t = 16)]
     memtable_mib: usize,
-    /// betula cache split. Defaults total 640 MiB, the same as SlateDB's
+    /// sidra cache split. Defaults total 640 MiB, the same as SlateDB's
     /// default block + metadata caches.
     #[arg(long, default_value_t = 256)]
     inner_cache_mib: u64,
     #[arg(long, default_value_t = 384)]
     leaf_cache_mib: u64,
-    /// Concurrent betula writers on the database (clients are spread across
+    /// Concurrent sidra writers on the database (clients are spread across
     /// them). SlateDB allows one.
     #[arg(long, default_value_t = 1)]
     writers: usize,
-    /// How often betula writers poll for each other's entries.
+    /// How often sidra writers poll for each other's entries.
     #[arg(long, default_value_t = 100)]
     poll_ms: u64,
-    /// Cross-writer visibility samples (betula, 2+ writers).
+    /// Cross-writer visibility samples (sidra, 2+ writers).
     #[arg(long, default_value_t = 100)]
     visibility_samples: u64,
     /// Seconds of mixed reads and writes after the other phases (0: skip).
@@ -99,7 +99,7 @@ struct Args {
     /// Width of the windows in the mixed phase's read-latency timeline.
     #[arg(long, default_value_t = 30)]
     mixed_window_secs: u64,
-    /// betula cleans segments whose live fraction is below this.
+    /// sidra cleans segments whose live fraction is below this.
     #[arg(long, default_value_t = 0.25)]
     clean_below: f64,
 }
@@ -258,12 +258,20 @@ async fn mixed_phase(
             tokio::spawn(async move {
                 let mut reads = Histogram::<u64>::new(3)?;
                 let mut writes = Histogram::<u64>::new(3)?;
-                let mut per_window: Vec<Histogram<u64>> = (0..windows)
-                    .map(|_| Histogram::new(3))
+                // Per window: (reads, writes).
+                let mut timeline: Vec<(Histogram<u64>, Histogram<u64>)> = (0..windows)
+                    .map(|_| {
+                        Ok::<_, hdrhistogram::CreationError>((
+                            Histogram::new(3)?,
+                            Histogram::new(3)?,
+                        ))
+                    })
                     .collect::<Result<_, _>>()?;
                 while Instant::now() < deadline {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let t = Instant::now();
+                    let w = ((t.duration_since(started).as_secs() / window.as_secs()) as usize)
+                        .min(windows - 1);
                     if reader {
                         let id = wl.random_id(7, i);
                         // Concurrent updates make any version valid; it must
@@ -271,18 +279,19 @@ async fn mixed_phase(
                         ensure!(db.get(&wl.key(id)).await?.is_some(), "key {id} lost");
                         let us = t.elapsed().as_micros() as u64;
                         reads.record(us)?;
-                        let w = (t.duration_since(started).as_secs() / window.as_secs()) as usize;
-                        per_window[w.min(windows - 1)].record(us)?;
+                        timeline[w].0.record(us)?;
                     } else {
                         let pairs = (0..batch)
                             .map(|j| wl.random_id(11, i * batch + j))
                             .map(|id| (wl.key(id), wl.value(id, 2 + i % 7)))
                             .collect();
                         db.write(i, pairs).await?;
-                        writes.record(t.elapsed().as_micros() as u64)?;
+                        let us = t.elapsed().as_micros() as u64;
+                        writes.record(us)?;
+                        timeline[w].1.record(us)?;
                     }
                 }
-                Ok::<_, anyhow::Error>((reads, writes, per_window))
+                Ok::<_, anyhow::Error>((reads, writes, timeline))
             })
         })
         .collect();
@@ -290,32 +299,33 @@ async fn mixed_phase(
     let elapsed = started.elapsed();
     let mut reads = Histogram::<u64>::new(3)?;
     let mut writes = Histogram::<u64>::new(3)?;
-    let mut per_window: Vec<Histogram<u64>> = (0..windows)
-        .map(|_| Histogram::new(3))
+    let mut timeline: Vec<(Histogram<u64>, Histogram<u64>)> = (0..windows)
+        .map(|_| Ok::<_, hdrhistogram::CreationError>((Histogram::new(3)?, Histogram::new(3)?)))
         .collect::<Result<_, _>>()?;
     for r in results {
-        let (r, w, pw) = r?;
+        let (r, w, tl) = r?;
         reads.add(r)?;
         writes.add(w)?;
-        for (acc, h) in per_window.iter_mut().zip(pw) {
-            acc.add(h)?;
+        for ((ar, aw), (hr, hw)) in timeline.iter_mut().zip(tl) {
+            ar.add(hr)?;
+            aw.add(hw)?;
         }
     }
     eprintln!(
-        "[{}] mixed read latency by {}s window: reads/s p50 p99 p99.9 (ms)",
+        "[{}] mixed timeline by {}s window: reads/s, read p99 ms, write p50 / p99 ms",
         kind.name(),
         window.as_secs()
     );
-    for (w, h) in per_window.iter().enumerate() {
-        let ms = |q: f64| h.value_at_quantile(q) as f64 / 1000.0;
+    for (w, (r, wr)) in timeline.iter().enumerate() {
+        let ms = |h: &Histogram<u64>, q: f64| h.value_at_quantile(q) as f64 / 1000.0;
         eprintln!(
-            "[{}]   {:>4}s {:>8.0} {:>7.2} {:>7.2} {:>7.2}",
+            "[{}]   {:>4}s {:>8.0} {:>7.2}   {:>7.1} {:>7.1}",
             kind.name(),
             w as u64 * window.as_secs(),
-            h.len() as f64 / window.as_secs_f64(),
-            ms(0.5),
-            ms(0.99),
-            ms(0.999)
+            r.len() as f64 / window.as_secs_f64(),
+            ms(r, 0.99),
+            ms(wr, 0.5),
+            ms(wr, 0.99)
         );
     }
     let io = counters.snapshot();
@@ -413,7 +423,7 @@ async fn bench_engine(
     let counters: Arc<Counters> = metered.counters.clone();
     let os: Arc<dyn ObjectStore> = metered;
     let path = format!("runs/{}-{}", kind.name(), unique());
-    let params = BetulaParams {
+    let params = SidraParams {
         leaf_bytes: args.leaf_kib << 10,
         internal_bytes: args.internal_kib << 10,
         fanout: args.fanout,
@@ -424,13 +434,13 @@ async fn bench_engine(
         poll: Duration::from_millis(args.poll_ms),
         max_runs: args.max_runs,
         warm: if args.warm_background {
-            betula::Warm::Background
+            sidra::Warm::Background
         } else {
-            betula::Warm::Blocking
+            sidra::Warm::Blocking
         },
     };
     let writers = match kind {
-        EngineKind::Betula => args.writers,
+        EngineKind::Sidra => args.writers,
         EngineKind::Slatedb => 1,
     };
     let c = args.concurrency;

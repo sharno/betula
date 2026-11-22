@@ -1,17 +1,17 @@
 [package]
-name = "betula-cli"
+name = "sidra-cli"
 version = "0.1.0"
-description = "Command-line tool for betula databases"
+description = "Command-line tool for sidra databases"
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "betula"
+name = "sidra"
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-betula.workspace = true
+sidra.workspace = true
 clap.workspace = true
 futures.workspace = true
 humantime-serde.workspace = true

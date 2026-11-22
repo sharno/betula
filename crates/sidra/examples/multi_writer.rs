@@ -5,11 +5,11 @@
 
 use std::sync::Arc;
 
-use betula::{Db, DbReader, Freshness, ReadOptions};
 use object_store::memory::InMemory;
+use sidra::{Db, DbReader, Freshness, ReadOptions};
 
 #[tokio::main]
-async fn main() -> betula::Result<()> {
+async fn main() -> sidra::Result<()> {
     // One shared store so the writers see each other; with S3 each process
     // would simply open the same URL.
     let store = Arc::new(InMemory::new());
@@ -27,7 +27,7 @@ async fn main() -> betula::Result<()> {
                     db.put(format!("order:{w}:{i:03}"), format!("writer {w}"))
                         .await?;
                 }
-                Ok::<_, betula::Error>(db)
+                Ok::<_, sidra::Error>(db)
             })
         })
         .collect();

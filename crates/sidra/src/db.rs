@@ -476,7 +476,8 @@ impl Shared {
         .await?
         {
             Publish::Published => {
-                let bytes_of = |id: SegmentId| new.iter().find(|(s, _)| *s == id).map_or(0, |(_, b)| *b);
+                let bytes_of =
+                    |id: SegmentId| new.iter().find(|(s, _)| *s == id).map_or(0, |(_, b)| *b);
                 tracing::debug!(
                     manifest = next_id.0,
                     msgs = msg_count,

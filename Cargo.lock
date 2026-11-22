@@ -212,59 +212,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
-name = "betula"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "crc32fast",
- "figment",
- "futures",
- "humantime-serde",
- "imbl",
- "object_store",
- "parking_lot",
- "postcard",
- "proptest",
- "quick_cache",
- "serde",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "betula-bench"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "betula",
- "bytes",
- "clap",
- "futures",
- "hdrhistogram",
- "object_store",
- "slatedb",
- "tokio",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "betula-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "betula",
- "clap",
- "futures",
- "humantime-serde",
- "serde",
- "tokio",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2642,6 +2589,59 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "sidra"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32fast",
+ "figment",
+ "futures",
+ "humantime-serde",
+ "imbl",
+ "object_store",
+ "parking_lot",
+ "postcard",
+ "proptest",
+ "quick_cache",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "sidra-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "clap",
+ "futures",
+ "hdrhistogram",
+ "object_store",
+ "sidra",
+ "slatedb",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sidra-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "humantime-serde",
+ "serde",
+ "sidra",
+ "tokio",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "signal-hook-registry"

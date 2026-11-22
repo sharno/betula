@@ -9,40 +9,40 @@ use slatedb::config::{FlushOptions, FlushType};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum EngineKind {
-    Betula,
+    Sidra,
     Slatedb,
 }
 
 impl EngineKind {
     pub fn name(self) -> &'static str {
         match self {
-            EngineKind::Betula => "betula",
+            EngineKind::Sidra => "sidra",
             EngineKind::Slatedb => "slatedb",
         }
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct BetulaParams {
+pub struct SidraParams {
     pub leaf_bytes: usize,
     pub internal_bytes: usize,
     pub fanout: usize,
     pub memtable_bytes: usize,
-    /// betula's split of the cache budget. SlateDB keeps its defaults:
+    /// sidra's split of the cache budget. SlateDB keeps its defaults:
     /// 512 MiB block cache + 128 MiB metadata cache.
     pub inner_cache_bytes: u64,
     pub leaf_cache_bytes: u64,
     pub clean_below_live: f64,
-    /// How often betula writers poll for each other's entries.
+    /// How often sidra writers poll for each other's entries.
     pub poll: Duration,
     pub max_runs: usize,
-    pub warm: betula::Warm,
+    pub warm: sidra::Warm,
 }
 
 pub enum Engine {
     /// Several concurrent writers on one database. The first opened takes
     /// the applier role and serves reads, so its cache is the warm one.
-    Betula(Vec<betula::Db>),
+    Sidra(Vec<sidra::Db>),
     Slatedb(slatedb::Db),
 }
 
@@ -51,53 +51,53 @@ impl Engine {
         kind: EngineKind,
         os: Arc<dyn ObjectStore>,
         path: &str,
-        params: &BetulaParams,
+        params: &SidraParams,
         writers: usize,
     ) -> Result<Self> {
         Ok(match kind {
-            EngineKind::Betula => {
-                let defaults = betula::Settings::default();
-                let cfg = betula::Settings {
-                    tree: betula::TreeConfig {
+            EngineKind::Sidra => {
+                let defaults = sidra::Settings::default();
+                let cfg = sidra::Settings {
+                    tree: sidra::TreeConfig {
                         leaf_max_bytes: params.leaf_bytes,
                         internal_max_bytes: params.internal_bytes,
                         max_fanout: params.fanout,
                         max_runs_per_child: params.max_runs,
                     },
-                    cache: betula::CacheConfig {
+                    cache: sidra::CacheConfig {
                         inner_bytes: params.inner_cache_bytes,
                         leaf_bytes: params.leaf_cache_bytes,
                     },
                     // Same WAL flush interval as SlateDB's default.
-                    wal: betula::WalConfig {
+                    wal: sidra::WalConfig {
                         flush_interval: Duration::from_millis(100),
                         ..defaults.wal
                     },
-                    checkpoint: betula::CheckpointConfig {
+                    checkpoint: sidra::CheckpointConfig {
                         bytes: params.memtable_bytes,
                         ..defaults.checkpoint
                     },
-                    poll: betula::PollConfig {
+                    poll: sidra::PollConfig {
                         interval: params.poll,
                         ..defaults.poll
                     },
                     warm: params.warm,
-                    cleaner: betula::CleanerConfig {
+                    cleaner: sidra::CleanerConfig {
                         clean_below_live: params.clean_below_live,
-                        ..betula::CleanerConfig::default()
+                        ..sidra::CleanerConfig::default()
                     },
                     ..defaults
                 };
                 let mut dbs = Vec::with_capacity(writers);
                 for _ in 0..writers.max(1) {
                     dbs.push(
-                        betula::Db::builder(path, os.clone())
+                        sidra::Db::builder(path, os.clone())
                             .with_settings(cfg.clone())
                             .build()
                             .await?,
                     );
                 }
-                Engine::Betula(dbs)
+                Engine::Sidra(dbs)
             }
             EngineKind::Slatedb => Engine::Slatedb(slatedb::Db::builder(path, os).build().await?),
         })
@@ -107,8 +107,8 @@ impl Engine {
     /// count); returns once the batch is durable.
     pub async fn write(&self, slot: u64, pairs: Vec<(Bytes, Bytes)>) -> Result<()> {
         match self {
-            Engine::Betula(dbs) => {
-                let mut batch = betula::WriteBatch::new();
+            Engine::Sidra(dbs) => {
+                let mut batch = sidra::WriteBatch::new();
                 pairs.into_iter().for_each(|(k, v)| {
                     batch.put_bytes(k, v);
                 });
@@ -129,7 +129,7 @@ impl Engine {
 
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         Ok(match self {
-            Engine::Betula(dbs) => dbs[0].get(key).await?,
+            Engine::Sidra(dbs) => dbs[0].get(key).await?,
             Engine::Slatedb(db) => db.get(key).await?,
         })
     }
@@ -138,7 +138,7 @@ impl Engine {
     pub async fn scan(&self, start: Bytes, limit: usize) -> Result<usize> {
         let mut n = 0;
         match self {
-            Engine::Betula(dbs) => {
+            Engine::Sidra(dbs) => {
                 let mut it = dbs[0].scan(start..);
                 while n < limit && it.next().await?.is_some() {
                     n += 1;
@@ -158,7 +158,7 @@ impl Engine {
     /// (tree checkpoint / L0 flush).
     pub async fn settle(&self) -> Result<()> {
         match self {
-            Engine::Betula(dbs) => {
+            Engine::Sidra(dbs) => {
                 for db in dbs {
                     db.flush_wal().await?;
                 }
@@ -184,7 +184,7 @@ impl Engine {
     /// Time from a durable write on one writer until another writer reads it.
     /// `None` for single-writer engines.
     pub async fn visibility_lag(&self, key: Bytes, value: Bytes) -> Result<Option<Duration>> {
-        let Engine::Betula(dbs) = self else {
+        let Engine::Sidra(dbs) = self else {
             return Ok(None);
         };
         let [reader, writer, ..] = dbs.as_slice() else {
@@ -200,7 +200,7 @@ impl Engine {
 
     pub fn describe(&self) -> String {
         match self {
-            Engine::Betula(dbs) => {
+            Engine::Sidra(dbs) => {
                 let s = dbs[0].metrics();
                 format!(
                     "writers={} manifest={} height={} segments={} live={:.0}%",
@@ -217,7 +217,7 @@ impl Engine {
 
     pub async fn close(self) -> Result<()> {
         match self {
-            Engine::Betula(dbs) => {
+            Engine::Sidra(dbs) => {
                 // Non-appliers first, so the applier's final checkpoint sees
                 // everything.
                 let (applier, rest): (Vec<_>, Vec<_>) =

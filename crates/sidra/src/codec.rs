@@ -15,10 +15,10 @@ pub struct Kind {
     pub magic: [u8; 4],
 }
 
-pub const MANIFEST: Kind = Kind { magic: *b"BTMF" };
-pub const WAL: Kind = Kind { magic: *b"BTWL" };
-pub const NODE: Kind = Kind { magic: *b"BTND" };
-pub const LEASE: Kind = Kind { magic: *b"BTLS" };
+pub const MANIFEST: Kind = Kind { magic: *b"SDMF" };
+pub const WAL: Kind = Kind { magic: *b"SDWL" };
+pub const NODE: Kind = Kind { magic: *b"SDND" };
+pub const LEASE: Kind = Kind { magic: *b"SDLS" };
 
 pub fn encode<T: Serialize>(kind: Kind, value: &T) -> Bytes {
     // Serializing owned in-memory types into a Vec cannot fail.

@@ -1,13 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/betula", "crates/betula-bench", "crates/betula-cli"]
+members = ["crates/sidra", "crates/sidra-bench", "crates/sidra-cli"]
 
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-betula = { path = "crates/betula" }
+sidra = { path = "crates/sidra" }
 anyhow = "1"
 async-trait = "0.1"
 bytes = { version = "1.12", features = ["serde"] }

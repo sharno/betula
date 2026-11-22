@@ -1,28 +1,28 @@
-//! `betula`: inspect and maintain betula databases.
+//! `sidra`: inspect and maintain sidra databases.
 //!
 //! ```sh
-//! betula info s3://bucket/db
-//! betula writers s3://bucket/db
-//! betula get s3://bucket/db user:1
-//! betula scan s3://bucket/db --prefix user: --limit 20
-//! betula put s3://bucket/db user:1 ada
-//! betula gc s3://bucket/db --retention 10m
+//! sidra info s3://bucket/db
+//! sidra writers s3://bucket/db
+//! sidra get s3://bucket/db user:1
+//! sidra scan s3://bucket/db --prefix user: --limit 20
+//! sidra put s3://bucket/db user:1 ada
+//! sidra gc s3://bucket/db --retention 10m
 //! ```
 //!
 //! Credentials come from AWS_* / GOOGLE_* / AZURE_*, settings from
-//! BETULA_CONFIG and BETULA_*.
+//! SIDRA_CONFIG and SIDRA_*.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use betula::{Admin, Db, DbReader, Freshness, ReadOptions, Settings};
 use clap::{Parser, Subcommand};
 use humantime_serde::re::humantime;
+use sidra::{Admin, Db, DbReader, Freshness, ReadOptions, Settings};
 
 #[derive(Parser)]
 #[command(
-    name = "betula",
-    about = "Inspect and maintain betula databases",
+    name = "sidra",
+    about = "Inspect and maintain sidra databases",
     version
 )]
 struct Cli {
@@ -101,9 +101,9 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 /// is none (or it stalled), so its edits get applied without disturbing a
 /// healthy deployment.
 async fn edit_writer(url: &str) -> Result<Db> {
-    let (store, path) = betula::parse_url(url)?;
+    let (store, path) = sidra::parse_url(url)?;
     let settings = Settings {
-        warm: betula::Warm::Off,
+        warm: sidra::Warm::Off,
         ..Settings::load()?
     };
     Ok(Db::builder(path, store)

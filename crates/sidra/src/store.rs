@@ -19,8 +19,8 @@ use crate::error::{Error, Result};
 use crate::hlc::WriterId;
 use crate::types::{Epoch, ManifestId, SegmentId};
 
-const DELETE_CONCURRENCY: usize = 32;
 const COALESCE_GAP: u64 = 128 << 10;
+const DELETE_BATCH: usize = 128;
 
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -202,18 +202,24 @@ impl Store {
         }
     }
 
+    /// Deletes objects through the store's bulk API where it has one (S3's
+    /// DeleteObjects), in small batches sent one at a time. One request per
+    /// object swamps the store, and so do huge batches on some servers; either
+    /// stalls writers' log PUTs behind GC. Missing objects count as deleted.
     pub async fn delete_all(&self, paths: Vec<Path>) -> Result<()> {
-        stream::iter(paths)
-            .map(|p| async move {
-                bump(&self.counters.deletes, 1);
-                match self.os.delete(&p).await {
-                    Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+        bump(&self.counters.deletes, paths.len() as u64);
+        for chunk in paths.chunks(DELETE_BATCH) {
+            let input = stream::iter(chunk.to_vec().into_iter().map(Ok)).boxed();
+            self.os
+                .delete_stream(input)
+                .map(|r| match r {
+                    Ok(_) | Err(object_store::Error::NotFound { .. }) => Ok(()),
                     Err(e) => Err(Error::from(e)),
-                }
-            })
-            .buffer_unordered(DELETE_CONCURRENCY)
-            .try_collect()
-            .await
+                })
+                .try_collect::<Vec<()>>()
+                .await?;
+        }
+        Ok(())
     }
 
     async fn list_names(&self, dir: &str, offset: Option<Path>) -> Result<Vec<String>> {

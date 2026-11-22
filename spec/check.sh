@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 run() {
-  everystate -workers auto -json -config "$1.cfg" Betula.tla | tail -1
+  everystate -workers auto -json -config "$1.cfg" Sidra.tla | tail -1
 }
 
 status() {
@@ -14,7 +14,7 @@ status() {
 }
 
 fail=0
-for cfg in Betula TwoAppliers; do
+for cfg in Sidra TwoAppliers; do
   s=$(run "$cfg" | status)
   echo "$cfg: $s (want success)"
   [[ $s == success ]] || fail=1

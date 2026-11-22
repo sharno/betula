@@ -1,14 +1,14 @@
-//! betula: a copy-on-write Bε-tree key-value store on object storage, with
+//! sidra: a copy-on-write Bε-tree key-value store on object storage, with
 //! any number of concurrent writers.
 //!
 //! ```
 //! # #[tokio::main(flavor = "current_thread")]
-//! # async fn main() -> betula::Result<()> {
-//! use betula::{Db, ReadOptions, Freshness, WriteBatch};
+//! # async fn main() -> sidra::Result<()> {
+//! use sidra::{Db, ReadOptions, Freshness, WriteBatch};
 //!
 //! // `s3://bucket/path`, `gs://…`, `az://…`, `file:///…` or `memory:///`.
 //! // Credentials come from the usual AWS_* / GOOGLE_* / AZURE_* variables,
-//! // settings from BETULA_CONFIG and BETULA_* (see `Settings`).
+//! // settings from SIDRA_CONFIG and SIDRA_* (see `Settings`).
 //! let db = Db::open("memory:///quickstart").await?;
 //!
 //! db.put("user:1", "ada").await?;

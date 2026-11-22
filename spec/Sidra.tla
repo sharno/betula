@@ -1,6 +1,6 @@
----------------------------- MODULE Betula ----------------------------
+---------------------------- MODULE Sidra ----------------------------
 (***************************************************************************)
-(* The betula multi-writer protocol, for one key.                          *)
+(* The sidra multi-writer protocol, for one key.                          *)
 (*                                                                         *)
 (* Writers stamp writes (time, writer id), keep them in flight, and flush  *)
 (* them as batches to their own append-only log. A writer's lease holds a  *)

@@ -1,13 +1,13 @@
 //! cargo run --example quickstart -- memory:///demo
-//! cargo run --example quickstart -- file:///tmp/betula-demo
+//! cargo run --example quickstart -- file:///tmp/sidra-demo
 //! AWS_ENDPOINT=http://127.0.0.1:9100 AWS_ALLOW_HTTP=true AWS_ACCESS_KEY_ID=… \
 //!   AWS_SECRET_ACCESS_KEY=… AWS_REGION=us-east-1 cargo run --example quickstart -- s3://bucket/demo
 
-use betula::{Db, WriteBatch};
 use futures::TryStreamExt;
+use sidra::{Db, WriteBatch};
 
 #[tokio::main]
-async fn main() -> betula::Result<()> {
+async fn main() -> sidra::Result<()> {
     let url = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "memory:///demo".into());

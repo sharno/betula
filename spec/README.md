@@ -2,10 +2,10 @@
 
 Two layers:
 
-- **`Betula.tla`**: a TLA+ model of the multi-writer protocol, model-checked
+- **`Sidra.tla`**: a TLA+ model of the multi-writer protocol, model-checked
   with [everystate](https://crates.io/crates/everystate), a TLC-compatible
   checker that needs no Java.
-- **`crates/betula/src/proofs.rs`**: [Kani](https://model-checking.github.io/kani/)
+- **`crates/sidra/src/proofs.rs`**: [Kani](https://model-checking.github.io/kani/)
   bounded proofs of the core pure functions in the Rust code itself.
 
 ## Protocol model (TLA+)
@@ -30,7 +30,7 @@ for each, so the invariants are strong enough to catch these bugs:
 
 | Config | Rule disabled | Result |
 |---|---|---|
-| `Betula.cfg` | none (2 writers, 1 applier) | pass, 22.5M distinct states |
+| `Sidra.cfg` | none (2 writers, 1 applier) | pass, 22.5M distinct states |
 | `TwoAppliers.cfg` | none (2 appliers racing) | pass, 146.9M distinct states |
 | `BugDiscovery.cfg` | the checkpoint pulls every writer whose lease it read | violation in 14 steps |
 | `BugCarryDown.cfg` | a leaf rewrite carries the buffered versions above it down | violation in 16 steps |
@@ -68,7 +68,7 @@ division); contents are symbolic.
 
 ```sh
 cargo install --locked kani-verifier && cargo kani setup
-cd crates/betula && cargo kani
+cd crates/sidra && cargo kani
 ```
 
 ## Not covered

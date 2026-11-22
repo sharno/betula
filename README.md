@@ -1,4 +1,8 @@
-# betula
+# sidra
+
+*Sidra* (سدرة) is the lote tree: deep-rooted, drought-hardy and long-lived,
+the tree of Sidrat al-Muntaha. A fitting name for a tree-shaped store meant
+to outlast the machines that use it.
 
 A copy-on-write Bε-tree key-value store on object storage (S3, RustFS, anything
 `object_store` supports with put-if-absent). No local disk and no coordinator,
@@ -7,7 +11,7 @@ like SlateDB, but with **any number of concurrent writers**.
 ## Quickstart
 
 ```rust
-use betula::{Db, Freshness, ReadOptions, WriteBatch};
+use sidra::{Db, Freshness, ReadOptions, WriteBatch};
 
 let db = Db::open("s3://bucket/mydb").await?;     // also gs://, az://, file://, memory://
 db.put("user:1", "ada").await?;                    // durable when it returns
@@ -30,7 +34,7 @@ For more control, use the builder:
 
 ```rust
 let db = Db::builder("mydb", store)              // any Arc<dyn ObjectStore>
-    .with_settings(Settings::from_file("betula.toml")?)
+    .with_settings(Settings::from_file("sidra.toml")?)
     .build()
     .await?;
 ```
@@ -39,8 +43,8 @@ let db = Db::builder("mydb", store)              // any Arc<dyn ObjectStore>
 
 Every setting has a default. `Settings::load()` (used by `Db::open`) layers:
 1. the defaults;
-2. the TOML file named by `BETULA_CONFIG`;
-3. `BETULA_*` environment variables, with `__` between sections.
+2. the TOML file named by `SIDRA_CONFIG`;
+3. `SIDRA_*` environment variables, with `__` between sections.
 
 ```toml
 warm = "blocking"          # or "background": open ~4x faster, reads warm up after
@@ -61,7 +65,7 @@ retention = "10m"
 ```
 
 ```sh
-BETULA_WAL__FLUSH_INTERVAL=20ms BETULA_APPLIER__MODE=never ./my-service
+SIDRA_WAL__FLUSH_INTERVAL=20ms SIDRA_APPLIER__MODE=never ./my-service
 ```
 
 Credentials and endpoints come from the usual `AWS_*`, `GOOGLE_*` and
@@ -100,18 +104,18 @@ and may lose writes that were only queued.
 ### Command line
 
 ```sh
-cargo install --path crates/betula-cli      # installs `betula`
-betula info    s3://bucket/db               # manifest, applier, tree, space
-betula writers s3://bucket/db               # leases and unapplied logs
-betula get     s3://bucket/db user:1        # latest acknowledged value
-betula scan    s3://bucket/db --prefix user: --limit 20
-betula put     s3://bucket/db user:1 ada    # takes the applier role only if none is running
-betula delete  s3://bucket/db user:1
-betula shape   s3://bucket/db               # walks the whole tree
-betula gc      s3://bucket/db --retention 10m
+cargo install --path crates/sidra-cli      # installs `sidra`
+sidra info    s3://bucket/db               # manifest, applier, tree, space
+sidra writers s3://bucket/db               # leases and unapplied logs
+sidra get     s3://bucket/db user:1        # latest acknowledged value
+sidra scan    s3://bucket/db --prefix user: --limit 20
+sidra put     s3://bucket/db user:1 ada    # takes the applier role only if none is running
+sidra delete  s3://bucket/db user:1
+sidra shape   s3://bucket/db               # walks the whole tree
+sidra gc      s3://bucket/db --retention 10m
 ```
 
-The same operations are available as a library: `betula::Admin`.
+The same operations are available as a library: `sidra::Admin`.
 
 ## Design
 
@@ -209,14 +213,14 @@ See [`spec/README.md`](spec/README.md):
 
 ## Layout
 
-- `crates/betula`: the library.
-- `crates/betula/tests/model.rs`: model-based proptest against a `BTreeMap`
+- `crates/sidra`: the library.
+- `crates/sidra/tests/model.rs`: model-based proptest against a `BTreeMap`
   with tiny nodes and eager cleaning (splits, flushes, removals, relocation,
   reopen, readers). After every checkpoint it checks that the manifest's live
   bytes per segment equal the bytes of reachable nodes. Further tests cover
   fencing, GC (only referenced segments remain, space amplification is
   bounded), and crash orphans.
-- `crates/betula-bench`: betula vs SlateDB on an S3 endpoint, with a metered
+- `crates/sidra-bench`: sidra vs SlateDB on an S3 endpoint, with a metered
   object store (request counts, bytes, optional added latency).
   `s3probe` measures the store's raw PUT/GET throughput.
 
@@ -225,24 +229,24 @@ See [`spec/README.md`](spec/README.md):
 ```sh
 # RustFS, no docker
 rustfs server --address 127.0.0.1:9100 /path/to/data   # RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY
-cargo run --release -p betula-bench -- --keys 1000000 --leaf-kib 256 --internal-kib 2048 --memtable-mib 32
-cargo run --release -p betula-bench -- ... --delay-ms 20   # approximate S3 latency
+cargo run --release -p sidra-bench -- --keys 1000000 --leaf-kib 256 --internal-kib 2048 --memtable-mib 32
+cargo run --release -p sidra-bench -- ... --delay-ms 20   # approximate S3 latency
 ```
 
 Phases: load (random order, batches of 32, 64 clients, durable writes), settle
 (checkpoint vs. memtable flush), warm random reads, 100-key scans, close and
 reopen, cold random reads, updates, settle. Every read is checked against the
 expected value. Both engines get 640 MiB of cache: SlateDB keeps its defaults
-(512 MiB blocks + 128 MiB metadata), and betula uses 256 MiB inner + 384 MiB
+(512 MiB blocks + 128 MiB metadata), and sidra uses 256 MiB inner + 384 MiB
 leaf.
 
 ### Results (local RustFS on one Mac)
 
 Single writer, 1M keys × 256 B, defaults (64 KiB leaves, 1 MiB inner-node
 budget, 16 MiB per checkpoint). Medians of 3 runs, alternating the two
-betula builds:
+sidra builds:
 
-| | betula (in-node buffers) | betula (append-only runs) | SlateDB 0.18 |
+| | sidra (in-node buffers) | sidra (append-only runs) | SlateDB 0.18 |
 |---|---|---|---|
 | load keys/s (p99 ms) | 20.3k (161) | 20.5k (132) | 19.4k (218) |
 | MiB written during load | 1,475 | **780** | 270 (+ deferred compaction) |
@@ -266,11 +270,11 @@ across them). SlateDB allows only one writer:
 
 Capacity, 256 clients × batches of 128, 2M keys:
 
-| | betula, 4 writers | SlateDB, 1 writer |
+| | sidra, 4 writers | SlateDB, 1 writer |
 |---|---|---|
 | load keys/s (p99 ms) | 203k (399) | 307k (162) |
 | update keys/s (p99 ms) | 305k (174) | 294k (119) |
 
 Bulk loading into an empty tree is limited by the single applier's
-copy-on-write rewrites. betula pays for its read advantage in bytes written:
+copy-on-write rewrites. sidra pays for its read advantage in bytes written:
 Bε buffers, plus the cleaner.

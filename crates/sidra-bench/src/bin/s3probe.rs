@@ -17,8 +17,8 @@ async fn main() -> Result<()> {
         AmazonS3Builder::new()
             .with_endpoint("http://127.0.0.1:9100")
             .with_bucket_name("bench")
-            .with_access_key_id("betula")
-            .with_secret_access_key("betula-secret")
+            .with_access_key_id("sidra")
+            .with_secret_access_key("sidra-secret")
             .with_region("us-east-1")
             .with_allow_http(true)
             .build()?,
