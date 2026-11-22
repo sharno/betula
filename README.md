@@ -95,6 +95,23 @@ writer, `sidra writers` and `sidra gc`) needs the same `[regions]` table, or
 its own region first: if that region fails before the applier pulls it, the
 write is unavailable until the region recovers, not lost.
 
+#### Readers in other regions
+
+Replicate the home bucket into the reader's region (S3 replication, or any
+copy job) and open the replica, naming the original as `origin`:
+
+```toml
+# Reader in eu-west-1, opened on s3://my-db-eu-replica/orders.
+origin = "s3://my-db/orders"
+```
+
+Every object is immutable except that new manifests appear, so a replica is
+always a consistent, slightly older database. A segment that hasn't arrived
+yet is read from the origin. Limits:
+- `Freshness::Latest` is as fresh as the replica, not the origin.
+- Replicate deletes too, or expire the replica's objects with a lifecycle
+  rule, or the replica keeps every segment GC removed.
+
 Credentials and endpoints come from the usual `AWS_*`, `GOOGLE_*` and
 `AZURE_*` variables (for example `AWS_ENDPOINT` and `AWS_ALLOW_HTTP` for
 RustFS or MinIO).
@@ -232,17 +249,15 @@ writer C ─► writers/C/wal/{seq} ─┘
 ## Roadmap
 
 Done: LZ4 compression (on by default), lighter cleaning of inner segments,
-paced GC deletes, regional writer logs, standby appliers.
+paced GC deletes, multi-region (regional writer logs, standby appliers,
+replica readers).
 
-1. **Multi-region reads.** Regional read replicas follow a replicated
-   manifest. Segments are immutable, so bucket replication copies them
-   safely.
-2. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
-3. **Fault-injection and soak tests:** failed, slow and lost store requests;
+1. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
+2. **Fault-injection and soak tests:** failed, slow and lost store requests;
    long runs.
-4. **Faster scans and bulk loads:** fewer sources per scan page; bottom-up
+3. **Faster scans and bulk loads:** fewer sources per scan page; bottom-up
    build into an empty tree.
-5. **Optional conditional writes** (compare-and-set) routed through the
+4. **Optional conditional writes** (compare-and-set) routed through the
    applier, for workloads that need them.
 
 ## Verification

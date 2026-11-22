@@ -34,6 +34,7 @@ pub struct DbReaderBuilder {
     path: Path,
     settings: ReaderSettings,
     regions: RegionStores,
+    origin: Option<(Arc<dyn ObjectStore>, Path)>,
 }
 
 impl DbReaderBuilder {
@@ -54,10 +55,23 @@ impl DbReaderBuilder {
         self
     }
 
+    /// Reads a replica: `store` is a bucket-replicated copy of `origin`, and
+    /// segments that haven't replicated yet are read from `origin`.
+    /// Overrides `origin` in settings.
+    pub fn with_origin(mut self, origin: Arc<dyn ObjectStore>, path: impl Into<Path>) -> Self {
+        self.origin = Some((origin, path.into()));
+        self
+    }
+
     pub async fn build(self) -> Result<DbReader> {
         let mut regions = RegionStores::from_urls(&self.settings.regions)?;
         regions.extend(self.regions);
-        DbReader::start(self.store, self.path, self.settings, regions).await
+        let origin = match (self.origin, &self.settings.origin) {
+            (Some(o), _) => Some(o),
+            (None, Some(url)) => Some(location::parse(url)?),
+            (None, None) => None,
+        };
+        DbReader::start(self.store, self.path, self.settings, regions, origin).await
     }
 }
 
@@ -83,6 +97,7 @@ impl DbReader {
             path: path.into(),
             settings: ReaderSettings::default(),
             regions: RegionStores::default(),
+            origin: None,
         }
     }
 
@@ -91,10 +106,17 @@ impl DbReader {
         path: Path,
         cfg: ReaderSettings,
         regions: RegionStores,
+        origin: Option<(Arc<dyn ObjectStore>, Path)>,
     ) -> Result<Self> {
         let home = Store::new(os, path);
         let logs = Arc::new(Logs::new(home.clone(), regions));
-        let nodes = Arc::new(Nodes::new(home, cfg.cache));
+        let nodes = Arc::new(match origin {
+            Some((os, path)) => {
+                let origin = home.sibling(os, path);
+                Nodes::replica(home, origin, cfg.cache)
+            }
+            None => Nodes::new(home, cfg.cache),
+        });
         let follower = Follower::open(nodes.clone(), logs, cfg.warm, cfg.rewarm, None).await?;
         let shared = Arc::new(Shared {
             nodes,

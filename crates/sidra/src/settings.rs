@@ -103,6 +103,10 @@ pub struct ReaderSettings {
     pub rewarm: Warm,
     /// Stores holding writers' logs, by region name (see `Settings`).
     pub regions: BTreeMap<Region, String>,
+    /// When the reader opens a replica of the database (bucket replication
+    /// into its own region), the URL of the original. Segments that haven't
+    /// replicated yet are read from it.
+    pub origin: Option<String>,
 }
 
 impl Default for ReaderSettings {
@@ -114,6 +118,7 @@ impl Default for ReaderSettings {
             warm: Warm::Blocking,
             rewarm: Warm::Background,
             regions: BTreeMap::new(),
+            origin: None,
         }
     }
 }

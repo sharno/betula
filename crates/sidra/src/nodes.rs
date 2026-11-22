@@ -84,8 +84,20 @@ pub struct CacheStats {
     pub misses: u64,
 }
 
+/// Where segments are read from.
+#[derive(Clone)]
+enum Source {
+    Home,
+    /// A replica of the home store (bucket replication), which may lag: a
+    /// segment not there yet is read from the origin.
+    Replica {
+        origin: Store,
+    },
+}
+
 pub struct Nodes {
     store: Store,
+    source: Source,
     inner: NodeCache,
     leaves: NodeCache,
     loading: Mutex<HashMap<NodePtr, Loading>>,
@@ -107,8 +119,19 @@ fn new_cache(bytes: u64, item_estimate: u64) -> NodeCache {
 
 impl Nodes {
     pub fn new(store: Store, cfg: CacheConfig) -> Self {
+        Self::with_source(store, Source::Home, cfg)
+    }
+
+    /// Reads from `replica`, falling back to `origin` for segments that
+    /// haven't replicated yet.
+    pub fn replica(replica: Store, origin: Store, cfg: CacheConfig) -> Self {
+        Self::with_source(replica, Source::Replica { origin }, cfg)
+    }
+
+    fn with_source(store: Store, source: Source, cfg: CacheConfig) -> Self {
         Self {
             store,
+            source,
             inner: new_cache(cfg.inner_bytes, INNER_NODE_ESTIMATE),
             leaves: new_cache(cfg.leaf_bytes, LEAF_ESTIMATE),
             loading: Mutex::new(HashMap::new()),
@@ -154,7 +177,11 @@ impl Nodes {
             .loading
             .lock()
             .entry(ptr)
-            .or_insert_with(|| fetch(self.store.clone(), ptr).boxed().shared())
+            .or_insert_with(|| {
+                fetch(self.store.clone(), self.source.clone(), ptr)
+                    .boxed()
+                    .shared()
+            })
             .clone();
         let result = loading.await;
         // Cache before dropping the in-flight entry so no reader slips
@@ -197,25 +224,44 @@ pub struct Segment {
 }
 
 /// Nodes of one segment, fetched with one coalesced ranged read.
-async fn fetch_batch(store: Store, seg: SegmentId, ptrs: Vec<NodePtr>) -> Result<Vec<Node>> {
+async fn fetch_batch(
+    store: Store,
+    source: Source,
+    seg: SegmentId,
+    ptrs: Vec<NodePtr>,
+) -> Result<Vec<Node>> {
     let path = store.segment_path(seg);
     let ranges: Vec<_> = ptrs.iter().map(NodePtr::range).collect();
-    let data = store
-        .get_ranges(&path, &ranges)
-        .await?
-        .ok_or(Error::SnapshotExpired(seg))?;
+    let local = store.get_ranges(&path, &ranges).await?;
+    let data = match (local, source) {
+        (Some(data), _) => Some(data),
+        (None, Source::Home) => None,
+        (None, Source::Replica { origin }) => {
+            origin
+                .get_ranges(&origin.segment_path(seg), &ranges)
+                .await?
+        }
+    }
+    .ok_or(Error::SnapshotExpired(seg))?;
     ptrs.iter()
         .zip(data)
         .map(|(ptr, bytes)| codec::decode(codec::NODE, &format!("{path}@{}", ptr.offset), &bytes))
         .collect()
 }
 
-async fn fetch(store: Store, ptr: NodePtr) -> Result<Node> {
+async fn fetch(store: Store, source: Source, ptr: NodePtr) -> Result<Node> {
     let path = store.segment_path(ptr.seg);
-    let data = store
-        .get_range(&path, ptr.range())
-        .await?
-        .ok_or(Error::SnapshotExpired(ptr.seg))?;
+    let local = store.get_range(&path, ptr.range()).await?;
+    let data = match (local, source) {
+        (Some(data), _) => Some(data),
+        (None, Source::Home) => None,
+        (None, Source::Replica { origin }) => {
+            origin
+                .get_range(&origin.segment_path(ptr.seg), ptr.range())
+                .await?
+        }
+    }
+    .ok_or(Error::SnapshotExpired(ptr.seg))?;
     codec::decode(codec::NODE, &format!("{path}@{}", ptr.offset), &data)
 }
 
@@ -258,9 +304,10 @@ impl Nodes {
                     .map(move |(_, b)| (seg, b))
             });
             for (seg, group) in batches {
-                let batch = fetch_batch(self.store.clone(), seg, group.clone())
-                    .boxed()
-                    .shared();
+                let batch =
+                    fetch_batch(self.store.clone(), self.source.clone(), seg, group.clone())
+                        .boxed()
+                        .shared();
                 group.iter().enumerate().for_each(|(i, p)| {
                     let one = batch
                         .clone()

@@ -110,6 +110,7 @@ fn reader_config() -> ReaderSettings {
         warm: Warm::Off,
         rewarm: Warm::Off,
         regions: BTreeMap::new(),
+        origin: None,
     }
 }
 
@@ -885,4 +886,61 @@ async fn standby_applies_only_while_no_primary_can() {
             "{k}"
         );
     }
+}
+
+/// Copies every object except segments matching `skip`, like bucket
+/// replication that hasn't caught up.
+async fn replicate(
+    from: &Arc<dyn ObjectStore>,
+    to: &Arc<dyn ObjectStore>,
+    skip: impl Fn(&str) -> bool,
+) {
+    let metas: Vec<_> = from
+        .list(Some(&Path::from(ROOT)))
+        .try_collect()
+        .await
+        .unwrap();
+    for m in metas.into_iter().filter(|m| !skip(m.location.as_ref())) {
+        let data = from.get(&m.location).await.unwrap().bytes().await.unwrap();
+        to.put(&m.location, data.into()).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replica_reader_falls_back_to_origin_for_lagging_segments() {
+    let home: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let replica: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = ManualClock::new();
+    let db = open(&home, &clock).await;
+    let mut model = Model::new();
+    for i in 0..200u32 {
+        clock.tick();
+        let (k, v) = (
+            Bytes::from(format!("k{:03}", i % 150)),
+            Bytes::from(format!("v{i}")),
+        );
+        db.put(k.clone(), v.clone()).await.unwrap();
+        model.insert(k, v);
+    }
+    db.checkpoint().await.unwrap();
+    db.close().await.unwrap();
+    // Every segment is missing from the replica.
+    replicate(&home, &replica, |p| p.contains("/seg/")).await;
+
+    let cold = |origin: bool| {
+        let b = DbReader::builder(ROOT, replica.clone()).with_settings(reader_config());
+        match origin {
+            true => b.with_origin(home.clone(), ROOT),
+            false => b,
+        }
+        .build()
+    };
+    let without = cold(false).await.unwrap();
+    assert!(matches!(
+        without.scan(KeyRange::all()).collect().await,
+        Err(Error::SnapshotExpired(_))
+    ));
+    let with = cold(true).await.unwrap();
+    let all = with.scan(KeyRange::all()).collect().await.unwrap();
+    assert_eq!(all, model_range(&model, &KeyRange::all()));
 }
