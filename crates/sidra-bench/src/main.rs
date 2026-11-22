@@ -172,7 +172,7 @@ impl Workload {
                             countries[(r >> 8) as usize % countries.len()],
                             plans[(r >> 16) as usize % plans.len()],
                             (r >> 24) % 1000,
-                            (r >> 34) % 2 == 0,
+                            (r >> 34).is_multiple_of(2),
                             (r >> 40) % 50,
                             (r >> 48) % 50,
                         )
