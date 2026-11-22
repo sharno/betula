@@ -19,8 +19,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub async fn get(&self, nodes: &Nodes, key: &[u8]) -> Result<Option<Version>> {
-        let tree = tree::get(nodes, self.tree, key).await?;
-        Ok(Version::newest(self.tails.get(key).cloned(), tree))
+        tree::get(nodes, self.tree, key, self.tails.get(key).cloned()).await
     }
 
     pub fn scan(self, nodes: Arc<Nodes>, range: KeyRange) -> DbIterator {

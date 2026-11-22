@@ -41,15 +41,18 @@ impl Default for CleanerConfig {
     }
 }
 
-/// The table after a checkpoint that wrote `new` (id, size) and freed
-/// `freed`, plus the segments that just died.
+/// The table after a checkpoint that wrote `new` (id, size) segments and
+/// freed `freed`, plus the segments that just died.
 pub fn account(
     prev: &SegmentTable,
-    new: Option<(SegmentId, u64)>,
+    new: &[(SegmentId, u64)],
     freed: &[NodePtr],
 ) -> (SegmentTable, Vec<SegmentId>) {
     let mut table = prev.clone();
-    table.extend(new.map(|(id, total)| (id, SegmentUsage { total, live: total })));
+    table.extend(
+        new.iter()
+            .map(|&(id, total)| (id, SegmentUsage { total, live: total })),
+    );
     freed.iter().for_each(|ptr| {
         let usage = table
             .get_mut(&ptr.seg)
@@ -115,9 +118,9 @@ mod tests {
 
     #[test]
     fn freeing_everything_kills_a_segment() {
-        let (t, dead) = account(&SegmentTable::new(), Some((seg(0), 30)), &[]);
+        let (t, dead) = account(&SegmentTable::new(), &[(seg(0), 30)], &[]);
         assert!(dead.is_empty());
-        let (t, dead) = account(&t, Some((seg(1), 10)), &[ptr(0, 0, 10), ptr(0, 10, 20)]);
+        let (t, dead) = account(&t, &[(seg(1), 10)], &[ptr(0, 0, 10), ptr(0, 10, 20)]);
         assert_eq!(dead, vec![seg(0)]);
         assert_eq!(t.keys().copied().collect::<Vec<_>>(), vec![seg(1)]);
     }

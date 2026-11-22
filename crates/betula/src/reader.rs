@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use crate::db::{Clock, SystemClock};
 use crate::error::Result;
 use crate::follow::Follower;
-use crate::nodes::{CacheConfig, Nodes};
+use crate::nodes::{CacheConfig, Nodes, Warm};
 use crate::snapshot::DbIterator;
 use crate::store::Store;
 use crate::types::{KeyRange, ManifestId};
@@ -25,9 +25,10 @@ pub struct ReaderConfig {
     pub refresh_interval: Option<Duration>,
     /// How often background refreshes also LIST for new writers.
     pub discovery_interval: Duration,
-    pub warm_inner_nodes: bool,
-    /// Also load each new manifest's internal nodes as soon as it is seen.
-    pub rewarm_on_refresh: bool,
+    /// Loading internal nodes and buffered runs on open.
+    pub warm: Warm,
+    /// Loading of each new manifest's internal nodes as soon as it is seen.
+    pub rewarm: Warm,
 }
 
 impl Default for ReaderConfig {
@@ -36,8 +37,8 @@ impl Default for ReaderConfig {
             cache: CacheConfig::default(),
             refresh_interval: Some(Duration::from_millis(500)),
             discovery_interval: Duration::from_secs(2),
-            warm_inner_nodes: true,
-            rewarm_on_refresh: true,
+            warm: Warm::Background,
+            rewarm: Warm::Background,
         }
     }
 }
@@ -60,8 +61,7 @@ impl DbReader {
         cfg: ReaderConfig,
     ) -> Result<Self> {
         let nodes = Arc::new(Nodes::new(Store::new(os, path), cfg.cache));
-        let follower =
-            Follower::open(nodes.clone(), cfg.warm_inner_nodes, cfg.rewarm_on_refresh).await?;
+        let follower = Follower::open(nodes.clone(), cfg.warm, cfg.rewarm, None).await?;
         let shared = Arc::new(Shared {
             nodes,
             follower,
@@ -96,6 +96,7 @@ impl DbReader {
             .follower
             .refresh(true, self.shared.clock.now_ms())
             .await
+            .map(|_| ())
     }
 
     pub fn manifest_id(&self) -> ManifestId {

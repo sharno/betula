@@ -61,6 +61,13 @@ struct Args {
     internal_kib: usize,
     #[arg(long, default_value_t = 32)]
     fanout: usize,
+    /// betula: load buffered runs on open before returning (otherwise in
+    /// the background).
+    #[arg(long)]
+    warm_blocking: bool,
+    /// betula: buffered runs per child before it is flushed.
+    #[arg(long, default_value_t = 16)]
+    max_runs: usize,
     #[arg(long, default_value_t = 16)]
     memtable_mib: usize,
     /// betula cache split. Defaults total 640 MiB, the same as SlateDB's
@@ -304,6 +311,12 @@ async fn bench_engine(
         leaf_cache_bytes: args.leaf_cache_mib << 20,
         clean_below_live: args.clean_below,
         poll: Duration::from_millis(args.poll_ms),
+        max_runs: args.max_runs,
+        warm: if args.warm_blocking {
+            betula::Warm::Blocking
+        } else {
+            betula::Warm::Background
+        },
     };
     let writers = match kind {
         EngineKind::Betula => args.writers,

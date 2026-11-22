@@ -68,6 +68,8 @@ pub struct TreeRoot {
     pub ptr: NodePtr,
     /// Oldest tombstone in the tree's leaves.
     pub oldest_tombstone: Option<Ts>,
+    /// Newest version anywhere in the tree.
+    pub newest: Option<Ts>,
     pub height: u32,
 }
 

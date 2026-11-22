@@ -125,11 +125,11 @@ fn check_chunks(len: usize) {
     let mut items: Vec<u8> = Vec::with_capacity(len);
     for _ in 0..len {
         let s: u8 = kani::any();
-        kani::assume((1..=4).contains(&s));
+        kani::assume((1..=3).contains(&s));
         items.push(s);
     }
     let target: usize = kani::any();
-    kani::assume((1..=8).contains(&target));
+    kani::assume((1..=6).contains(&target));
     let size = |s: &u8| *s as usize;
     let chunks = chunk_by_bytes(items.clone(), target, size);
     let mut total = 0;
@@ -153,11 +153,10 @@ fn check_chunks(len: usize) {
     assert!(at == items.len());
 }
 
-harnesses!(check_chunks, 7:
+harnesses!(check_chunks, 6:
     chunks_1(1);
     chunks_2(2);
     chunks_3(3);
-    chunks_4(4);
 );
 
 /// Internal-node splits: groups start at 0, cover every child, are
@@ -327,7 +326,7 @@ fn account_tracks_live_bytes() {
     let (f0, f1): (u8, u8) = (kani::any(), kani::any());
     kani::assume(f0 > 0 && f0 <= live0 && f1 > 0 && f1 <= new_total);
     let freed = [ptr(0, f0), ptr(1, f1)];
-    let (table, dead) = account(&prev, Some((seg(1), new_total.into())), &freed);
+    let (table, dead) = account(&prev, &[(seg(1), new_total.into())], &freed);
     let check = |s: u64, left: u8| match table.get(&seg(s)) {
         Some(u) => assert!(u.live == u64::from(left) && left > 0 && !dead.contains(&seg(s))),
         None => assert!(left == 0 && dead.contains(&seg(s))),

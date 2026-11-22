@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::hlc::WriterId;
 use crate::manifest::{self, Frontier, Manifest};
 use crate::memtable::Memtable;
-use crate::nodes::Nodes;
+use crate::nodes::{Nodes, Warm};
 use crate::snapshot::Snapshot;
 use crate::types::ManifestId;
 use crate::wal::{self, WalBatch};
@@ -95,9 +95,11 @@ pub struct View {
 
 pub struct Follower {
     nodes: Arc<Nodes>,
-    rewarm: bool,
+    rewarm: Warm,
     view: RwLock<View>,
     writers: Mutex<BTreeSet<WriterId>>,
+    /// This process's own writer, whose batches arrive via `add_own`.
+    own: Option<WriterId>,
     refreshing: tokio::sync::Mutex<()>,
     /// Notified whenever a new manifest is installed.
     pub installed: Notify,
@@ -106,16 +108,19 @@ pub struct Follower {
 impl Follower {
     /// `warm` loads the tree's internal nodes now; `rewarm` does it again
     /// for every new manifest (worth it only for processes serving reads).
-    pub async fn open(nodes: Arc<Nodes>, warm: bool, rewarm: bool) -> Result<Self> {
+    pub async fn open(
+        nodes: Arc<Nodes>,
+        warm: Warm,
+        rewarm: Warm,
+        own: Option<WriterId>,
+    ) -> Result<Self> {
         let store = nodes.store();
         // An empty database reads as the initial manifest under id 0, which
         // any published manifest supersedes.
         let (manifest_id, manifest) = manifest::load_latest(store)
             .await?
             .unwrap_or_else(|| (ManifestId(0), Manifest::initial(0)));
-        if warm {
-            nodes.warm_inner(manifest.tree).await?;
-        }
+        nodes.warm(manifest.tree, warm).await?;
         Ok(Self {
             nodes,
             rewarm,
@@ -125,6 +130,7 @@ impl Follower {
                 tails: Tails::default(),
             }),
             writers: Mutex::new(BTreeSet::new()),
+            own,
             refreshing: tokio::sync::Mutex::new(()),
             installed: Notify::new(),
         })
@@ -172,8 +178,9 @@ impl Follower {
     }
 
     /// Pulls new manifests and log entries. `discover` also LISTs, to find
-    /// new writers and to catch up when consecutive probing can't.
-    pub async fn refresh(&self, discover: bool, now_ms: u64) -> Result<()> {
+    /// new writers and to catch up when consecutive probing can't. Returns
+    /// whether anything new arrived.
+    pub async fn refresh(&self, discover: bool, now_ms: u64) -> Result<bool> {
         let _guard = self.refreshing.lock().await;
         let store = self.nodes.store();
         if discover {
@@ -190,8 +197,8 @@ impl Follower {
             Some(id) => load_required(store, id).await?.map(|m| (id, m)),
             None => probe_manifests(store, current).await?,
         };
-        if let (Some((_, m)), true) = (&newer, self.rewarm) {
-            self.nodes.warm_inner(m.tree).await?;
+        if let Some((_, m)) = &newer {
+            self.nodes.warm(m.tree, self.rewarm).await?;
         }
 
         let (applied, starts) = {
@@ -204,6 +211,7 @@ impl Follower {
                 .lock()
                 .iter()
                 .chain(applied.keys())
+                .filter(|w| Some(**w) != self.own)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .map(|w| {
@@ -224,6 +232,7 @@ impl Follower {
         )
         .await?;
 
+        let changed = newer.is_some() || fresh.iter().any(|f| !f.is_empty());
         let mut v = self.view.write();
         if let Some((id, m)) = newer.filter(|(id, _)| *id > v.manifest_id) {
             v.tails.prune(&m.frontier, now_ms);
@@ -238,7 +247,7 @@ impl Follower {
         });
         drop(v);
         self.installed.notify_waiters();
-        Ok(())
+        Ok(changed)
     }
 }
 

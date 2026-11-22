@@ -1,5 +1,5 @@
 use std::ops::Bound;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,8 @@ use crate::types::{Msg, NodePtr, Version, entry_bytes};
 pub enum Node {
     Leaf(Arc<Leaf>),
     Internal(Arc<Internal>),
+    /// A buffered run of messages for one child of an internal node.
+    Run(Arc<Run>),
 }
 
 /// Sorted, one version per key. Tombstones stay until no older write can
@@ -23,24 +25,72 @@ pub struct Leaf {
     pub entries: Vec<(Bytes, Version)>,
 }
 
+/// Sorted, one version per key: messages buffered above a child.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Run {
+    pub entries: Vec<(Bytes, Version)>,
+}
+
 /// `children[i]` covers keys in `[pivots[i-1], pivots[i])`, so
-/// `children.len() == pivots.len() + 1`. `buffer` is sorted and holds at most
-/// one version per key. A buffered version is not necessarily newer than one
-/// below it (a late write from a slow writer), so reads compare timestamps.
+/// `children.len() == pivots.len() + 1`. The Bε buffer is kept per child as
+/// append-only runs (`Child::runs`): adding messages writes new runs and
+/// rewrites only this small routing node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Internal {
     pub pivots: Vec<Bytes>,
     pub children: Vec<Child>,
-    pub buffer: Vec<(Bytes, Version)>,
 }
 
-/// A child pointer plus the oldest tombstone in that subtree's leaves, so a
-/// checkpoint can find leaves whose tombstones became droppable without
-/// loading any leaf.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// A child pointer, the runs buffered above that child, and summaries of the
+/// subtree that let checkpoints and reads skip it without loading it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Child {
     pub ptr: NodePtr,
+    /// Oldest tombstone in the subtree's leaves (droppable-tombstone search).
     pub oldest_tombstone: Option<Ts>,
+    /// Newest version in the subtree (excluding `runs`): a read that already
+    /// found something newer stops here.
+    pub newest: Option<Ts>,
+    /// Messages buffered for this child, newest run last. A buffered version
+    /// is not necessarily newer than one below it (a late write from a slow
+    /// writer), so reads compare timestamps.
+    pub runs: Vec<RunRef>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RunRef {
+    pub ptr: NodePtr,
+    /// Logical message bytes, for flush decisions without loading the run.
+    pub bytes: u32,
+    pub newest: Ts,
+    /// The run once loaded. Internal nodes are immutable and shared through
+    /// the cache, so a read resolves each run once and later reads skip the
+    /// cache lookup. Runs stay alive as long as their parent node does.
+    #[serde(skip)]
+    pub resolved: OnceLock<Arc<Run>>,
+}
+
+impl PartialEq for RunRef {
+    fn eq(&self, other: &Self) -> bool {
+        (self.ptr, self.bytes, self.newest) == (other.ptr, other.bytes, other.newest)
+    }
+}
+
+impl Eq for RunRef {}
+
+impl Child {
+    pub fn pending_bytes(&self) -> usize {
+        self.runs.iter().map(|r| r.bytes as usize).sum()
+    }
+
+    /// Newest version in the subtree including the buffered runs.
+    pub fn newest_with_runs(&self) -> Option<Ts> {
+        self.runs.iter().map(|r| r.newest).chain(self.newest).max()
+    }
+}
+
+fn newest_in(entries: &[(Bytes, Version)]) -> Option<Ts> {
+    entries.iter().map(|(_, v)| v.ts).max()
 }
 
 impl Node {
@@ -53,29 +103,42 @@ impl Node {
                 .map(|(_, v)| v.ts)
                 .min(),
             Node::Internal(i) => i.children.iter().filter_map(|c| c.oldest_tombstone).min(),
+            // Buffered tombstones are dropped only once carried into a leaf.
+            Node::Run(_) => None,
+        }
+    }
+
+    pub fn newest(&self) -> Option<Ts> {
+        match self {
+            Node::Leaf(l) => newest_in(&l.entries),
+            Node::Run(r) => newest_in(&r.entries),
+            Node::Internal(i) => i.children.iter().filter_map(Child::newest_with_runs).max(),
         }
     }
 }
 
+fn lookup<'a>(entries: &'a [(Bytes, Version)], key: &[u8]) -> Option<&'a Version> {
+    entries
+        .binary_search_by(|(k, _)| k.as_ref().cmp(key))
+        .ok()
+        .map(|i| &entries[i].1)
+}
+
 impl Leaf {
     pub fn get(&self, key: &[u8]) -> Option<&Version> {
-        self.entries
-            .binary_search_by(|(k, _)| k.as_ref().cmp(key))
-            .ok()
-            .map(|i| &self.entries[i].1)
+        lookup(&self.entries, key)
+    }
+}
+
+impl Run {
+    pub fn get(&self, key: &[u8]) -> Option<&Version> {
+        lookup(&self.entries, key)
     }
 }
 
 impl Internal {
     pub fn child_index(&self, key: &[u8]) -> usize {
         child_index::<[u8], _>(&self.pivots, key)
-    }
-
-    pub fn buffered(&self, key: &[u8]) -> Option<&Version> {
-        self.buffer
-            .binary_search_by(|(k, _)| k.as_ref().cmp(key))
-            .ok()
-            .map(|i| &self.buffer[i].1)
     }
 
     /// First child that can hold keys at or after `start`.
@@ -93,29 +156,11 @@ impl Internal {
         child_bounds(&self.pivots, i)
     }
 
-    /// Index range of `buffer` destined for child `i`.
-    pub fn buffer_slice(&self, i: usize) -> std::ops::Range<usize> {
-        let (lo, hi) = self.child_bounds(i);
-        let start = lo.map_or(0, |lo| self.buffer.partition_point(|(k, _)| k < lo));
-        let end = hi.map_or(self.buffer.len(), |hi| {
-            self.buffer.partition_point(|(k, _)| k < hi)
-        });
-        start..end
-    }
-
-    pub fn buffer_bytes(&self) -> usize {
-        msgs_bytes(&self.buffer)
-    }
-
-    pub fn routing_bytes(&self) -> usize {
-        self.pivots.iter().map(|p| p.len() + 8).sum::<usize>() + self.children.len() * 56
-    }
-
-    /// Buffered bytes per child, in child order.
-    pub fn pending_per_child(&self) -> Vec<usize> {
-        (0..self.children.len())
-            .map(|i| msgs_bytes(&self.buffer[self.buffer_slice(i)]))
-            .collect()
+    /// Every run referenced by this node.
+    pub fn run_ptrs(&self) -> impl Iterator<Item = NodePtr> + '_ {
+        self.children
+            .iter()
+            .flat_map(|c| c.runs.iter().map(|r| r.ptr))
     }
 }
 

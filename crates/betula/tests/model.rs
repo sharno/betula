@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use betula::{
     ApplierRole, CacheConfig, CleanerConfig, Clock, Db, DbConfig, DbReader, Durability, Error,
-    KeyRange, LeaseConfig, ReaderConfig, SegmentId, TreeConfig, WriteBatch,
+    KeyRange, LeaseConfig, ReaderConfig, SegmentId, TreeConfig, Warm, WriteBatch,
 };
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -54,6 +54,7 @@ fn tiny_config() -> DbConfig {
             leaf_max_bytes: 200,
             internal_max_bytes: 400,
             max_fanout: 4,
+            max_runs_per_child: 2,
         },
         // Small caches force reloads from storage.
         cache: CacheConfig {
@@ -67,6 +68,7 @@ fn tiny_config() -> DbConfig {
         checkpoint_interval: HOUR,
         max_unapplied_bytes: 1 << 30,
         poll_interval: Duration::from_millis(5),
+        max_poll_interval: Duration::from_millis(20),
         discovery_interval: Duration::from_millis(20),
         lease: LeaseConfig {
             interval: Duration::from_millis(5),
@@ -79,8 +81,8 @@ fn tiny_config() -> DbConfig {
             clean_below_live: 0.6,
             max_moved_bytes: 2048,
         },
-        warm_inner_nodes: true,
-        rewarm_on_refresh: true,
+        warm: Warm::Blocking,
+        rewarm: Warm::Blocking,
     }
 }
 
@@ -92,8 +94,8 @@ fn reader_config() -> ReaderConfig {
         },
         refresh_interval: None,
         discovery_interval: Duration::from_millis(20),
-        warm_inner_nodes: false,
-        rewarm_on_refresh: false,
+        warm: Warm::Off,
+        rewarm: Warm::Off,
     }
 }
 
@@ -486,4 +488,68 @@ async fn orphan_segments_are_deleted_on_claim() {
     assert!(db.claim_applier().await.unwrap());
     assert_eq!(segment_objects(&os).await, published);
     assert_eq!(db.get(b"k0042").await.unwrap(), Some(Bytes::from("v42")));
+}
+
+/// Leaves and runs much larger than a scan page, so scans resume mid-leaf
+/// with versions interleaved from several runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paged_scans_match_model() {
+    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = ManualClock::new();
+    let mut cfg = tiny_config();
+    cfg.tree = TreeConfig {
+        leaf_max_bytes: 16 << 10,
+        internal_max_bytes: 32 << 10,
+        max_fanout: 8,
+        max_runs_per_child: 6,
+    };
+    cfg.checkpoint_bytes = 1 << 30;
+    let db = Db::open_with_clock(os.clone(), ROOT, cfg, clock.clone())
+        .await
+        .unwrap();
+    let mut model = Model::new();
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move |n: u64| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng % n
+    };
+    for round in 0..30u64 {
+        for _ in 0..200 {
+            clock.tick();
+            let k = Bytes::from(format!("k{:05}", next(4000)));
+            if next(5) == 0 {
+                db.delete(k.clone()).await.unwrap();
+                model.remove(&k);
+            } else {
+                let v = Bytes::from(format!("r{round}-{}", next(1000)));
+                db.put(k.clone(), v.clone()).await.unwrap();
+                model.insert(k, v);
+            }
+        }
+        db.checkpoint().await.unwrap();
+    }
+    let shape = db.tree_shape().await.unwrap();
+    assert!(shape.runs > 10, "runs must accumulate: {shape:?}");
+    let all = db.scan(KeyRange::all()).collect().await.unwrap();
+    assert_eq!(all, model_range(&model, &KeyRange::all()));
+    for _ in 0..200 {
+        let a = next(4100);
+        let len = next(400) as usize;
+        let range = KeyRange::new(
+            Bound::Included(Bytes::from(format!("k{a:05}"))),
+            Bound::Unbounded,
+        );
+        let mut it = db.scan(range.clone());
+        let mut got = Vec::new();
+        while got.len() < len {
+            match it.next().await.unwrap() {
+                Some(kv) => got.push(kv),
+                None => break,
+            }
+        }
+        let want: Vec<_> = model_range(&model, &range).into_iter().take(len).collect();
+        assert_eq!(got, want, "scan from k{a:05} len {len}");
+    }
 }

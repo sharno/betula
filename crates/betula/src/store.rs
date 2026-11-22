@@ -19,6 +19,7 @@ use crate::hlc::WriterId;
 use crate::types::{Epoch, ManifestId, SegmentId};
 
 const DELETE_CONCURRENCY: usize = 32;
+const COALESCE_GAP: u64 = 128 << 10;
 
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -83,6 +84,28 @@ impl Store {
         range: std::ops::Range<u64>,
     ) -> Result<Option<Bytes>> {
         match self.os.get_range(path, range).await {
+            Ok(b) => Ok(Some(b)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Several ranges of one object; nearby ranges are fetched together.
+    pub async fn get_ranges(
+        &self,
+        path: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Result<Option<Vec<Bytes>>> {
+        // Batched reads target inner segments (inner nodes and runs only;
+        // leaves live in their own segments), so merging across gaps of dead
+        // nodes costs little and saves requests.
+        let fetched = object_store::coalesce_ranges(
+            ranges,
+            |r| async move { self.os.get_range(path, r).await },
+            COALESCE_GAP,
+        )
+        .await;
+        match fetched {
             Ok(b) => Ok(Some(b)),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e.into()),

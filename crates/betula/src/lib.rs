@@ -38,7 +38,7 @@ pub use db::{
 pub use error::{Error, Result};
 pub use gc::{GcConfig, GcStats};
 pub use hlc::{Ts, WriterId};
-pub use nodes::CacheConfig;
+pub use nodes::{CacheConfig, Warm};
 pub use reader::{DbReader, ReaderConfig};
 pub use segments::{CleanerConfig, SegmentTable, SegmentUsage};
 pub use snapshot::DbIterator;

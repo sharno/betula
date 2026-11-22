@@ -27,13 +27,22 @@ writer C ─► writers/C/wal/{seq} ─┘
   entries into the tree and records each writer's applied sequence number.
   Any writer takes the role over when entries sit unapplied too long. Losing
   the role never affects writing.
-- **Bε-tree.** Internal nodes hold pivots, child pointers and a message
-  buffer. An overflowing buffer flushes its fullest child's messages down.
-  Leaves split by bytes. The root grows and shrinks as needed.
-- **Copy-on-write segments.** A checkpoint writes every node it touches into
-  one segment object (`seg/{epoch}-{seq}.seg`), which costs about 2 PUTs.
+- **Bε-tree with append-only buffers.** Internal nodes hold pivots and, for
+  each child, a pointer plus a list of buffered message runs. A batch reaching
+  a node is split by child and appended as new runs, so only the small
+  routing node is rewritten, not the buffered data.
+  - When a node's runs exceed its byte budget, or a child has too many runs,
+    the fullest child is flushed: its runs are merged into it.
+  - Leaves split by bytes. The root grows and shrinks as needed.
+- **Copy-on-write segments.** A checkpoint writes the nodes it touches into
+  two segment objects (`seg/{epoch}-{seq}.seg`), about 3 PUTs in all: one
+  for inner nodes and runs, one for leaves. Warming inner nodes is then a few
+  contiguous reads, and short-lived runs don't keep leaf segments alive.
   Parents point at `(segment, offset, len)`, so reading a node is one ranged
   GET.
+- **Reads stop early.** Each child pointer records the newest timestamp in its
+  subtree. A point read stops once the version it holds is newer than
+  everything below. Scans build each leaf's view one page at a time.
 - **Tombstones.** Deletes stay as tombstones until no writer can still
   produce an older version of the key. Each writer's lease
   (`writers/{id}/lease`) carries a floor under every timestamp it may still
@@ -46,10 +55,14 @@ writer C ─► writers/C/wal/{seq} ─┘
 
   Child pointers record each subtree's oldest tombstone, so leaves whose
   tombstones became droppable are found without loading leaves.
-- **Inner-node cache.** Internal nodes have their own cache and are loaded on
-  open, so a cold point read is one GET.
+- **Inner-node cache.** Internal nodes and runs have their own cache. On
+  open, internal nodes load before returning and runs load in the background
+  (`Warm::Background`); `Warm::Blocking` waits for both. Once warm, a cold
+  point read is at most one GET. Polling for other writers backs off while
+  nothing changes.
 - **Cleaner.** Segments below 25% live get their live nodes rewritten by the
-  next checkpoint. Cleaning at live fraction *t* adds about *t*/(1−*t*) to
+  next checkpoint. Runs in such a segment are copied in place instead of
+  being pushed down. Cleaning at live fraction *t* adds about *t*/(1−*t*) to
   write amplification and keeps space amplification near 1/*t*.
 - **GC.** Once a manifest is past retention, GC deletes the segments that died
   in it, the previous manifest, and log entries the manifest already holds.
@@ -108,15 +121,18 @@ leaf.
 
 ### Results (local RustFS on one Mac)
 
-Single writer, 1M keys × 256 B, defaults (64 KiB leaves, 1 MiB internal, 16 MiB per checkpoint):
+Single writer, 1M keys × 256 B, defaults (64 KiB leaves, 1 MiB inner-node
+budget, 16 MiB per checkpoint). Medians of 3 runs, alternating the two
+betula builds:
 
-| | betula | SlateDB 0.18 |
-|---|---|---|
-| load keys/s (p99 ms) | 20.4k (147) | 19.9k (124) |
-| PUTs / MiB written during load | 558 / 1419 | 506 / 270 (+ deferred compaction) |
-| warm point reads/s | 839k, 0 GETs | 357k, 0 GETs |
-| cold point reads (50k): GETs, reads/s | 4.4k, 264k | 37.6k, 37k |
-| 100-key scans/s | 31k | 82k |
+| | betula (in-node buffers) | betula (append-only runs) | SlateDB 0.18 |
+|---|---|---|---|
+| load keys/s (p99 ms) | 20.3k (161) | 20.5k (132) | 19.4k (218) |
+| MiB written during load | 1,475 | **780** | 270 (+ deferred compaction) |
+| warm point reads/s | 931k | 1.03M | 336k |
+| 100-key scans/s | 33k | 36k | 80k |
+| open (reopen) | 52 ms | 29 ms (`Blocking`: 140 ms) | 53 ms |
+| cold point reads (50k): GETs, reads/s | 4.0k, 297k | 3.8k, 262k (`Blocking`: 3.8k, 319k) | 43k, 32k |
 
 At 64 clients × batches of 32, load for both engines sits at the ceiling set
 by the 100 ms log flush interval.

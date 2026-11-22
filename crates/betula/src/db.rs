@@ -34,7 +34,7 @@ use crate::follow::Follower;
 use crate::gc::{self, GcConfig, GcStats};
 use crate::hlc::{Hlc, Ts, WriterId};
 use crate::manifest::{self, Manifest, Publish};
-use crate::nodes::{CacheConfig, Nodes};
+use crate::nodes::{CacheConfig, Nodes, Warm};
 use crate::retry::retry;
 use crate::segments::{self, CleanerConfig, SegmentTable};
 use crate::snapshot::DbIterator;
@@ -99,20 +99,25 @@ pub struct DbConfig {
     pub checkpoint_interval: Duration,
     /// Writers stall while unapplied entries exceed this.
     pub max_unapplied_bytes: usize,
-    /// How often to poll for other writers' entries and new manifests.
+    /// How often to poll for other writers' entries and new manifests while
+    /// they are arriving.
     pub poll_interval: Duration,
+    /// Polling backs off exponentially up to this while nothing new arrives,
+    /// so an idle database costs few requests. Visibility of the first write
+    /// after a quiet period is delayed by up to this.
+    pub max_poll_interval: Duration,
     /// How often to LIST for new writers.
     pub discovery_interval: Duration,
     pub lease: LeaseConfig,
     pub applier: ApplierRole,
     pub gc: Option<GcConfig>,
     pub cleaner: CleanerConfig,
-    /// Load every internal node into cache on open.
-    pub warm_inner_nodes: bool,
-    /// Also load every new manifest's changed internal nodes as soon as it is
-    /// seen. Otherwise they load on first use. Every writer doing this costs
-    /// GETs proportional to writers × checkpoint size.
-    pub rewarm_on_refresh: bool,
+    /// Loading internal nodes and buffered runs on open.
+    pub warm: Warm,
+    /// Loading of each new manifest's changed internal nodes and runs as
+    /// soon as it is seen. Every writer doing this costs GETs proportional to
+    /// writers × checkpoint size, so writers default to loading on first use.
+    pub rewarm: Warm,
 }
 
 impl Default for DbConfig {
@@ -126,6 +131,7 @@ impl Default for DbConfig {
             checkpoint_interval: Duration::from_secs(2),
             max_unapplied_bytes: 512 << 20,
             poll_interval: Duration::from_millis(200),
+            max_poll_interval: Duration::from_secs(2),
             discovery_interval: Duration::from_secs(2),
             lease: LeaseConfig::default(),
             applier: ApplierRole::Auto {
@@ -133,8 +139,8 @@ impl Default for DbConfig {
             },
             gc: Some(GcConfig::default()),
             cleaner: CleanerConfig::default(),
-            warm_inner_nodes: true,
-            rewarm_on_refresh: false,
+            warm: Warm::Background,
+            rewarm: Warm::Off,
         }
     }
 }
@@ -380,32 +386,42 @@ impl Shared {
             hlc: floor,
             writer: WriterId(0),
         };
-        let seg = app.next_segment;
-        // A fresh segment per attempt: a failed attempt may still have
-        // uploaded its segment, which then shows up as an orphan.
-        app.next_segment = seg.next();
+        let out = tree::Outputs {
+            inner: app.next_segment,
+            leaves: app.next_segment.next(),
+        };
+        // Fresh segments per attempt: a failed attempt may still have
+        // uploaded its segments, which then show up as orphans.
+        app.next_segment = out.leaves.next();
         let msgs = view.tails.mem().to_sorted_vec();
         let msg_count = msgs.len();
         let plan = tree::apply(
             &self.nodes,
             &self.cfg.tree,
-            seg,
+            out,
             view.manifest.tree,
             msgs,
             &victims,
             drop_below,
         )
         .await?;
-        if let Some(segment) = &plan.segment {
-            retry("segment upload", || self.nodes.upload(segment)).await?;
-        }
-        let new = plan.segment.as_ref().map(|s| (s.id, s.data.len() as u64));
-        let (table, dead) = segments::account(&view.manifest.segments, new, &plan.freed);
+        futures::future::try_join_all(
+            plan.segments
+                .iter()
+                .map(|segment| retry("segment upload", || self.nodes.upload(segment))),
+        )
+        .await?;
+        let new: Vec<(SegmentId, u64)> = plan
+            .segments
+            .iter()
+            .map(|s| (s.id, s.data.len() as u64))
+            .collect();
+        let (table, dead) = segments::account(&view.manifest.segments, &new, &plan.freed);
         let next = Manifest {
             applier_epoch: app.epoch,
             tree: plan.root,
             frontier: view.tails.frontier(&view.manifest.frontier),
-            segment_watermark: seg.next(),
+            segment_watermark: app.next_segment,
             segments: table,
             dead,
             created_at_ms: self.now(),
@@ -420,7 +436,7 @@ impl Shared {
                 tracing::debug!(
                     manifest = next_id.0,
                     msgs = msg_count,
-                    segment_bytes = new.map_or(0, |(_, b)| b),
+                    segment_bytes = new.iter().map(|(_, b)| b).sum::<u64>(),
                     freed = plan.freed.len(),
                     victims = victims.len(),
                     elapsed = ?started.elapsed(),
@@ -468,13 +484,13 @@ impl Db {
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
         let nodes = Arc::new(Nodes::new(Store::new(os, path), cfg.cache));
-        let follower =
-            Follower::open(nodes.clone(), cfg.warm_inner_nodes, cfg.rewarm_on_refresh).await?;
+        let writer = random_writer_id(clock.now_ms());
+        let follower = Follower::open(nodes.clone(), cfg.warm, cfg.rewarm, Some(writer)).await?;
         let (shutdown, shutdown_rx) = watch::channel(false);
         let shared = Arc::new(Shared {
             nodes,
             follower,
-            writer: random_writer_id(clock.now_ms()),
+            writer,
             hlc: Hlc::default(),
             inflight: Mutex::new(BTreeMap::new()),
             lease_valid_until_ms: AtomicU64::new(0),
@@ -585,7 +601,11 @@ impl Db {
 
     /// Pulls other writers' entries and the latest manifest now.
     pub async fn refresh(&self) -> Result<()> {
-        self.shared.follower.refresh(true, self.shared.now()).await
+        self.shared
+            .follower
+            .refresh(true, self.shared.now())
+            .await
+            .map(|_| ())
     }
 
     /// Makes every write sent so far durable.
@@ -833,14 +853,20 @@ async fn lease_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
 
 async fn follow_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     let mut last_discovery = Instant::now();
-    while every(shared.cfg.poll_interval, &mut shutdown).await {
+    let mut period = shared.cfg.poll_interval;
+    while every(period, &mut shutdown).await {
         let discover = last_discovery.elapsed() >= shared.cfg.discovery_interval;
         if discover {
             last_discovery = Instant::now();
         }
-        if let Err(e) = shared.follower.refresh(discover, shared.now()).await {
-            tracing::warn!(%e, "refresh failed");
-            continue;
+        match shared.follower.refresh(discover, shared.now()).await {
+            // Poll fast while things arrive, back off while quiet.
+            Ok(true) => period = shared.cfg.poll_interval,
+            Ok(false) => period = (period * 2).min(shared.cfg.max_poll_interval),
+            Err(e) => {
+                tracing::warn!(%e, "refresh failed");
+                continue;
+            }
         }
         if let Err(e) = shared.maybe_claim().await {
             tracing::warn!(%e, "applier claim failed");

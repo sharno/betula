@@ -35,6 +35,8 @@ pub struct BetulaParams {
     pub clean_below_live: f64,
     /// How often betula writers poll for each other's entries.
     pub poll: Duration,
+    pub max_runs: usize,
+    pub warm: betula::Warm,
 }
 
 pub enum Engine {
@@ -59,6 +61,7 @@ impl Engine {
                         leaf_max_bytes: params.leaf_bytes,
                         internal_max_bytes: params.internal_bytes,
                         max_fanout: params.fanout,
+                        max_runs_per_child: params.max_runs,
                     },
                     cache: betula::CacheConfig {
                         inner_bytes: params.inner_cache_bytes,
@@ -67,6 +70,7 @@ impl Engine {
                     // Same WAL flush interval as SlateDB's default.
                     wal_flush_interval: Duration::from_millis(100),
                     checkpoint_bytes: params.memtable_bytes,
+                    warm: params.warm,
                     poll_interval: params.poll,
                     cleaner: betula::CleanerConfig {
                         clean_below_live: params.clean_below_live,

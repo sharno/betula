@@ -148,14 +148,20 @@ impl ObjectStore for Metered {
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        self.pause().await;
-        let out = self.inner.get_ranges(location, ranges).await?;
-        Self::add(&self.counters.gets, ranges.len() as u64);
-        Self::add(
-            &self.counters.get_bytes,
-            out.iter().map(|b| b.len() as u64).sum(),
-        );
-        Ok(out)
+        // Coalesce here (as stores do) so each merged request goes through
+        // `get_opts` and is counted once, with its real byte count.
+        object_store::coalesce_ranges(
+            ranges,
+            |r| async move {
+                let opts = GetOptions {
+                    range: Some(r.into()),
+                    ..Default::default()
+                };
+                self.get_opts(location, opts).await?.bytes().await
+            },
+            object_store::OBJECT_STORE_COALESCE_DEFAULT,
+        )
+        .await
     }
 
     fn delete_stream(
