@@ -204,22 +204,22 @@ writer C ─► writers/C/wal/{seq} ─┘
 
 ## Roadmap
 
-1. **Compression** (LZ4) of tree nodes and log batches, configurable.
-2. **Lighter cleaning:** inner segments (runs) are cleaned only when nearly
-   empty, since they empty out on their own.
-3. **Multi-region writers.**
+Done: LZ4 compression (on by default), lighter cleaning of inner segments,
+paced GC deletes.
+
+1. **Multi-region writers.**
    - Each writer appends its log to a bucket in its own region (local write
      latency, no cross-region traffic to write); its lease records where.
    - The applier is pinned to the home region and pulls those logs
      asynchronously.
    - Regional read replicas follow a replicated manifest. Segments are
      immutable, so bucket replication copies them safely.
-4. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
-5. **Fault-injection and soak tests:** failed, slow and lost store requests;
+2. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
+3. **Fault-injection and soak tests:** failed, slow and lost store requests;
    long runs.
-6. **Faster scans and bulk loads:** fewer sources per scan page; bottom-up
+4. **Faster scans and bulk loads:** fewer sources per scan page; bottom-up
    build into an empty tree.
-7. **Optional conditional writes** (compare-and-set) routed through the
+5. **Optional conditional writes** (compare-and-set) routed through the
    applier, for workloads that need them.
 
 ## Verification
@@ -261,6 +261,39 @@ expected value. Both engines get 640 MiB of cache: SlateDB keeps its defaults
 leaf.
 
 ### Results (local RustFS on one Mac)
+
+The meter counts multipart upload parts. Earlier versions of this table missed
+them, which undercounted SlateDB's SST writes; the older tables below carry
+that error in their SlateDB byte figures.
+
+Current defaults, 1M keys × 256 B, 40 clients, then 15 minutes of mixed
+traffic (80% writes, 20% reads). Random (incompressible) values:
+
+| | sidra | SlateDB 0.18 |
+|---|---|---|
+| mixed reads/s (p99 ms) | **1.61M (0.01)**, flat | 311k (0.40), swings 168k–437k |
+| mixed GETs | **177k** | 4.6M |
+| mixed writes keys/s | **10.2k** | 9.4k |
+| mixed write p99 / p99.9 ms | **145 / 181** | 256 / 1,183 |
+| MiB written, mixed | 9,123 | **6,523** |
+| load write p99 ms | **131** | 144 |
+| MiB written, load | 830 | **755** |
+| cold reads (20k): GETs, reads/s | **3.6k, 158k** | 18.4k, 27k |
+
+JSON-like values, LZ4 on for both engines, 5 minutes mixed:
+
+| | sidra | SlateDB 0.18 |
+|---|---|---|
+| mixed reads/s | **1.49M** | 324k |
+| MiB written, load | 248 | **171** |
+| MiB written, mixed | 932 | **864** |
+| footprint after run | 1,195 MiB | **1,066 MiB** |
+
+With compressible data the bytes-written gap narrows to about 1.1× under
+mixed traffic. Sidra's GC spreads each run's deletes over its interval: on
+RustFS, bursts of deletes pushed write p99 to 0.7–1.2 s.
+
+Earlier runs:
 
 Single writer, 1M keys × 256 B, defaults (64 KiB leaves, 1 MiB inner-node
 budget, 16 MiB per checkpoint). Medians of 3 runs, alternating the two
