@@ -4,6 +4,8 @@ use std::ops::Bound;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::hlc::Ts;
+
 /// Writer generation. Bumped by every writer that opens the database; a writer
 /// whose epoch is no longer the latest is fenced.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -64,18 +66,9 @@ impl fmt::Display for NodePtr {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeRoot {
     pub ptr: NodePtr,
+    /// Oldest tombstone in the tree's leaves.
+    pub oldest_tombstone: Option<Ts>,
     pub height: u32,
-}
-
-/// WAL object sequence number. `WalId::NONE` means "no WAL applied yet".
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct WalId(pub u64);
-
-impl WalId {
-    pub const NONE: Self = Self(0);
-    pub fn next(self) -> Self {
-        Self(self.0 + 1)
-    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -87,8 +80,7 @@ impl ManifestId {
     }
 }
 
-/// A pending mutation for a key. Bε-tree buffers hold at most one message per
-/// key: a newer message for the same key replaces the older one.
+/// A mutation for a key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Msg {
     Put(Bytes),
@@ -111,9 +103,36 @@ impl Msg {
     }
 }
 
+/// A timestamped mutation. Wherever two versions of a key meet, the larger
+/// timestamp wins, so applying writes in any order gives the same result.
+/// Buffers and leaves hold at most one version per key; deletes are kept as
+/// tombstones until no older write can still arrive.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Version {
+    pub ts: Ts,
+    pub msg: Msg,
+}
+
+impl Version {
+    pub fn value(&self) -> Option<&Bytes> {
+        match &self.msg {
+            Msg::Put(v) => Some(v),
+            Msg::Delete => None,
+        }
+    }
+
+    /// The newer of two versions.
+    pub fn newest(a: Option<Version>, b: Option<Version>) -> Option<Version> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(if b.ts > a.ts { b } else { a }),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
 /// Approximate in-memory/on-disk cost of an entry, used for node sizing.
 pub fn entry_bytes(key: &Bytes, msg_len: usize) -> usize {
-    key.len() + msg_len + 8
+    key.len() + msg_len + 24
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

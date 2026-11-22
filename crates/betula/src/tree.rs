@@ -15,12 +15,14 @@ use futures::{StreamExt, TryStreamExt, stream};
 
 use crate::codec;
 use crate::error::{Error, Result};
+use crate::hlc::Ts;
 use crate::node::{
-    Internal, Leaf, Node, apply_to_entries, chunk_by_bytes, entries_bytes, group_starts, merge_msgs,
+    Child, Internal, Leaf, Node, apply_to_leaf, chunk_by_bytes, group_starts, merge_versions,
+    msgs_bytes,
 };
 use crate::nodes::Nodes;
 use crate::nodes::Segment;
-use crate::types::{KeyRange, Msg, NodePtr, SegmentId, TreeRoot, entry_bytes};
+use crate::types::{KeyRange, NodePtr, SegmentId, TreeRoot, Version, entry_bytes};
 
 #[derive(Clone, Copy, Debug)]
 pub struct TreeConfig {
@@ -55,17 +57,18 @@ impl TreeConfig {
     }
 }
 
-pub async fn get(nodes: &Nodes, root: Option<TreeRoot>, key: &[u8]) -> Result<Option<Bytes>> {
+/// The newest version of `key` in the tree. Walks the whole root-to-leaf
+/// path: a late write from a slow writer can sit above a newer version.
+pub async fn get(nodes: &Nodes, root: Option<TreeRoot>, key: &[u8]) -> Result<Option<Version>> {
     let Some(root) = root else { return Ok(None) };
     let mut id = root.ptr;
+    let mut best = None;
     loop {
         match nodes.load(id).await? {
-            Node::Leaf(leaf) => return Ok(leaf.get(key).cloned()),
+            Node::Leaf(leaf) => return Ok(Version::newest(best, leaf.get(key).cloned())),
             Node::Internal(node) => {
-                if let Some(msg) = node.buffered(key) {
-                    return Ok(msg.clone().into_value());
-                }
-                id = node.children[node.child_index(key)];
+                best = Version::newest(best, node.buffered(key).cloned());
+                id = node.children[node.child_index(key)].ptr;
             }
         }
     }
@@ -75,6 +78,8 @@ pub async fn get(nodes: &Nodes, root: Option<TreeRoot>, key: &[u8]) -> Result<Op
 pub struct TreeShape {
     pub internal: usize,
     pub leaves: usize,
+    /// Tombstones still held in leaves.
+    pub tombstones: usize,
     /// Every reachable node.
     pub nodes: Vec<NodePtr>,
 }
@@ -92,7 +97,7 @@ pub async fn shape(nodes: &Nodes, root: Option<TreeRoot>) -> Result<TreeShape> {
         level = loaded
             .iter()
             .flat_map(|(_, n)| match n {
-                Node::Internal(i) => i.children.clone(),
+                Node::Internal(i) => i.children.iter().map(|c| c.ptr).collect(),
                 Node::Leaf(_) => Vec::new(),
             })
             .collect();
@@ -100,6 +105,18 @@ pub async fn shape(nodes: &Nodes, root: Option<TreeRoot>) -> Result<TreeShape> {
             .iter()
             .filter(|(_, n)| matches!(n, Node::Internal(_)))
             .count();
+        shape.tombstones += loaded
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::Leaf(l) => Some(
+                    l.entries
+                        .iter()
+                        .filter(|(_, v)| v.value().is_none())
+                        .count(),
+                ),
+                Node::Internal(_) => None,
+            })
+            .sum::<usize>();
         shape.internal += internal;
         shape.leaves += loaded.len() - internal;
         shape.nodes.extend(loaded.into_iter().map(|(id, _)| id));
@@ -140,7 +157,9 @@ impl TreeIter {
     }
 
     /// The next non-empty run of live entries, in key order.
-    pub async fn next_chunk(&mut self) -> Result<Option<Vec<(Bytes, Bytes)>>> {
+    /// The next non-empty run of versions (tombstones included, so they can
+    /// shadow log tails), in key order.
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<(Bytes, Version)>>> {
         loop {
             let (stack, leaf) = match std::mem::replace(&mut self.state, IterState::Done) {
                 IterState::Done | IterState::Start(None) => return Ok(None),
@@ -169,7 +188,7 @@ impl TreeIter {
                 Node::Internal(node) => {
                     let idx = node.first_child(&self.range.start);
                     let last = node.last_child(&self.range.end).max(idx);
-                    id = node.children[idx];
+                    id = node.children[idx].ptr;
                     stack.push(Frame { node, idx, last });
                 }
             }
@@ -180,7 +199,7 @@ impl TreeIter {
         while let Some(top) = stack.last_mut() {
             if top.idx < top.last {
                 top.idx += 1;
-                let id = top.node.children[top.idx];
+                let id = top.node.children[top.idx].ptr;
                 return self.descend(id, stack).await.map(Some);
             }
             stack.pop();
@@ -188,7 +207,7 @@ impl TreeIter {
         Ok(None)
     }
 
-    fn materialize(&self, stack: &[Frame], leaf: &Leaf) -> Vec<(Bytes, Bytes)> {
+    fn materialize(&self, stack: &[Frame], leaf: &Leaf) -> Vec<(Bytes, Version)> {
         // The leaf's key range is the intersection of every ancestor's child
         // bounds; a frame's own bound is `None` where it inherits its parent's.
         let (lo, hi) = stack.iter().fold((None, None), |(lo, hi), f| {
@@ -200,25 +219,22 @@ impl TreeIter {
                 && hi.is_none_or(|hi: &Bytes| k < hi)
                 && self.range.contains(k)
         };
-        let base: BTreeMap<Bytes, Msg> = leaf
+        let base: BTreeMap<Bytes, Version> = leaf
             .entries
             .iter()
             .filter(|(k, _)| self.range.contains(k))
-            .map(|(k, v)| (k.clone(), Msg::Put(v.clone())))
+            .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        // Deepest buffers first so upper (newer) levels overwrite them.
-        let view = stack.iter().rev().fold(base, |mut view, f| {
-            view.extend(
-                f.node
-                    .buffer
-                    .iter()
-                    .filter(|(k, _)| in_leaf(k))
-                    .map(|(k, m)| (k.clone(), m.clone())),
-            );
-            view
-        });
-        view.into_iter()
-            .filter_map(|(k, m)| m.into_value().map(|v| (k, v)))
+        stack
+            .iter()
+            .flat_map(|f| f.node.buffer.iter().filter(|(k, _)| in_leaf(k)))
+            .fold(base, |mut view, (k, v)| {
+                if view.get(k).is_none_or(|old| v.ts > old.ts) {
+                    view.insert(k.clone(), v.clone());
+                }
+                view
+            })
+            .into_iter()
             .collect()
     }
 }
@@ -233,8 +249,8 @@ enum Rewrite {
     /// The subtree is now `first` followed by `rest`, each tagged with its
     /// lowest key (the pivot to insert before it).
     Nodes {
-        first: NodePtr,
-        rest: Vec<(Bytes, NodePtr)>,
+        first: Child,
+        rest: Vec<(Bytes, Child)>,
     },
 }
 
@@ -255,13 +271,15 @@ pub async fn apply(
     cfg: &TreeConfig,
     seg: SegmentId,
     root: Option<TreeRoot>,
-    msgs: Vec<(Bytes, Msg)>,
+    msgs: Vec<(Bytes, Version)>,
     victims: &HashSet<SegmentId>,
+    drop_tombstones_below: Ts,
 ) -> Result<Plan> {
     let mut w = Writer {
         nodes,
         cfg,
         victims,
+        drop_below: drop_tombstones_below,
         dirty: HashSet::new(),
         seg,
         buf: BytesMut::new(),
@@ -288,6 +306,8 @@ struct Writer<'a> {
     nodes: &'a Nodes,
     cfg: &'a TreeConfig,
     victims: &'a HashSet<SegmentId>,
+    /// Tombstones older than this are dropped when their leaf is rewritten.
+    drop_below: Ts,
     /// Internal nodes with a node in `victims` at or below them.
     dirty: HashSet<NodePtr>,
     seg: SegmentId,
@@ -299,6 +319,10 @@ struct Writer<'a> {
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 impl Writer<'_> {
+    fn needs_purge(&self, oldest_tombstone: Option<Ts>) -> bool {
+        oldest_tombstone.is_some_and(|t| t < self.drop_below)
+    }
+
     /// Whether the subtree at `ptr` holds a node that must move.
     fn needs_move(&self, ptr: NodePtr) -> bool {
         self.victims.contains(&ptr.seg) || self.dirty.contains(&ptr)
@@ -315,8 +339,8 @@ impl Writer<'_> {
                 return Ok(self.victims.contains(&ptr.seg));
             };
             let mut dirty = self.victims.contains(&ptr.seg);
-            for &child in &node.children {
-                dirty |= self.mark_dirty(child, height - 1).await?;
+            for child in &node.children {
+                dirty |= self.mark_dirty(child.ptr, height - 1).await?;
             }
             if dirty {
                 self.dirty.insert(ptr);
@@ -328,17 +352,20 @@ impl Writer<'_> {
     async fn apply_root(
         &mut self,
         root: Option<TreeRoot>,
-        msgs: Vec<(Bytes, Msg)>,
+        msgs: Vec<(Bytes, Version)>,
     ) -> Result<Option<TreeRoot>> {
         let (mut level, mut height) = match root {
             None => {
-                let puts = msgs
-                    .into_iter()
-                    .filter_map(|(k, m)| m.into_value().map(|v| (k, v)))
-                    .collect();
-                (self.write_leaves(puts), 0)
+                let entries = apply_to_leaf(Vec::new(), msgs, self.drop_below);
+                (self.write_leaves(entries), 0)
             }
-            Some(r) if msgs.is_empty() && !self.needs_move(r.ptr) => return Ok(Some(r)),
+            Some(r)
+                if msgs.is_empty()
+                    && !self.needs_move(r.ptr)
+                    && !self.needs_purge(r.oldest_tombstone) =>
+            {
+                return Ok(Some(r));
+            }
             Some(r) => (self.rewrite(r.ptr, msgs).await?, r.height),
         };
         // Grow upward while the top level still has several nodes.
@@ -346,7 +373,11 @@ impl Writer<'_> {
             match level {
                 Rewrite::Removed => return Ok(None),
                 Rewrite::Nodes { first, rest } if rest.is_empty() => {
-                    break TreeRoot { ptr: first, height };
+                    break TreeRoot {
+                        ptr: first.ptr,
+                        oldest_tombstone: first.oldest_tombstone,
+                        height,
+                    };
                 }
                 Rewrite::Nodes { first, rest } => {
                     let (pivots, more): (Vec<_>, Vec<_>) = rest.into_iter().unzip();
@@ -366,8 +397,10 @@ impl Writer<'_> {
             if *ptr != root.ptr || node.children.len() != 1 || !node.buffer.is_empty() {
                 break;
             }
+            let only = node.children[0];
             root = TreeRoot {
-                ptr: node.children[0],
+                ptr: only.ptr,
+                oldest_tombstone: only.oldest_tombstone,
                 height: root.height - 1,
             };
             self.buf.truncate(ptr.offset as usize);
@@ -377,25 +410,22 @@ impl Writer<'_> {
     }
 
     /// Rewrites the node at `ptr` with `msgs` applied, moving any victim
-    /// nodes below it.
-    fn rewrite(&mut self, ptr: NodePtr, msgs: Vec<(Bytes, Msg)>) -> BoxFut<'_, Rewrite> {
+    /// nodes below it and dropping tombstones that became droppable.
+    fn rewrite(&mut self, ptr: NodePtr, msgs: Vec<(Bytes, Version)>) -> BoxFut<'_, Rewrite> {
         Box::pin(async move {
             let node = self.nodes.load(ptr).await?;
             self.freed.push(ptr);
             match node {
-                // A pure move keeps the leaf as is.
-                Node::Leaf(leaf) if msgs.is_empty() => Ok(Rewrite::Nodes {
-                    first: self.write(Node::Leaf(leaf)),
-                    rest: Vec::new(),
-                }),
-                Node::Leaf(leaf) => {
-                    Ok(self.write_leaves(apply_to_entries(leaf.entries.clone(), msgs)))
-                }
+                Node::Leaf(leaf) => Ok(self.write_leaves(apply_to_leaf(
+                    leaf.entries.clone(),
+                    msgs,
+                    self.drop_below,
+                ))),
                 Node::Internal(old) => {
                     let mut node = Internal {
                         pivots: old.pivots.clone(),
                         children: old.children.clone(),
-                        buffer: merge_msgs(old.buffer.clone(), msgs),
+                        buffer: merge_versions(old.buffer.clone(), msgs),
                     };
                     while node.buffer_bytes() > self.cfg.buffer_capacity(&node) {
                         let pending = node.pending_per_child();
@@ -405,15 +435,22 @@ impl Writer<'_> {
                             .max_by_key(|(_, b)| **b)
                             .expect("an internal node has children");
                         let slice = node.buffer.drain(node.buffer_slice(i)).collect();
-                        let rewrite = self.rewrite(node.children[i], slice).await?;
+                        let rewrite = self.rewrite(node.children[i].ptr, slice).await?;
                         splice(&mut node, i, rewrite);
                     }
-                    // Move children still holding victims. Replacements live
-                    // in the new segment, so the scan steps past them.
+                    // Rewrite children that hold victims or droppable
+                    // tombstones. Replacements need neither, so the scan steps
+                    // past them. The child takes this node's messages for its
+                    // range along: every rewrite carries its ancestors' messages
+                    // down, so a rewritten leaf has no older version of its keys
+                    // above it, and a tombstone there can go once no writer can
+                    // still produce an older version.
                     let mut i = 0;
                     while i < node.children.len() {
-                        if self.needs_move(node.children[i]) {
-                            let rewrite = self.rewrite(node.children[i], Vec::new()).await?;
+                        let child = node.children[i];
+                        if self.needs_move(child.ptr) || self.needs_purge(child.oldest_tombstone) {
+                            let slice = node.buffer.drain(node.buffer_slice(i)).collect();
+                            let rewrite = self.rewrite(child.ptr, slice).await?;
                             splice(&mut node, i, rewrite);
                         } else {
                             i += 1;
@@ -431,6 +468,14 @@ impl Writer<'_> {
         })
     }
 
+    fn write_child(&mut self, node: Node) -> Child {
+        let oldest_tombstone = node.oldest_tombstone();
+        Child {
+            ptr: self.write(node),
+            oldest_tombstone,
+        }
+    }
+
     fn write(&mut self, node: Node) -> NodePtr {
         let frame = codec::encode(codec::NODE, &node);
         let ptr = NodePtr {
@@ -443,15 +488,15 @@ impl Writer<'_> {
         ptr
     }
 
-    fn write_leaves(&mut self, entries: Vec<(Bytes, Bytes)>) -> Rewrite {
+    fn write_leaves(&mut self, entries: Vec<(Bytes, Version)>) -> Rewrite {
         if entries.is_empty() {
             return Rewrite::Removed;
         }
-        let chunks = if entries_bytes(&entries) <= self.cfg.leaf_max_bytes {
+        let chunks = if msgs_bytes(&entries) <= self.cfg.leaf_max_bytes {
             vec![entries]
         } else {
             chunk_by_bytes(entries, self.cfg.leaf_split_target(), |(k, v)| {
-                entry_bytes(k, v.len())
+                entry_bytes(k, v.msg.encoded_len())
             })
         };
         let mut ids = chunks.into_iter().map(|entries| {
@@ -460,10 +505,10 @@ impl Writer<'_> {
         });
         let (_, first) = ids.next().expect("non-empty entries yield a chunk");
         let rest: Vec<_> = ids.collect();
-        let first = self.write(first);
+        let first = self.write_child(first);
         let rest = rest
             .into_iter()
-            .map(|(low, n)| (low, self.write(n)))
+            .map(|(low, n)| (low, self.write_child(n)))
             .collect();
         Rewrite::Nodes { first, rest }
     }
@@ -496,11 +541,11 @@ impl Writer<'_> {
             .collect();
         let mut groups = groups.into_iter();
         let (_, first) = groups.next().expect("at least one group");
-        let first = self.write(Node::Internal(Arc::new(first)));
+        let first = self.write_child(Node::Internal(Arc::new(first)));
         let rest = groups
             .map(|(lo, g)| {
                 let lo = lo.expect("groups after the first have a lower pivot");
-                (lo, self.write(Node::Internal(Arc::new(g))))
+                (lo, self.write_child(Node::Internal(Arc::new(g))))
             })
             .collect();
         Rewrite::Nodes { first, rest }
@@ -509,19 +554,36 @@ impl Writer<'_> {
 
 /// Replaces child `i` of `node` with the result of rewriting it.
 fn splice(node: &mut Internal, i: usize, rewrite: Rewrite) {
-    match rewrite {
-        Rewrite::Removed => {
-            node.children.remove(i);
-            // Hand the removed range to a neighbor by dropping one boundary.
-            if !node.pivots.is_empty() {
-                node.pivots.remove(i.saturating_sub(1));
+    let replacement = match rewrite {
+        Rewrite::Removed => None,
+        Rewrite::Nodes { first, rest } => Some((first, rest)),
+    };
+    splice_children(&mut node.pivots, &mut node.children, i, replacement);
+}
+
+/// Replaces child `i` with `first` followed by `rest` (each tagged with the
+/// pivot that goes before it), or removes it (`None`), handing its key range
+/// to a neighbor. Keeps `children.len() == pivots.len() + 1`.
+pub(crate) fn splice_children<P, C>(
+    pivots: &mut Vec<P>,
+    children: &mut Vec<C>,
+    i: usize,
+    replacement: Option<(C, Vec<(P, C)>)>,
+) {
+    match replacement {
+        None => {
+            children.remove(i);
+            // Drop one boundary: the left neighbor's upper one, or for the
+            // first child, the right neighbor's lower one.
+            if !pivots.is_empty() {
+                pivots.remove(i.saturating_sub(1));
             }
         }
-        Rewrite::Nodes { first, rest } => {
-            node.children[i] = first;
-            let (lows, ids): (Vec<_>, Vec<_>) = rest.into_iter().unzip();
-            node.children.splice(i + 1..i + 1, ids);
-            node.pivots.splice(i..i, lows);
+        Some((first, rest)) => {
+            children[i] = first;
+            let (lows, more): (Vec<_>, Vec<_>) = rest.into_iter().unzip();
+            children.splice(i + 1..i + 1, more);
+            pivots.splice(i..i, lows);
         }
     }
 }

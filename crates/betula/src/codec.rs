@@ -6,7 +6,8 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{Error, Result};
 
-const VERSION: u8 = 1;
+// 2: timestamped versions, per-writer logs.
+const VERSION: u8 = 2;
 
 #[derive(Copy, Clone, Debug)]
 pub struct Kind {
@@ -16,6 +17,7 @@ pub struct Kind {
 pub const MANIFEST: Kind = Kind { magic: *b"BTMF" };
 pub const WAL: Kind = Kind { magic: *b"BTWL" };
 pub const NODE: Kind = Kind { magic: *b"BTND" };
+pub const LEASE: Kind = Kind { magic: *b"BTLS" };
 
 pub fn encode<T: Serialize>(kind: Kind, value: &T) -> Bytes {
     // Serializing owned in-memory types into a Vec cannot fail.

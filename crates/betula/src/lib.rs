@@ -1,21 +1,28 @@
-//! betula: a copy-on-write Bε-tree on object storage.
+//! betula: a copy-on-write Bε-tree on object storage with any number of
+//! concurrent writers.
 //!
-//! - Writes go to a WAL on object storage, then a memtable, then are applied
-//!   to the tree in batches. Each batch writes new nodes (copy-on-write) and
-//!   publishes a new manifest with put-if-absent.
-//! - Internal nodes buffer messages for their children (the Bε part), so a
-//!   batch only rewrites the root-to-leaf paths whose buffers overflow.
-//! - Internal nodes are cached separately and warmed on open, so a cold point
-//!   read costs one GET.
+//! - Each writer appends timestamped writes (hybrid logical clock) to its own
+//!   log on object storage. Writers never coordinate.
+//! - One process at a time holds the applier role. It folds every writer's
+//!   log into the tree in batches, writing changed nodes into one segment
+//!   object per batch (copy-on-write), and publishes a new manifest with
+//!   put-if-absent. Any writer takes the role over if entries go unapplied.
+//! - Versions merge newest-wins, so order of application doesn't matter.
+//! - Internal nodes buffer messages for their children (the Bε part), are
+//!   cached separately and warmed on open, so a cold point read costs one GET.
 
 mod codec;
 mod db;
 mod error;
+mod follow;
 mod gc;
+mod hlc;
 mod manifest;
 mod memtable;
 mod node;
 mod nodes;
+#[cfg(kani)]
+mod proofs;
 mod reader;
 mod retry;
 mod segments;
@@ -25,9 +32,12 @@ mod tree;
 mod types;
 mod wal;
 
-pub use db::{Clock, Db, DbConfig, DbStats, Durability, SystemClock, WriteBatch};
+pub use db::{
+    ApplierRole, Clock, Db, DbConfig, DbStats, Durability, LeaseConfig, SystemClock, WriteBatch,
+};
 pub use error::{Error, Result};
 pub use gc::{GcConfig, GcStats};
+pub use hlc::{Ts, WriterId};
 pub use nodes::CacheConfig;
 pub use reader::{DbReader, ReaderConfig};
 pub use segments::{CleanerConfig, SegmentTable, SegmentUsage};

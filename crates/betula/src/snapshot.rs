@@ -5,29 +5,27 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::error::Result;
-use crate::memtable::{MemMerge, Memtable};
+use crate::memtable::{MemCursor, Memtable};
 use crate::nodes::Nodes;
 use crate::tree::{self, TreeIter};
-use crate::types::{KeyRange, Msg, TreeRoot};
+use crate::types::{KeyRange, TreeRoot, Version};
 
-/// A consistent read view: memtables (newest first) over a tree version.
+/// A consistent read view: unapplied writer log tails over a tree version.
 #[derive(Clone)]
 pub struct Snapshot {
-    pub mems: Vec<Memtable>,
+    pub tails: Memtable,
     pub tree: Option<TreeRoot>,
 }
 
 impl Snapshot {
-    pub async fn get(&self, nodes: &Nodes, key: &[u8]) -> Result<Option<Bytes>> {
-        match self.mems.iter().find_map(|m| m.get(key)) {
-            Some(msg) => Ok(msg.clone().into_value()),
-            None => tree::get(nodes, self.tree, key).await,
-        }
+    pub async fn get(&self, nodes: &Nodes, key: &[u8]) -> Result<Option<Version>> {
+        let tree = tree::get(nodes, self.tree, key).await?;
+        Ok(Version::newest(self.tails.get(key).cloned(), tree))
     }
 
     pub fn scan(self, nodes: Arc<Nodes>, range: KeyRange) -> DbIterator {
         DbIterator {
-            mem: MemMerge::new(self.mems, &range),
+            tails: MemCursor::new(self.tails, &range),
             tree: TreeIter::new(nodes, self.tree, range),
             tree_buf: VecDeque::new(),
             tree_done: false,
@@ -37,21 +35,15 @@ impl Snapshot {
 
 /// Ordered iterator over live key/value pairs in a range.
 pub struct DbIterator {
-    mem: MemMerge,
+    tails: MemCursor,
     tree: TreeIter,
-    tree_buf: VecDeque<(Bytes, Bytes)>,
+    tree_buf: VecDeque<(Bytes, Version)>,
     tree_done: bool,
 }
 
-enum Pick {
-    Mem,
-    Tree,
-    /// Same key on both sides: the memtable is newer.
-    MemShadowingTree,
-}
-
 impl DbIterator {
-    pub async fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+    /// The next live pair and the timestamp of the version it came from.
+    pub async fn next_versioned(&mut self) -> Result<Option<(Bytes, Version)>> {
         loop {
             if self.tree_buf.is_empty() && !self.tree_done {
                 match self.tree.next_chunk().await? {
@@ -59,28 +51,33 @@ impl DbIterator {
                     None => self.tree_done = true,
                 }
             }
-            let pick = match (self.mem.peek_key(), self.tree_buf.front()) {
+            let order = match (self.tails.peek(), self.tree_buf.front()) {
                 (None, None) => return Ok(None),
-                (Some(_), None) => Pick::Mem,
-                (None, Some(_)) => Pick::Tree,
-                (Some(mk), Some((tk, _))) => match mk.cmp(tk) {
-                    Ordering::Less => Pick::Mem,
-                    Ordering::Greater => Pick::Tree,
-                    Ordering::Equal => Pick::MemShadowingTree,
-                },
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (Some((a, _)), Some((b, _))) => a.cmp(b),
             };
-            let mem_msg = match pick {
-                Pick::Tree => return Ok(self.tree_buf.pop_front()),
-                Pick::Mem => self.mem.pop(),
-                Pick::MemShadowingTree => {
-                    self.tree_buf.pop_front();
-                    self.mem.pop()
+            let (key, version) = match order {
+                Ordering::Less => self.tails.pop(),
+                Ordering::Greater => self.tree_buf.pop_front(),
+                Ordering::Equal => {
+                    let (k, a) = self.tails.pop().expect("peeked");
+                    let (_, b) = self.tree_buf.pop_front().expect("peeked");
+                    Some((k, if b.ts > a.ts { b } else { a }))
                 }
-            };
-            if let Some((k, Msg::Put(v))) = mem_msg {
-                return Ok(Some((k, v)));
+            }
+            .expect("one side was non-empty");
+            if version.value().is_some() {
+                return Ok(Some((key, version)));
             }
         }
+    }
+
+    pub async fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+        Ok(self.next_versioned().await?.and_then(|(k, v)| match v.msg {
+            crate::types::Msg::Put(value) => Some((k, value)),
+            crate::types::Msg::Delete => None,
+        }))
     }
 
     pub async fn collect(mut self) -> Result<Vec<(Bytes, Bytes)>> {

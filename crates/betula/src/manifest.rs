@@ -2,17 +2,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec;
 use crate::error::{Error, Result};
+use crate::hlc::WriterId;
 use crate::segments::SegmentTable;
 use crate::store::{CreateOutcome, Store};
-use crate::types::{Epoch, ManifestId, SegmentId, TreeRoot, WalId};
+use crate::types::{Epoch, ManifestId, SegmentId, TreeRoot};
+
+/// Last applied log sequence number per writer.
+pub type Frontier = std::collections::BTreeMap<WriterId, u64>;
 
 /// One published database version.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
-    pub writer_epoch: Epoch,
+    /// Bumped by every process that takes the applier role. Publishing with
+    /// put-if-absent fences the previous applier.
+    pub applier_epoch: Epoch,
     pub tree: Option<TreeRoot>,
-    /// Every WAL id at or below this is reflected in `tree`.
-    pub wal_replay_after: WalId,
+    /// Writer log entries at or below these sequence numbers are in `tree`.
+    pub frontier: Frontier,
     /// First segment id the publishing writer had not used. Segments at or
     /// above it that exist in storage are orphans of a writer that died
     /// before publishing.
@@ -28,9 +34,9 @@ pub struct Manifest {
 impl Manifest {
     pub fn initial(now_ms: u64) -> Self {
         Self {
-            writer_epoch: Epoch(0),
+            applier_epoch: Epoch(0),
             tree: None,
-            wal_replay_after: WalId::NONE,
+            frontier: Frontier::new(),
             segment_watermark: SegmentId {
                 epoch: Epoch(0),
                 seq: 0,
@@ -41,10 +47,10 @@ impl Manifest {
         }
     }
 
-    /// The same tree claimed by the next writer epoch.
+    /// The same tree claimed by the next applier epoch.
     pub fn fenced(&self, now_ms: u64) -> Self {
         Self {
-            writer_epoch: self.writer_epoch.next(),
+            applier_epoch: self.applier_epoch.next(),
             dead: Vec::new(),
             created_at_ms: now_ms,
             ..self.clone()

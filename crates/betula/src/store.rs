@@ -2,7 +2,8 @@
 //!
 //! - `manifest/{id:020}.mf`: immutable manifests; the highest id is current.
 //!   Writers publish with put-if-absent, which is the only coordination point.
-//! - `wal/{id:020}.wal`: write-ahead log batches, also put-if-absent.
+//! - `writers/{writer}/wal/{seq:020}.wal`: each writer's log, put-if-absent.
+//! - `writers/{writer}/lease`: each writer's liveness and timestamp floor.
 //! - `seg/{epoch:020}-{seq:020}.seg`: one per checkpoint, holding every node
 //!   that checkpoint wrote, back to back. Nodes are read with ranged GETs.
 
@@ -14,7 +15,8 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
 use crate::error::{Error, Result};
-use crate::types::{Epoch, ManifestId, SegmentId, WalId};
+use crate::hlc::WriterId;
+use crate::types::{Epoch, ManifestId, SegmentId};
 
 const DELETE_CONCURRENCY: usize = 32;
 
@@ -48,8 +50,18 @@ impl Store {
         self.dir("manifest").join(format!("{:020}.mf", id.0))
     }
 
-    pub fn wal_path(&self, id: WalId) -> Path {
-        self.dir("wal").join(format!("{:020}.wal", id.0))
+    fn writer_dir(&self, writer: WriterId) -> Path {
+        self.dir("writers").join(writer.to_string())
+    }
+
+    pub fn wal_path(&self, writer: WriterId, seq: u64) -> Path {
+        self.writer_dir(writer)
+            .join("wal")
+            .join(format!("{seq:020}.wal"))
+    }
+
+    pub fn lease_path(&self, writer: WriterId) -> Path {
+        self.writer_dir(writer).join("lease")
     }
 
     pub fn segment_path(&self, id: SegmentId) -> Path {
@@ -139,15 +151,27 @@ impl Store {
         Ok(ids)
     }
 
-    pub async fn list_wals(&self) -> Result<Vec<WalId>> {
-        let mut ids: Vec<_> = self
-            .list_names("wal", None)
-            .await?
+    pub async fn list_writers(&self) -> Result<Vec<WriterId>> {
+        let listing = self
+            .os
+            .list_with_delimiter(Some(&self.dir("writers")))
+            .await?;
+        Ok(listing
+            .common_prefixes
             .iter()
-            .filter_map(|n| parse_num(n, ".wal").map(WalId))
+            .filter_map(|p| p.filename().and_then(WriterId::parse))
+            .collect())
+    }
+
+    pub async fn list_wals(&self, writer: WriterId) -> Result<Vec<u64>> {
+        let prefix = self.writer_dir(writer).join("wal");
+        let metas: Vec<_> = self.os.list(Some(&prefix)).try_collect().await?;
+        let mut seqs: Vec<u64> = metas
+            .iter()
+            .filter_map(|m| m.location.filename().and_then(|n| parse_num(n, ".wal")))
             .collect();
-        ids.sort();
-        Ok(ids)
+        seqs.sort();
+        Ok(seqs)
     }
 
     /// Segment ids at or after `from`, sorted.

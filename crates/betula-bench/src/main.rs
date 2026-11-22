@@ -69,6 +69,16 @@ struct Args {
     inner_cache_mib: u64,
     #[arg(long, default_value_t = 384)]
     leaf_cache_mib: u64,
+    /// Concurrent betula writers on the database (clients are spread across
+    /// them). SlateDB allows one.
+    #[arg(long, default_value_t = 1)]
+    writers: usize,
+    /// How often betula writers poll for each other's entries.
+    #[arg(long, default_value_t = 100)]
+    poll_ms: u64,
+    /// Cross-writer visibility samples (betula, 2+ writers).
+    #[arg(long, default_value_t = 100)]
+    visibility_samples: u64,
     /// betula cleans segments whose live fraction is below this.
     #[arg(long, default_value_t = 0.25)]
     clean_below: f64,
@@ -198,7 +208,7 @@ async fn write_phase(
                 .map(|i| wl.load_order(i + offset))
                 .map(|id| (wl.key(id), wl.value(id, version)))
                 .collect();
-            db.write(pairs).await
+            db.write(b, pairs).await
         }
     })
     .await
@@ -293,6 +303,11 @@ async fn bench_engine(
         inner_cache_bytes: args.inner_cache_mib << 20,
         leaf_cache_bytes: args.leaf_cache_mib << 20,
         clean_below_live: args.clean_below,
+        poll: Duration::from_millis(args.poll_ms),
+    };
+    let writers = match kind {
+        EngineKind::Betula => args.writers,
+        EngineKind::Slatedb => 1,
     };
     let c = args.concurrency;
     let mut phases = Vec::new();
@@ -309,7 +324,7 @@ async fn bench_engine(
         io_mark = now;
     };
 
-    let db = Arc::new(Engine::open(kind, os.clone(), &path, &params).await?);
+    let db = Arc::new(Engine::open(kind, os.clone(), &path, &params, writers).await?);
 
     let (elapsed, hist) = write_phase(db.clone(), wl.clone(), wl.keys, args.batch, c, 0, 0).await?;
     record("load", wl.keys, elapsed, hist, &mut phases);
@@ -322,6 +337,24 @@ async fn bench_engine(
         wl.keys,
         db.describe()
     );
+
+    if writers >= 2 && args.visibility_samples > 0 {
+        let started = Instant::now();
+        let mut hist = Histogram::<u64>::new(3)?;
+        for i in 0..args.visibility_samples {
+            let key = Bytes::from(format!("vis{i:08}"));
+            if let Some(lag) = db.visibility_lag(key, wl.value(i, 9)).await? {
+                hist.record(lag.as_micros() as u64)?;
+            }
+        }
+        record(
+            "visibility",
+            args.visibility_samples,
+            started.elapsed(),
+            hist,
+            &mut phases,
+        );
+    }
 
     let read_phase = |seed: u64, db: Arc<Engine>, version: u64| {
         let wl = wl.clone();
@@ -359,7 +392,8 @@ async fn bench_engine(
     let db = Arc::try_unwrap(db).map_err(|_| anyhow::anyhow!("engine still shared"))?;
     let (elapsed, hist, ()) = timed(db.close()).await?;
     record("close", 1, elapsed, hist, &mut phases);
-    let (elapsed, hist, db) = timed(Engine::open(kind, os.clone(), &path, &params)).await?;
+    let (elapsed, hist, db) =
+        timed(Engine::open(kind, os.clone(), &path, &params, writers)).await?;
     record("reopen", 1, elapsed, hist, &mut phases);
     let db = Arc::new(db);
 

@@ -4,7 +4,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Msg, NodePtr, entry_bytes};
+use crate::hlc::Ts;
+use crate::types::{Msg, NodePtr, Version, entry_bytes};
 
 /// Tree node. Nodes are immutable once written: every change produces a new
 /// node under a new id (copy-on-write).
@@ -15,24 +16,49 @@ pub enum Node {
     Internal(Arc<Internal>),
 }
 
-/// Sorted, unique key/value pairs.
+/// Sorted, one version per key. Tombstones stay until no older write can
+/// still arrive.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Leaf {
-    pub entries: Vec<(Bytes, Bytes)>,
+    pub entries: Vec<(Bytes, Version)>,
 }
 
 /// `children[i]` covers keys in `[pivots[i-1], pivots[i])`, so
-/// `children.len() == pivots.len() + 1`. `buffer` is sorted, holds at most one
-/// message per key, and its messages are newer than anything below.
+/// `children.len() == pivots.len() + 1`. `buffer` is sorted and holds at most
+/// one version per key. A buffered version is not necessarily newer than one
+/// below it (a late write from a slow writer), so reads compare timestamps.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Internal {
     pub pivots: Vec<Bytes>,
-    pub children: Vec<NodePtr>,
-    pub buffer: Vec<(Bytes, Msg)>,
+    pub children: Vec<Child>,
+    pub buffer: Vec<(Bytes, Version)>,
+}
+
+/// A child pointer plus the oldest tombstone in that subtree's leaves, so a
+/// checkpoint can find leaves whose tombstones became droppable without
+/// loading any leaf.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Child {
+    pub ptr: NodePtr,
+    pub oldest_tombstone: Option<Ts>,
+}
+
+impl Node {
+    pub fn oldest_tombstone(&self) -> Option<Ts> {
+        match self {
+            Node::Leaf(l) => l
+                .entries
+                .iter()
+                .filter(|(_, v)| v.msg == Msg::Delete)
+                .map(|(_, v)| v.ts)
+                .min(),
+            Node::Internal(i) => i.children.iter().filter_map(|c| c.oldest_tombstone).min(),
+        }
+    }
 }
 
 impl Leaf {
-    pub fn get(&self, key: &[u8]) -> Option<&Bytes> {
+    pub fn get(&self, key: &[u8]) -> Option<&Version> {
         self.entries
             .binary_search_by(|(k, _)| k.as_ref().cmp(key))
             .ok()
@@ -42,10 +68,10 @@ impl Leaf {
 
 impl Internal {
     pub fn child_index(&self, key: &[u8]) -> usize {
-        self.pivots.partition_point(|p| p.as_ref() <= key)
+        child_index::<[u8], _>(&self.pivots, key)
     }
 
-    pub fn buffered(&self, key: &[u8]) -> Option<&Msg> {
+    pub fn buffered(&self, key: &[u8]) -> Option<&Version> {
         self.buffer
             .binary_search_by(|(k, _)| k.as_ref().cmp(key))
             .ok()
@@ -54,26 +80,17 @@ impl Internal {
 
     /// First child that can hold keys at or after `start`.
     pub fn first_child(&self, start: &Bound<Bytes>) -> usize {
-        match start {
-            Bound::Included(k) | Bound::Excluded(k) => self.child_index(k),
-            Bound::Unbounded => 0,
-        }
+        first_child::<[u8], _>(&self.pivots, start)
     }
 
     /// Last child that can hold keys at or before `end`.
     pub fn last_child(&self, end: &Bound<Bytes>) -> usize {
-        match end {
-            Bound::Included(k) => self.child_index(k),
-            // Keys strictly below a pivot never land in the pivot's child.
-            Bound::Excluded(k) => self.pivots.partition_point(|p| p.as_ref() < k.as_ref()),
-            Bound::Unbounded => self.pivots.len(),
-        }
+        last_child::<[u8], _>(&self.pivots, end)
     }
 
     /// Key bounds of child `i`.
     pub fn child_bounds(&self, i: usize) -> (Option<&Bytes>, Option<&Bytes>) {
-        let lo = i.checked_sub(1).map(|j| &self.pivots[j]);
-        (lo, self.pivots.get(i))
+        child_bounds(&self.pivots, i)
     }
 
     /// Index range of `buffer` destined for child `i`.
@@ -91,7 +108,7 @@ impl Internal {
     }
 
     pub fn routing_bytes(&self) -> usize {
-        self.pivots.iter().map(|p| p.len() + 8).sum::<usize>() + self.children.len() * 32
+        self.pivots.iter().map(|p| p.len() + 8).sum::<usize>() + self.children.len() * 56
     }
 
     /// Buffered bytes per child, in child order.
@@ -102,52 +119,88 @@ impl Internal {
     }
 }
 
-pub fn msgs_bytes(msgs: &[(Bytes, Msg)]) -> usize {
+pub fn msgs_bytes(msgs: &[(Bytes, Version)]) -> usize {
     msgs.iter()
-        .map(|(k, m)| entry_bytes(k, m.encoded_len()))
+        .map(|(k, v)| entry_bytes(k, v.msg.encoded_len()))
         .sum()
 }
 
-pub fn entries_bytes(entries: &[(Bytes, Bytes)]) -> usize {
-    entries.iter().map(|(k, v)| entry_bytes(k, v.len())).sum()
+// Routing over sorted pivots, generic so it can be verified with small types.
+// Child `i` covers `[pivots[i-1], pivots[i])`.
+
+pub fn child_index<K: Ord + ?Sized, P: std::borrow::Borrow<K>>(pivots: &[P], key: &K) -> usize {
+    pivots.partition_point(|p| p.borrow() <= key)
 }
 
-/// Merges two sorted unique message runs; `newer` wins on equal keys.
-pub fn merge_msgs(older: Vec<(Bytes, Msg)>, newer: Vec<(Bytes, Msg)>) -> Vec<(Bytes, Msg)> {
-    merge_sorted(older, newer)
+pub fn first_child<K: Ord + ?Sized, P: std::borrow::Borrow<K>>(
+    pivots: &[P],
+    start: &Bound<P>,
+) -> usize {
+    match start {
+        Bound::Included(k) | Bound::Excluded(k) => child_index::<K, P>(pivots, k.borrow()),
+        Bound::Unbounded => 0,
+    }
 }
 
-/// Applies sorted unique messages to sorted unique leaf entries.
-pub fn apply_to_entries(
-    entries: Vec<(Bytes, Bytes)>,
-    msgs: Vec<(Bytes, Msg)>,
-) -> Vec<(Bytes, Bytes)> {
-    let entries = entries.into_iter().map(|(k, v)| (k, Msg::Put(v))).collect();
-    merge_sorted(entries, msgs)
+pub fn last_child<K: Ord + ?Sized, P: std::borrow::Borrow<K>>(
+    pivots: &[P],
+    end: &Bound<P>,
+) -> usize {
+    match end {
+        Bound::Included(k) => child_index::<K, P>(pivots, k.borrow()),
+        // Keys strictly below a pivot never land in the pivot's child.
+        Bound::Excluded(k) => pivots.partition_point(|p| p.borrow() < k.borrow()),
+        Bound::Unbounded => pivots.len(),
+    }
+}
+
+pub fn child_bounds<P>(pivots: &[P], i: usize) -> (Option<&P>, Option<&P>) {
+    let lo = i.checked_sub(1).map(|j| &pivots[j]);
+    (lo, pivots.get(i))
+}
+
+/// Merges two sorted, key-unique runs, keeping the newer version per key.
+pub fn merge_versions(a: Vec<(Bytes, Version)>, b: Vec<(Bytes, Version)>) -> Vec<(Bytes, Version)> {
+    merge_newest(a, b, |v| v.ts)
+}
+
+/// Applies sorted, key-unique versions to leaf entries. Tombstones older than
+/// `drop_below` are removed: by then no older write for their key can arrive.
+pub fn apply_to_leaf(
+    entries: Vec<(Bytes, Version)>,
+    msgs: Vec<(Bytes, Version)>,
+    drop_below: Ts,
+) -> Vec<(Bytes, Version)> {
+    merge_newest(entries, msgs, |v| v.ts)
         .into_iter()
-        .filter_map(|(k, m)| m.into_value().map(|v| (k, v)))
+        .filter(|(_, v)| !(v.msg == Msg::Delete && v.ts < drop_below))
         .collect()
 }
 
-fn merge_sorted<V>(older: Vec<(Bytes, V)>, newer: Vec<(Bytes, V)>) -> Vec<(Bytes, V)> {
-    let mut out = Vec::with_capacity(older.len() + newer.len());
-    let mut a = older.into_iter().peekable();
-    let mut b = newer.into_iter().peekable();
+/// Merges two sorted, key-unique runs. On equal keys the entry with the
+/// larger stamp wins (`a` on a tie).
+pub fn merge_newest<K: Ord, V, T: Ord>(
+    a: Vec<(K, V)>,
+    b: Vec<(K, V)>,
+    stamp: impl Fn(&V) -> T,
+) -> Vec<(K, V)> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let mut a = a.into_iter().peekable();
+    let mut b = b.into_iter().peekable();
     loop {
-        let take_newer = match (a.peek(), b.peek()) {
+        let next = match (a.peek(), b.peek()) {
             (None, None) => break,
-            (Some(_), None) => false,
-            (None, Some(_)) => true,
-            (Some((ka, _)), Some((kb, _))) => {
-                if ka == kb {
-                    a.next();
-                    true
-                } else {
-                    kb < ka
-                }
+            (Some(_), None) => a.next(),
+            (None, Some(_)) => b.next(),
+            (Some((ka, _)), Some((kb, _))) if ka < kb => a.next(),
+            (Some((ka, _)), Some((kb, _))) if kb < ka => b.next(),
+            (Some(_), Some(_)) => {
+                let (k, va) = a.next().expect("peeked");
+                let (_, vb) = b.next().expect("peeked");
+                Some((k, if stamp(&vb) > stamp(&va) { vb } else { va }))
             }
         };
-        out.push(if take_newer { b.next() } else { a.next() }.expect("peeked"));
+        out.extend(next);
     }
     out
 }

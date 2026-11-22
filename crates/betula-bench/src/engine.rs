@@ -33,10 +33,14 @@ pub struct BetulaParams {
     pub inner_cache_bytes: u64,
     pub leaf_cache_bytes: u64,
     pub clean_below_live: f64,
+    /// How often betula writers poll for each other's entries.
+    pub poll: Duration,
 }
 
 pub enum Engine {
-    Betula(betula::Db),
+    /// Several concurrent writers on one database. The first opened takes
+    /// the applier role and serves reads, so its cache is the warm one.
+    Betula(Vec<betula::Db>),
     Slatedb(slatedb::Db),
 }
 
@@ -46,6 +50,7 @@ impl Engine {
         os: Arc<dyn ObjectStore>,
         path: &str,
         params: &BetulaParams,
+        writers: usize,
     ) -> Result<Self> {
         Ok(match kind {
             EngineKind::Betula => {
@@ -61,27 +66,35 @@ impl Engine {
                     },
                     // Same WAL flush interval as SlateDB's default.
                     wal_flush_interval: Duration::from_millis(100),
-                    memtable_bytes: params.memtable_bytes,
+                    checkpoint_bytes: params.memtable_bytes,
+                    poll_interval: params.poll,
                     cleaner: betula::CleanerConfig {
                         clean_below_live: params.clean_below_live,
                         ..betula::CleanerConfig::default()
                     },
                     ..betula::DbConfig::default()
                 };
-                Engine::Betula(betula::Db::open(os, path, cfg).await?)
+                let mut dbs = Vec::with_capacity(writers);
+                for _ in 0..writers.max(1) {
+                    dbs.push(betula::Db::open(os.clone(), path, cfg.clone()).await?);
+                }
+                Engine::Betula(dbs)
             }
             EngineKind::Slatedb => Engine::Slatedb(slatedb::Db::builder(path, os).build().await?),
         })
     }
 
-    /// Writes the pairs atomically; returns once the batch is durable.
-    pub async fn write(&self, pairs: Vec<(Bytes, Bytes)>) -> Result<()> {
+    /// Writes the pairs atomically through writer `slot` (modulo the writer
+    /// count); returns once the batch is durable.
+    pub async fn write(&self, slot: u64, pairs: Vec<(Bytes, Bytes)>) -> Result<()> {
         match self {
-            Engine::Betula(db) => {
+            Engine::Betula(dbs) => {
                 let batch = pairs
                     .into_iter()
                     .fold(betula::WriteBatch::new(), |b, (k, v)| b.put(k, v));
-                db.write(batch, betula::Durability::AwaitDurable).await?
+                dbs[slot as usize % dbs.len()]
+                    .write(batch, betula::Durability::AwaitDurable)
+                    .await?
             }
             Engine::Slatedb(db) => {
                 let batch = pairs
@@ -98,7 +111,7 @@ impl Engine {
 
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         Ok(match self {
-            Engine::Betula(db) => db.get(key).await?,
+            Engine::Betula(dbs) => dbs[0].get(key).await?,
             Engine::Slatedb(db) => db.get(key).await?,
         })
     }
@@ -107,8 +120,8 @@ impl Engine {
     pub async fn scan(&self, start: Bytes, limit: usize) -> Result<usize> {
         let mut n = 0;
         match self {
-            Engine::Betula(db) => {
-                let mut it = db.scan(start..);
+            Engine::Betula(dbs) => {
+                let mut it = dbs[0].scan(start..);
                 while n < limit && it.next().await?.is_some() {
                     n += 1;
                 }
@@ -127,7 +140,19 @@ impl Engine {
     /// (tree checkpoint / L0 flush).
     pub async fn settle(&self) -> Result<()> {
         match self {
-            Engine::Betula(db) => db.checkpoint().await?,
+            Engine::Betula(dbs) => {
+                for db in dbs {
+                    db.flush_wal().await?;
+                }
+                let applier = match dbs.iter().find(|d| d.is_applier()) {
+                    Some(d) => d,
+                    None => {
+                        dbs[0].claim_applier().await?;
+                        &dbs[0]
+                    }
+                };
+                applier.checkpoint().await?
+            }
             Engine::Slatedb(db) => {
                 db.flush_with_options(FlushOptions {
                     flush_type: FlushType::MemTable,
@@ -138,12 +163,30 @@ impl Engine {
         Ok(())
     }
 
+    /// Time from a durable write on one writer until another writer reads it.
+    /// `None` for single-writer engines.
+    pub async fn visibility_lag(&self, key: Bytes, value: Bytes) -> Result<Option<Duration>> {
+        let Engine::Betula(dbs) = self else {
+            return Ok(None);
+        };
+        let [reader, writer, ..] = dbs.as_slice() else {
+            return Ok(None);
+        };
+        writer.put(key.clone(), value.clone()).await?;
+        let start = std::time::Instant::now();
+        while reader.get(&key).await?.as_ref() != Some(&value) {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        Ok(Some(start.elapsed()))
+    }
+
     pub fn describe(&self) -> String {
         match self {
-            Engine::Betula(db) => {
-                let s = db.stats();
+            Engine::Betula(dbs) => {
+                let s = dbs[0].stats();
                 format!(
-                    "manifest={} height={} segments={} live={:.0}%",
+                    "writers={} manifest={} height={} segments={} live={:.0}%",
+                    dbs.len(),
                     s.manifest_id.0,
                     s.tree.map_or(0, |t| t.height),
                     s.segments,
@@ -156,7 +199,15 @@ impl Engine {
 
     pub async fn close(self) -> Result<()> {
         match self {
-            Engine::Betula(db) => db.close().await?,
+            Engine::Betula(dbs) => {
+                // Non-appliers first, so the applier's final checkpoint sees
+                // everything.
+                let (applier, rest): (Vec<_>, Vec<_>) =
+                    dbs.into_iter().partition(|d| d.is_applier());
+                for db in rest.into_iter().chain(applier) {
+                    db.close().await?;
+                }
+            }
             Engine::Slatedb(db) => db.close().await?,
         }
         Ok(())

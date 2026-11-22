@@ -173,7 +173,7 @@ impl Nodes {
             level = nodes
                 .iter()
                 .flat_map(|n| match n {
-                    Node::Internal(i) => i.children.clone(),
+                    Node::Internal(i) => i.children.iter().map(|c| c.ptr).collect(),
                     Node::Leaf(_) => Vec::new(),
                 })
                 .collect();

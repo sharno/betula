@@ -1,17 +1,18 @@
-//! Deletes nodes, WALs and manifests that no reader can need anymore.
+//! Deletes segments, writer log entries and manifests that no reader can
+//! need anymore.
 //!
 //! Manifest `m[i]` lists the segments that died going from `m[i-1]` to `m[i]`.
 //! Once `m[i]` is older than the retention, nobody may still be reading
 //! `m[i-1]` (readers must refresh within the retention), so `m[i]`'s dead
-//! segments, `m[i-1]` itself, and WALs already folded into `m[i]` can go. The
-//! latest manifest is never deleted.
+//! segments, `m[i-1]` itself, and writer log entries already folded into
+//! `m[i]` can go. The latest manifest is never deleted.
 
 use std::time::Duration;
 
 use crate::error::Result;
 use crate::manifest;
+use crate::manifest::Frontier;
 use crate::store::Store;
-use crate::types::WalId;
 
 #[derive(Clone, Copy, Debug)]
 pub struct GcConfig {
@@ -41,7 +42,7 @@ pub async fn run(store: &Store, now_ms: u64, retention: Duration) -> Result<GcSt
     let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
     let ids = store.list_manifests().await?;
     let mut stats = GcStats::default();
-    let mut wal_floor = WalId::NONE;
+    let mut applied = Frontier::new();
     for pair in ids.windows(2) {
         let (prev, cur) = (pair[0], pair[1]);
         let Some(m) = manifest::load(store, cur).await? else {
@@ -57,17 +58,18 @@ pub async fn run(store: &Store, now_ms: u64, retention: Duration) -> Result<GcSt
         // Delete the manifest last so a crash mid-way is retried next run.
         store.delete_all(vec![store.manifest_path(prev)]).await?;
         stats.manifests += 1;
-        wal_floor = m.wal_replay_after;
+        applied = m.frontier;
     }
-    let wals: Vec<_> = store
-        .list_wals()
-        .await?
-        .into_iter()
-        .filter(|id| *id <= wal_floor)
-        .collect();
-    stats.wals = wals.len();
-    store
-        .delete_all(wals.into_iter().map(|id| store.wal_path(id)).collect())
-        .await?;
+    for (writer, upto) in applied {
+        let paths: Vec<_> = store
+            .list_wals(writer)
+            .await?
+            .into_iter()
+            .filter(|seq| *seq <= upto)
+            .map(|seq| store.wal_path(writer, seq))
+            .collect();
+        stats.wals += paths.len();
+        store.delete_all(paths).await?;
+    }
     Ok(stats)
 }

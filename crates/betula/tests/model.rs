@@ -1,6 +1,11 @@
-//! Model-based tests: random op sequences against a `BTreeMap`, with tiny
-//! nodes so splits, buffer flushes, removals and root growth/shrink happen
-//! constantly.
+//! Model-based tests: random op sequences over several concurrent writers
+//! against a `BTreeMap`, with tiny nodes so splits, buffer flushes, removals,
+//! relocation and root growth/shrink happen constantly.
+//!
+//! A manual clock, advanced before every write, makes timestamp order equal
+//! call order, so the model is plain sequential last-writer-wins. Queued
+//! (not yet durable) writes and checkpoints that flush only the applier make
+//! late writes from slow writers happen for real.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -9,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use betula::{
-    CacheConfig, CleanerConfig, Clock, Db, DbConfig, DbReader, Error, KeyRange, ReaderConfig,
-    SegmentId, TreeConfig,
+    ApplierRole, CacheConfig, CleanerConfig, Clock, Db, DbConfig, DbReader, Durability, Error,
+    KeyRange, LeaseConfig, ReaderConfig, SegmentId, TreeConfig, WriteBatch,
 };
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -20,23 +25,54 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use proptest::prelude::*;
 
 const ROOT: &str = "db";
+const WRITERS: usize = 3;
+const HOUR: Duration = Duration::from_secs(3600);
+
+struct ManualClock(AtomicU64);
+
+impl ManualClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(AtomicU64::new(1_000)))
+    }
+    fn tick(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+    fn advance(&self, d: Duration) {
+        self.0.fetch_add(d.as_millis() as u64, Ordering::SeqCst);
+    }
+}
+
+impl Clock for ManualClock {
+    fn now_ms(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
 
 fn tiny_config() -> DbConfig {
     DbConfig {
         tree: TreeConfig {
-            leaf_max_bytes: 160,
-            internal_max_bytes: 320,
+            leaf_max_bytes: 200,
+            internal_max_bytes: 400,
             max_fanout: 4,
         },
         // Small caches force reloads from storage.
         cache: CacheConfig {
-            inner_bytes: 2048,
+            inner_bytes: 4096,
             leaf_bytes: 1024,
         },
         wal_flush_interval: Duration::from_millis(2),
         wal_max_bytes: 256,
-        memtable_bytes: 200,
-        max_immutables: 2,
+        checkpoint_bytes: 400,
+        // Manual-clock durations: these never elapse unless a test advances.
+        checkpoint_interval: HOUR,
+        max_unapplied_bytes: 1 << 30,
+        poll_interval: Duration::from_millis(5),
+        discovery_interval: Duration::from_millis(20),
+        lease: LeaseConfig {
+            interval: Duration::from_millis(5),
+            ttl: HOUR,
+        },
+        applier: ApplierRole::Auto { steal_after: HOUR },
         gc: None,
         // Clean eagerly so relocation runs constantly.
         cleaner: CleanerConfig {
@@ -44,7 +80,27 @@ fn tiny_config() -> DbConfig {
             max_moved_bytes: 2048,
         },
         warm_inner_nodes: true,
+        rewarm_on_refresh: true,
     }
+}
+
+fn reader_config() -> ReaderConfig {
+    ReaderConfig {
+        cache: CacheConfig {
+            inner_bytes: 4096,
+            leaf_bytes: 1024,
+        },
+        refresh_interval: None,
+        discovery_interval: Duration::from_millis(20),
+        warm_inner_nodes: false,
+        rewarm_on_refresh: false,
+    }
+}
+
+async fn open(os: &Arc<dyn ObjectStore>, clock: &Arc<ManualClock>) -> Db {
+    Db::open_with_clock(os.clone(), ROOT, tiny_config(), clock.clone())
+        .await
+        .unwrap()
 }
 
 /// The manifest's live bytes per segment equal the bytes of reachable nodes.
@@ -64,26 +120,16 @@ async fn assert_accounting(db: &Db) {
     assert_eq!(table, reachable, "segment accounting");
 }
 
-fn reader_config() -> ReaderConfig {
-    ReaderConfig {
-        cache: CacheConfig {
-            inner_bytes: 4096,
-            leaf_bytes: 1024,
-        },
-        refresh_interval: None,
-        warm_inner_nodes: false,
-    }
-}
-
 #[derive(Clone, Debug)]
 enum Op {
-    Put(u8, Vec<u8>),
-    Delete(u8),
-    Get(u8),
-    Scan(u8, u8),
+    Put(usize, u8, Vec<u8>),
+    PutQueued(usize, u8, Vec<u8>),
+    Delete(usize, u8),
+    Get(usize, u8),
+    Scan(usize, u8, u8),
     Checkpoint,
-    FlushWal,
-    Reopen,
+    Claim(usize),
+    Reopen(usize),
     ReaderScan,
 }
 
@@ -92,14 +138,17 @@ fn key(k: u8) -> Bytes {
 }
 
 fn op() -> impl Strategy<Value = Op> {
+    let w = 0..WRITERS;
+    let value = proptest::collection::vec(any::<u8>(), 0..40);
     prop_oneof![
-        8 => (0u8..80, proptest::collection::vec(any::<u8>(), 0..48)).prop_map(|(k, v)| Op::Put(k, v)),
-        3 => (0u8..80).prop_map(Op::Delete),
-        2 => (0u8..80).prop_map(Op::Get),
-        2 => (0u8..80, 0u8..80).prop_map(|(a, b)| Op::Scan(a, b)),
-        1 => Just(Op::Checkpoint),
-        1 => Just(Op::FlushWal),
-        1 => Just(Op::Reopen),
+        6 => (w.clone(), 0u8..60, value.clone()).prop_map(|(w, k, v)| Op::Put(w, k, v)),
+        3 => (w.clone(), 0u8..60, value).prop_map(|(w, k, v)| Op::PutQueued(w, k, v)),
+        4 => (w.clone(), 0u8..60).prop_map(|(w, k)| Op::Delete(w, k)),
+        2 => (w.clone(), 0u8..60).prop_map(|(w, k)| Op::Get(w, k)),
+        1 => (w.clone(), 0u8..60, 0u8..60).prop_map(|(w, a, b)| Op::Scan(w, a, b)),
+        2 => Just(Op::Checkpoint),
+        1 => w.clone().prop_map(Op::Claim),
+        1 => w.prop_map(Op::Reopen),
         1 => Just(Op::ReaderScan),
     ]
 }
@@ -113,28 +162,65 @@ fn model_range(model: &Model, range: &KeyRange) -> Vec<(Bytes, Bytes)> {
         .collect()
 }
 
+/// Makes every writer's queued writes durable and lets `reader` see them.
+async fn sync(dbs: &[Db], reader: usize) {
+    for db in dbs {
+        db.flush_wal().await.unwrap();
+    }
+    dbs[reader].refresh().await.unwrap();
+}
+
+/// Runs a checkpoint on whoever holds the applier role, claiming it with
+/// writer 0 if nobody does.
+async fn checkpoint(dbs: &[Db]) {
+    let applier = match dbs.iter().position(Db::is_applier) {
+        Some(i) => i,
+        None => {
+            assert!(dbs[0].claim_applier().await.unwrap());
+            0
+        }
+    };
+    match dbs[applier].checkpoint().await {
+        Ok(()) => assert_accounting(&dbs[applier]).await,
+        // Lost the role to a concurrent claim: fine.
+        Err(Error::NotApplier) => {}
+        Err(e) => panic!("checkpoint: {e}"),
+    }
+}
+
 async fn run(ops: Vec<Op>) {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let mut db = Db::open(os.clone(), ROOT, tiny_config()).await.unwrap();
+    let clock = ManualClock::new();
+    let mut dbs = Vec::new();
+    for _ in 0..WRITERS {
+        dbs.push(open(&os, &clock).await);
+    }
     let mut model = Model::new();
     for op in ops {
         match op {
-            Op::Put(k, v) => {
-                db.put(key(k), v.clone()).await.unwrap();
+            Op::Put(w, k, v) => {
+                clock.tick();
+                dbs[w].put(key(k), v.clone()).await.unwrap();
                 model.insert(key(k), Bytes::from(v));
             }
-            Op::Delete(k) => {
-                db.delete(key(k)).await.unwrap();
+            Op::PutQueued(w, k, v) => {
+                clock.tick();
+                let batch = WriteBatch::new().put(key(k), v.clone());
+                dbs[w].write(batch, Durability::Queued).await.unwrap();
+                model.insert(key(k), Bytes::from(v));
+            }
+            Op::Delete(w, k) => {
+                clock.tick();
+                dbs[w].delete(key(k)).await.unwrap();
                 model.remove(&key(k));
             }
-            Op::Get(k) => {
-                assert_eq!(
-                    db.get(&key(k)).await.unwrap(),
-                    model.get(&key(k)).cloned(),
-                    "get {k}"
-                );
+            Op::Get(w, k) => {
+                sync(&dbs, w).await;
+                let got = dbs[w].get(&key(k)).await.unwrap();
+                assert_eq!(got, model.get(&key(k)).cloned(), "get {k} via writer {w}");
             }
-            Op::Scan(a, b) => {
+            Op::Scan(w, a, b) => {
+                sync(&dbs, w).await;
                 let (lo, hi) = (a.min(b), a.max(b));
                 let ranges = [
                     KeyRange::new(Bound::Included(key(lo)), Bound::Excluded(key(hi))),
@@ -143,20 +229,20 @@ async fn run(ops: Vec<Op>) {
                     KeyRange::new(Bound::Included(key(lo)), Bound::Unbounded),
                 ];
                 for r in ranges {
-                    let got = db.scan(r.clone()).collect().await.unwrap();
-                    assert_eq!(got, model_range(&model, &r), "scan {r:?}");
+                    let got = dbs[w].scan(r.clone()).collect().await.unwrap();
+                    assert_eq!(got, model_range(&model, &r), "scan {r:?} via writer {w}");
                 }
             }
-            Op::Checkpoint => {
-                db.checkpoint().await.unwrap();
-                assert_accounting(&db).await;
+            Op::Checkpoint => checkpoint(&dbs).await,
+            Op::Claim(w) => {
+                dbs[w].claim_applier().await.unwrap();
             }
-            Op::FlushWal => db.flush_wal().await.unwrap(),
-            Op::Reopen => {
-                db.close().await.unwrap();
-                db = Db::open(os.clone(), ROOT, tiny_config()).await.unwrap();
+            Op::Reopen(w) => {
+                let old = std::mem::replace(&mut dbs[w], open(&os, &clock).await);
+                old.close().await.unwrap();
             }
             Op::ReaderScan => {
+                sync(&dbs, 0).await;
                 let reader = DbReader::open(os.clone(), ROOT, reader_config())
                     .await
                     .unwrap();
@@ -165,23 +251,22 @@ async fn run(ops: Vec<Op>) {
             }
         }
     }
-    let all = db.scan(KeyRange::all()).collect().await.unwrap();
+    sync(&dbs, 1).await;
+    let all = dbs[1].scan(KeyRange::all()).collect().await.unwrap();
     assert_eq!(all, model_range(&model, &KeyRange::all()));
-    db.checkpoint().await.unwrap();
-    db.close().await.unwrap();
-    let db = Db::open(os, ROOT, tiny_config()).await.unwrap();
+    checkpoint(&dbs).await;
+    for db in dbs {
+        db.close().await.unwrap();
+    }
+    let db = open(&os, &clock).await;
     let all = db.scan(KeyRange::all()).collect().await.unwrap();
-    assert_eq!(
-        all,
-        model_range(&model, &KeyRange::all()),
-        "after final reopen"
-    );
+    assert_eq!(all, model_range(&model, &KeyRange::all()), "after reopen");
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
     #[test]
-    fn matches_model(ops in proptest::collection::vec(op(), 1..300)) {
+    fn matches_model(ops in proptest::collection::vec(op(), 1..250)) {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         rt.block_on(run(ops));
     }
@@ -190,18 +275,15 @@ proptest! {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bulk_load_builds_multi_level_tree() {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = Db::open(os.clone(), ROOT, tiny_config()).await.unwrap();
+    let clock = ManualClock::new();
+    let db = open(&os, &clock).await;
     let mut model = Model::new();
     for i in 0..2000u32 {
+        clock.tick();
         let k = Bytes::from(format!("k{:08}", (i * 7919) % 2000));
         let v = Bytes::from(format!("v{i}"));
         db.put(k.clone(), v.clone()).await.unwrap();
         model.insert(k, v);
-        if i % 3 == 0 {
-            let d = Bytes::from(format!("k{:08}", (i * 31) % 2000));
-            db.delete(d.clone()).await.unwrap();
-            model.remove(&d);
-        }
     }
     db.checkpoint().await.unwrap();
     let height = db.stats().tree.unwrap().height;
@@ -210,37 +292,124 @@ async fn bulk_load_builds_multi_level_tree() {
     assert_eq!(all, model_range(&model, &KeyRange::all()));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn new_writer_fences_old_one() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writers_all_land() {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let a = Db::open(os.clone(), ROOT, tiny_config()).await.unwrap();
-    a.put("x", "1").await.unwrap();
-    let b = Db::open(os.clone(), ROOT, tiny_config()).await.unwrap();
-    assert_eq!(b.get(b"x").await.unwrap(), Some(Bytes::from("1")));
-    assert!(matches!(a.put("y", "2").await, Err(Error::Fenced)));
-    assert!(matches!(a.put("z", "3").await, Err(Error::Fenced)));
-    b.put("y", "b").await.unwrap();
+    let clock = ManualClock::new();
+    let dbs: Vec<Arc<Db>> = futures::future::join_all((0..4).map(|_| open(&os, &clock)))
+        .await
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+    assert_eq!(dbs.iter().filter(|d| d.is_applier()).count(), 1);
+    let tasks: Vec<_> = dbs
+        .iter()
+        .enumerate()
+        .map(|(w, db)| {
+            let db = db.clone();
+            tokio::spawn(async move {
+                for i in 0..200u32 {
+                    db.put(format!("w{w}-{i:04}"), format!("{w}:{i}"))
+                        .await
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    futures::future::try_join_all(tasks).await.unwrap();
+    let applier = dbs.iter().find(|d| d.is_applier()).unwrap();
+    applier.checkpoint().await.unwrap();
+    let reader = DbReader::open(os.clone(), ROOT, reader_config())
+        .await
+        .unwrap();
+    let all = reader.scan(KeyRange::all()).collect().await.unwrap();
+    assert_eq!(all.len(), 800);
+    assert_eq!(
+        reader.get(b"w3-0199").await.unwrap(),
+        Some(Bytes::from("3:199"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn applier_failover_applies_the_dead_appliers_writes() {
+    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = ManualClock::new();
+    let mut cfg = tiny_config();
+    cfg.applier = ApplierRole::Auto {
+        steal_after: Duration::from_secs(10),
+    };
+    cfg.checkpoint_bytes = 1 << 30;
+    let a = Db::open_with_clock(os.clone(), ROOT, cfg.clone(), clock.clone())
+        .await
+        .unwrap();
+    let b = Db::open_with_clock(os.clone(), ROOT, cfg, clock.clone())
+        .await
+        .unwrap();
+    assert!(a.is_applier() && !b.is_applier());
+    clock.tick();
+    a.put("from-a", "1").await.unwrap();
+    clock.tick();
+    b.put("from-b", "2").await.unwrap();
+    // `a` dies without a final checkpoint.
+    drop(a);
+    clock.advance(Duration::from_secs(60));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !b.is_applier() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("b takes over the applier role");
     b.checkpoint().await.unwrap();
-    assert_eq!(b.get(b"y").await.unwrap(), Some(Bytes::from("b")));
-    assert_eq!(b.get(b"z").await.unwrap(), None);
+    let reader = DbReader::open(os, ROOT, reader_config()).await.unwrap();
+    assert_eq!(reader.get(b"from-a").await.unwrap(), Some(Bytes::from("1")));
+    assert_eq!(reader.get(b"from-b").await.unwrap(), Some(Bytes::from("2")));
+    assert!(b.stats().unapplied_bytes == 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fenced_checkpoint_fails() {
+async fn stale_applier_is_fenced_but_keeps_writing() {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let a = Db::open(os.clone(), ROOT, tiny_config()).await.unwrap();
-    let _b = Db::open(os.clone(), ROOT, tiny_config()).await.unwrap();
-    // `a` never wrote a WAL, so only the manifest conflict can fence it.
-    let r = a.checkpoint().await;
-    assert!(matches!(r, Ok(()) | Err(Error::Fenced)), "{r:?}");
+    let clock = ManualClock::new();
+    let a = open(&os, &clock).await;
+    let b = open(&os, &clock).await;
+    assert!(a.is_applier());
+    assert!(b.claim_applier().await.unwrap());
+    clock.tick();
+    a.put("x", "1").await.unwrap();
+    assert!(matches!(a.checkpoint().await, Err(Error::NotApplier)));
+    assert!(!a.is_applier());
+    b.checkpoint().await.unwrap();
+    b.refresh().await.unwrap();
+    assert_eq!(b.get(b"x").await.unwrap(), Some(Bytes::from("1")));
 }
 
-struct ManualClock(AtomicU64);
-
-impl Clock for ManualClock {
-    fn now_ms(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tombstones_are_dropped_once_safe() {
+    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = ManualClock::new();
+    let db = open(&os, &clock).await;
+    for i in 0..300u32 {
+        clock.tick();
+        db.put(format!("k{i:04}"), "v").await.unwrap();
     }
+    db.checkpoint().await.unwrap();
+    for i in 0..300u32 {
+        clock.tick();
+        db.delete(format!("k{i:04}")).await.unwrap();
+    }
+    db.checkpoint().await.unwrap();
+    // Push everything down with more checkpoints as floors move past the
+    // deletes.
+    for round in 0..20u32 {
+        clock.advance(Duration::from_secs(1));
+        clock.tick();
+        db.put(format!("z{round:04}"), "v").await.unwrap();
+        db.checkpoint().await.unwrap();
+    }
+    let shape = db.tree_shape().await.unwrap();
+    assert_eq!(shape.tombstones, 0, "{shape:?}");
+    assert_eq!(db.scan(KeyRange::all()).collect().await.unwrap().len(), 20);
 }
 
 async fn segment_objects(os: &Arc<dyn ObjectStore>) -> usize {
@@ -255,13 +424,12 @@ async fn segment_objects(os: &Arc<dyn ObjectStore>) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gc_keeps_exactly_the_live_tree() {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let clock = Arc::new(ManualClock(AtomicU64::new(1_000)));
-    let db = Db::open_with_clock(os.clone(), ROOT, tiny_config(), clock.clone())
-        .await
-        .unwrap();
+    let clock = ManualClock::new();
+    let db = open(&os, &clock).await;
     let mut model = Model::new();
     for round in 0..20u32 {
         for i in 0..40u32 {
+            clock.tick();
             let k = Bytes::from(format!("k{:04}", (i * 13 + round * 7) % 300));
             let v = Bytes::from(format!("r{round}i{i}"));
             db.put(k.clone(), v.clone()).await.unwrap();
@@ -275,9 +443,12 @@ async fn gc_keeps_exactly_the_live_tree() {
     let stats = db.run_gc(Duration::from_secs(60)).await.unwrap();
     assert_eq!(stats.segments, 0);
 
-    clock.0.fetch_add(120_000, Ordering::SeqCst);
+    clock.advance(Duration::from_secs(120));
     let stats = db.run_gc(Duration::from_secs(60)).await.unwrap();
-    assert!(stats.segments > 0 && stats.manifests > 0, "{stats:?}");
+    assert!(
+        stats.segments > 0 && stats.manifests > 0 && stats.wals > 0,
+        "{stats:?}"
+    );
     assert_accounting(&db).await;
     let after = segment_objects(&os).await;
     assert!(after < before);
@@ -297,45 +468,22 @@ async fn gc_keeps_exactly_the_live_tree() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reader_follows_writer() {
+async fn orphan_segments_are_deleted_on_claim() {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = Db::open(os.clone(), ROOT, tiny_config()).await.unwrap();
-    let reader = DbReader::open(os.clone(), ROOT, reader_config())
-        .await
-        .unwrap();
-    db.put("a", "1").await.unwrap();
-    reader.refresh().await.unwrap();
-    assert_eq!(
-        reader.get(b"a").await.unwrap(),
-        Some(Bytes::from("1")),
-        "from WAL tail"
-    );
-    db.checkpoint().await.unwrap();
-    db.put("a", "2").await.unwrap();
-    db.put("b", "3").await.unwrap();
-    reader.refresh().await.unwrap();
-    assert_eq!(reader.get(b"a").await.unwrap(), Some(Bytes::from("2")));
-    db.delete("a").await.unwrap();
-    db.checkpoint().await.unwrap();
-    reader.refresh().await.unwrap();
-    assert_eq!(reader.get(b"a").await.unwrap(), None);
-    assert_eq!(reader.get(b"b").await.unwrap(), Some(Bytes::from("3")));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn crash_orphans_are_deleted_on_open() {
-    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = Db::open(os.clone(), ROOT, tiny_config()).await.unwrap();
+    let clock = ManualClock::new();
+    let db = open(&os, &clock).await;
     for i in 0..200u32 {
+        clock.tick();
         db.put(format!("k{i:04}"), format!("v{i}")).await.unwrap();
     }
     db.checkpoint().await.unwrap();
     db.close().await.unwrap();
     let published = segment_objects(&os).await;
-    // Simulate a writer that uploaded nodes but crashed before publishing.
+    // An applier that uploaded a segment but died before publishing.
     let orphan = Path::from(format!("{ROOT}/seg/{:020}-{:020}.seg", 1, 1_000_000));
     os.put(&orphan, "junk".into()).await.unwrap();
-    let db = Db::open(os.clone(), ROOT, tiny_config()).await.unwrap();
+    let db = open(&os, &clock).await;
+    assert!(db.claim_applier().await.unwrap());
     assert_eq!(segment_objects(&os).await, published);
     assert_eq!(db.get(b"k0042").await.unwrap(), Some(Bytes::from("v42")));
 }

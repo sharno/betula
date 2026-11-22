@@ -4,9 +4,17 @@ use crate::types::SegmentId;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
-    /// A newer writer opened the database. This handle can no longer write.
-    #[error("writer fenced by a newer writer")]
-    Fenced,
+    /// The operation needs the applier role, which this process doesn't hold
+    /// (or just lost to another process).
+    #[error("this process is not the applier")]
+    NotApplier,
+    /// The writer couldn't renew its lease in time, so the applier may already
+    /// treat it as gone. Open a new writer.
+    #[error("writer lease expired")]
+    LeaseExpired,
+    /// Another process is writing under this writer id.
+    #[error("writer id already in use")]
+    WriterIdTaken,
     #[error("object store: {0}")]
     ObjectStore(Arc<object_store::Error>),
     #[error("corrupt object {path}: {reason}")]
