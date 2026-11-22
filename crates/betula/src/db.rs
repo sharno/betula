@@ -15,7 +15,7 @@
 //! Versions merge newest-wins, so applying entries in any order is correct, and
 //! a slow writer's late entries need no special handling.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -30,17 +30,17 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::error::{Error, Result};
-use crate::follow::Follower;
+use crate::follow::{Follower, Scope};
 use crate::gc::{self, GcConfig, GcStats};
 use crate::hlc::{Hlc, Ts, WriterId};
 use crate::location;
 use crate::manifest::{self, Manifest, Publish};
-use crate::nodes::Nodes;
+use crate::nodes::{CacheStats, Nodes};
 use crate::retry::retry;
 use crate::segments::{self, SegmentTable};
-use crate::settings::{ApplierRole, Gc, Settings};
+use crate::settings::{ApplierRole, Follow, Gc, Settings};
 use crate::snapshot::DbIterator;
-use crate::store::Store;
+use crate::store::{RequestStats, Store};
 use crate::tree::{self, TreeShape};
 use crate::types::{Epoch, KeyRange, ManifestId, Msg, SegmentId, TreeRoot, Version, entry_bytes};
 use crate::wal::{self, Lease, WalBatch, WalWrite};
@@ -139,16 +139,38 @@ impl WriteBatch {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct DbStats {
+pub struct Metrics {
     pub writer: WriterId,
     pub is_applier: bool,
     pub applier_epoch: Epoch,
     pub manifest_id: ManifestId,
+    /// Time since the current manifest was published.
+    pub manifest_age: Duration,
     pub tree: Option<TreeRoot>,
+    /// Durable writes this process knows of that the tree doesn't hold yet.
     pub unapplied_bytes: usize,
+    /// How long the oldest of them has waited.
+    pub unapplied_age: Option<Duration>,
     pub segments: usize,
     pub segment_bytes: u64,
     pub live_bytes: u64,
+    /// Batches this writer made durable, and the log objects holding them.
+    pub batches_written: u64,
+    pub log_flushes: u64,
+    /// Checkpoints this process published as applier.
+    pub checkpoints: u64,
+    pub last_checkpoint: Option<Duration>,
+    pub cache: CacheStats,
+    pub requests: RequestStats,
+}
+
+#[derive(Debug, Default)]
+struct Counters {
+    batches: AtomicU64,
+    flushes: AtomicU64,
+    checkpoints: AtomicU64,
+    /// Duration of the last checkpoint in microseconds plus one (0: none).
+    last_checkpoint_us: AtomicU64,
 }
 
 struct Applier {
@@ -173,6 +195,7 @@ struct Shared {
     fatal: OnceLock<Error>,
     shutdown: watch::Sender<bool>,
     wake_applier: Notify,
+    counters: Counters,
 }
 
 impl Shared {
@@ -182,6 +205,15 @@ impl Shared {
 
     fn now(&self) -> u64 {
         self.clock.now_ms()
+    }
+
+    /// What background refreshes pull. The applier always needs every log.
+    fn scope(&self) -> Scope {
+        match self.cfg.poll.follow {
+            Follow::AllWriters => Scope::AllWriters,
+            Follow::ManifestOnly if self.is_applier.load(Ordering::Acquire) => Scope::AllWriters,
+            Follow::ManifestOnly => Scope::ManifestOnly,
+        }
     }
 
     fn check(&self) -> Result<()> {
@@ -236,7 +268,9 @@ impl Shared {
         if guard.is_some() {
             return Ok(true);
         }
-        self.follower.refresh(true, self.now()).await?;
+        self.follower
+            .refresh(true, Scope::AllWriters, self.now())
+            .await?;
         let store = self.store();
         let view = self.follower.view();
         let (id, current) = match view.manifest_id {
@@ -250,7 +284,7 @@ impl Shared {
             }
             id => (id, view.manifest.as_ref().clone()),
         };
-        let next = current.fenced(self.now());
+        let next = current.fenced(self.writer, self.now());
         let next_id = id.next();
         if manifest::publish(store, next_id, &next).await? == Publish::Conflict {
             return Ok(false);
@@ -277,13 +311,49 @@ impl Shared {
             return Ok(());
         }
         let view = self.follower.view();
-        let steal = steal_after.as_millis() as u64;
         let now = self.now();
-        let stalled = view.tails.since_ms.is_some_and(|t| now >= t + steal)
-            && now >= view.manifest.created_at_ms + steal;
-        if view.manifest_id == ManifestId(0) || stalled {
+        let waiting_for = |d: Duration| {
+            let d = d.as_millis() as u64;
+            view.tails.since_ms.is_some_and(|t| now >= t + d)
+        };
+        let take = match view.manifest.applier {
+            _ if view.manifest_id == ManifestId(0) => true,
+            // Released on close: take it as soon as there is work.
+            None => !view.tails.is_empty(),
+            Some(w) if w == self.writer => false,
+            // Alive but stuck: work waited past `steal_after` and the
+            // applier published nothing meanwhile.
+            Some(_)
+                if waiting_for(steal_after)
+                    && now >= view.manifest.created_at_ms + steal_after.as_millis() as u64 =>
+            {
+                true
+            }
+            // Work waited a couple of checkpoint intervals: take over at once
+            // if the applier's lease ran out (it crashed or lost the store).
+            Some(w) if waiting_for(self.cfg.checkpoint.interval * 2) => {
+                wal::read_lease(self.store(), w)
+                    .await?
+                    .is_none_or(|l| l.expires_at_ms <= now)
+            }
+            Some(_) => false,
+        };
+        if take {
             self.claim().await?;
         }
+        Ok(())
+    }
+
+    /// Gives up the applier role so another writer can take it at once.
+    async fn release(&self) -> Result<()> {
+        let mut guard = self.applier.lock().await;
+        if guard.is_none() {
+            return Ok(());
+        }
+        self.set_role(&mut guard, None);
+        let view = self.follower.view();
+        let next = view.manifest.released(self.now());
+        manifest::publish(self.store(), view.manifest_id.next(), &next).await?;
         Ok(())
     }
 
@@ -303,22 +373,25 @@ impl Shared {
     /// already visible to the pull. (Pulling only previously known writers
     /// let a new writer's older entry arrive after a newer tombstone for the
     /// same key had been dropped, resurrecting the key.)
-    async fn lease_floor(&self) -> Result<u64> {
+    ///
+    /// Also returns every writer with objects in storage.
+    async fn lease_floor(&self) -> Result<(u64, BTreeSet<WriterId>)> {
         let store = self.store();
         let now = self.now();
         let writers = store.list_writers().await?;
         self.follower.track(writers.iter().copied());
         let leases =
-            futures::future::try_join_all(writers.into_iter().map(|w| wal::read_lease(store, w)))
+            futures::future::try_join_all(writers.iter().map(|w| wal::read_lease(store, *w)))
                 .await?;
-        Ok(leases
+        let floor = leases
             .into_iter()
             .flatten()
             .filter(|l| l.expires_at_ms > now)
             .map(|l| l.floor_hlc)
             .chain([self.floor_hlc()])
             .min()
-            .expect("chained with our own floor"))
+            .expect("chained with our own floor");
+        Ok((floor, writers.into_iter().collect()))
     }
 
     /// Folds every pulled log entry into the tree and publishes a manifest.
@@ -328,8 +401,10 @@ impl Shared {
             return Err(Error::NotApplier);
         };
         let started = Instant::now();
-        let floor = self.lease_floor().await?;
-        self.follower.refresh(false, self.now()).await?;
+        let (floor, present) = self.lease_floor().await?;
+        self.follower
+            .refresh(false, Scope::AllWriters, self.now())
+            .await?;
         let view = self.follower.view();
         if view.manifest.applier_epoch > app.epoch {
             self.set_role(&mut guard, None);
@@ -379,8 +454,15 @@ impl Shared {
         let (table, dead) = segments::account(&view.manifest.segments, &new, &plan.freed);
         let next = Manifest {
             applier_epoch: app.epoch,
+            applier: Some(self.writer),
             tree: plan.root,
-            frontier: view.tails.frontier(&view.manifest.frontier),
+            // Writers GC forgot (no lease, no logs) can never write again.
+            frontier: view
+                .tails
+                .frontier(&view.manifest.frontier)
+                .into_iter()
+                .filter(|(w, _)| present.contains(w))
+                .collect(),
             segment_watermark: app.next_segment,
             segments: table,
             dead,
@@ -404,6 +486,10 @@ impl Shared {
                 );
                 self.nodes.evict(&plan.freed);
                 self.follower.install(next_id, Arc::new(next), self.now());
+                let c = &self.counters;
+                c.checkpoints.fetch_add(1, Ordering::Relaxed);
+                let us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX - 1);
+                c.last_checkpoint_us.store(us + 1, Ordering::Relaxed);
                 Ok(())
             }
             Publish::Conflict => {
@@ -498,11 +584,15 @@ impl Db {
             fatal: OnceLock::new(),
             shutdown,
             wake_applier: Notify::new(),
+            counters: Counters::default(),
             clock,
             cfg,
         });
         shared.renew_lease().await?;
-        shared.follower.refresh(true, shared.now()).await?;
+        shared
+            .follower
+            .refresh(true, shared.scope(), shared.now())
+            .await?;
         shared.maybe_claim().await?;
 
         let (cmd, rx) = mpsc::channel(CMD_QUEUE);
@@ -648,7 +738,7 @@ impl Db {
     pub async fn refresh(&self) -> Result<()> {
         self.shared
             .follower
-            .refresh(true, self.shared.now())
+            .refresh(true, Scope::AllWriters, self.shared.now())
             .await
             .map(|_| ())
     }
@@ -692,18 +782,33 @@ impl Db {
         self.shared.follower.view().manifest.segments.clone()
     }
 
-    pub fn stats(&self) -> DbStats {
+    pub fn metrics(&self) -> Metrics {
         let v = self.shared.follower.view();
-        DbStats {
+        let now = self.shared.now();
+        let ms = |t: u64| Duration::from_millis(now.saturating_sub(t));
+        let c = &self.shared.counters;
+        Metrics {
             writer: self.shared.writer,
             is_applier: self.is_applier(),
             applier_epoch: v.manifest.applier_epoch,
             manifest_id: v.manifest_id,
+            manifest_age: ms(v.manifest.created_at_ms),
             tree: v.manifest.tree,
             unapplied_bytes: v.tails.mem().bytes(),
+            unapplied_age: v.tails.since_ms.map(ms),
             segments: v.manifest.segments.len(),
             segment_bytes: v.manifest.segments.values().map(|u| u.total).sum(),
             live_bytes: v.manifest.segments.values().map(|u| u.live).sum(),
+            batches_written: c.batches.load(Ordering::Relaxed),
+            log_flushes: c.flushes.load(Ordering::Relaxed),
+            checkpoints: c.checkpoints.load(Ordering::Relaxed),
+            last_checkpoint: c
+                .last_checkpoint_us
+                .load(Ordering::Relaxed)
+                .checked_sub(1)
+                .map(Duration::from_micros),
+            cache: self.shared.nodes.cache_stats(),
+            requests: self.shared.store().requests(),
         }
     }
 
@@ -719,9 +824,19 @@ impl Db {
         }
         self.shared.shutdown.send_replace(true);
         futures::future::join_all(tasks).await;
+        // A free (or dead applier's) role: take it so our writes get applied
+        // now rather than whenever another writer next runs.
+        if let Err(e) = self.shared.maybe_claim().await {
+            tracing::debug!(%e, "claim on close failed");
+        }
         if self.is_applier() {
             match self.shared.checkpoint().await {
-                Ok(()) | Err(Error::NotApplier) => {}
+                Ok(()) => {
+                    if let Err(e) = self.shared.release().await {
+                        tracing::warn!(%e, "releasing the applier role failed");
+                    }
+                }
+                Err(Error::NotApplier) => {}
                 Err(e) => tracing::warn!(%e, "final checkpoint failed"),
             }
         }
@@ -830,7 +945,7 @@ impl WalTask {
         let stamps = std::mem::take(&mut self.stamps);
         let waiters = std::mem::take(&mut self.waiters);
         self.bytes = 0;
-        let result = self.persist(ops).await;
+        let result = self.persist(ops, stamps.len() as u64).await;
         {
             let mut inflight = self.shared.inflight.lock();
             stamps.iter().for_each(|t| {
@@ -848,7 +963,8 @@ impl WalTask {
         result
     }
 
-    async fn persist(&mut self, ops: Vec<(Bytes, Version)>) -> Result<()> {
+    /// Writes `ops` (from `batches` write calls) as one log object.
+    async fn persist(&mut self, ops: Vec<(Bytes, Version)>, batches: u64) -> Result<()> {
         let shared = &self.shared;
         shared.check()?;
         if ops.is_empty() {
@@ -879,6 +995,9 @@ impl WalTask {
             Err(e) => return Err(shared.fail(e)),
         }
         self.next_seq += 1;
+        let c = &shared.counters;
+        c.flushes.fetch_add(1, Ordering::Relaxed);
+        c.batches.fetch_add(batches, Ordering::Relaxed);
         shared.follower.add_own(seq, Arc::new(batch), shared.now());
         shared.wake_applier.notify_one();
         Ok(())
@@ -911,7 +1030,11 @@ async fn follow_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
         if discover {
             last_discovery = Instant::now();
         }
-        match shared.follower.refresh(discover, shared.now()).await {
+        match shared
+            .follower
+            .refresh(discover, shared.scope(), shared.now())
+            .await
+        {
             // Poll fast while things arrive, back off while quiet.
             Ok(true) => period = shared.cfg.poll.interval,
             Ok(false) => period = (period * 2).min(shared.cfg.poll.max_interval),

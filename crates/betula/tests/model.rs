@@ -76,6 +76,7 @@ fn tiny_config() -> Settings {
             interval: Duration::from_millis(5),
             max_interval: Duration::from_millis(20),
             discovery_interval: Duration::from_millis(20),
+            follow: betula::Follow::AllWriters,
         },
         lease: LeaseConfig {
             interval: Duration::from_millis(5),
@@ -185,11 +186,13 @@ async fn sync(dbs: &[Db], reader: usize) {
 /// Runs a checkpoint on whoever holds the applier role, claiming it with
 /// writer 0 if nobody does.
 async fn checkpoint(dbs: &[Db]) {
-    let applier = match dbs.iter().position(Db::is_applier) {
-        Some(i) => i,
-        None => {
-            assert!(dbs[0].claim_applier().await.unwrap());
-            0
+    // Released roles are taken by background claims too, so the claim can
+    // lose a race; then whoever won is the applier.
+    let applier = loop {
+        match dbs.iter().position(Db::is_applier) {
+            Some(i) => break i,
+            None if dbs[0].claim_applier().await.unwrap() => break 0,
+            None => tokio::task::yield_now().await,
         }
     };
     match dbs[applier].checkpoint().await {
@@ -304,7 +307,7 @@ async fn bulk_load_builds_multi_level_tree() {
         model.insert(k, v);
     }
     db.checkpoint().await.unwrap();
-    let height = db.stats().tree.unwrap().height;
+    let height = db.metrics().tree.unwrap().height;
     assert!(height >= 3, "height {height}");
     let all = db.scan(KeyRange::all()).collect().await.unwrap();
     assert_eq!(all, model_range(&model, &KeyRange::all()));
@@ -394,7 +397,7 @@ async fn applier_failover_applies_the_dead_appliers_writes() {
         .unwrap();
     assert_eq!(reader.get(b"from-a").await.unwrap(), Some(Bytes::from("1")));
     assert_eq!(reader.get(b"from-b").await.unwrap(), Some(Bytes::from("2")));
-    assert!(b.stats().unapplied_bytes == 0);
+    assert!(b.metrics().unapplied_bytes == 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -488,7 +491,7 @@ async fn gc_keeps_exactly_the_live_tree() {
         "only referenced segments remain"
     );
     // The cleaner keeps space amplification bounded.
-    let s = db.stats();
+    let s = db.metrics();
     assert!(s.live_bytes * 10 >= s.segment_bytes * 4, "{s:?}");
 
     db.close().await.unwrap();
@@ -587,4 +590,131 @@ async fn paged_scans_match_model() {
         let want: Vec<_> = model_range(&model, &range).into_iter().take(len).collect();
         assert_eq!(got, want, "scan from k{a:05} len {len}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_only_writers_see_others_after_apply() {
+    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = ManualClock::new();
+    let applier = open(&os, &clock).await;
+    let mut cfg = tiny_config();
+    cfg.poll.follow = betula::Follow::ManifestOnly;
+    cfg.applier = ApplierRole::Never;
+    let quiet = Db::builder(ROOT, os.clone())
+        .with_settings(cfg)
+        .with_clock(clock.clone())
+        .build()
+        .await
+        .unwrap();
+    clock.tick();
+    applier.put("k", "v").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        quiet.get("k").await.unwrap(),
+        None,
+        "not pulled before apply"
+    );
+    let fresh = betula::ReadOptions {
+        freshness: betula::Freshness::Latest,
+    };
+    assert_eq!(
+        quiet.get_with("k", fresh).await.unwrap().as_deref(),
+        Some(&b"v"[..])
+    );
+    clock.tick();
+    applier.put("k2", "v2").await.unwrap();
+    applier.checkpoint().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while quiet.get("k2").await.unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("visible once applied");
+    let m = quiet.metrics();
+    assert!(!m.is_applier && m.requests.gets > 0 && m.cache.hits + m.cache.misses > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_applier_hands_over_and_dead_lease_triggers_takeover() {
+    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = ManualClock::new();
+    let mut cfg = tiny_config();
+    cfg.checkpoint.interval = Duration::from_secs(1);
+    cfg.lease.ttl = Duration::from_secs(5);
+    let build = |cfg: Settings| {
+        Db::builder(ROOT, os.clone())
+            .with_settings(cfg)
+            .with_clock(clock.clone())
+            .build()
+    };
+    // Graceful: a closing applier releases, the next writer with work takes over.
+    let a = build(cfg.clone()).await.unwrap();
+    assert!(a.is_applier());
+    a.close().await.unwrap();
+    let b = build(cfg.clone()).await.unwrap();
+    clock.tick();
+    b.put("k", "v").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !b.is_applier() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("takes the released role");
+    // Crash: b dies; once its lease expires, c takes over without waiting
+    // the full steal_after.
+    let c = build(cfg).await.unwrap();
+    drop(b);
+    clock.tick();
+    c.put("k2", "v2").await.unwrap();
+    clock.advance(Duration::from_secs(6));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !c.is_applier() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("takes over from a dead applier");
+    c.checkpoint().await.unwrap();
+    assert_eq!(c.get("k").await.unwrap().as_deref(), Some(&b"v"[..]));
+}
+
+/// Busy readers on cached data must not starve lease renewal (cache hits
+/// never suspend; reads yield via tokio's cooperative budget). Without the
+/// yield this test hangs: the starved runtime never runs the put loop either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn busy_readers_do_not_starve_the_lease() {
+    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut cfg = tiny_config();
+    cfg.lease = LeaseConfig {
+        interval: Duration::from_millis(20),
+        ttl: Duration::from_millis(300),
+    };
+    let db = Arc::new(
+        Db::builder(ROOT, os.clone())
+            .with_settings(cfg)
+            .build()
+            .await
+            .unwrap(),
+    );
+    db.put("hot", "v").await.unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers: Vec<_> = (0..8)
+        .map(|_| {
+            let (db, stop) = (db.clone(), stop.clone());
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    db.get("hot").await.unwrap();
+                }
+            })
+        })
+        .collect();
+    for i in 0..20 {
+        db.put(format!("k{i}"), "v").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop.store(true, Ordering::Relaxed);
+    futures::future::join_all(readers).await;
+    db.status().unwrap();
 }

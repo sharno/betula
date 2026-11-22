@@ -6,8 +6,9 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{Error, Result};
 
-// 2: timestamped versions, per-writer logs.
-const VERSION: u8 = 2;
+// 2: timestamped versions, per-writer logs. 3: append-only runs, manifest
+// records the applier.
+const VERSION: u8 = 3;
 
 #[derive(Copy, Clone, Debug)]
 pub struct Kind {

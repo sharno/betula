@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::future::{BoxFuture, Shared};
@@ -73,11 +74,23 @@ type NodeCache = Cache<NodePtr, Node, EncodedSize>;
 /// A fetch shared by every concurrent reader of the same missing node.
 type Loading = Shared<BoxFuture<'static, Result<Node>>>;
 
+/// Node cache occupancy and lookups since open. A miss is a node read that
+/// went to the object store (or joined an in-flight fetch).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub inner_bytes: u64,
+    pub leaf_bytes: u64,
+    pub hits: u64,
+    pub misses: u64,
+}
+
 pub struct Nodes {
     store: Store,
     inner: NodeCache,
     leaves: NodeCache,
     loading: Mutex<HashMap<NodePtr, Loading>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 fn new_cache(bytes: u64, item_estimate: u64) -> NodeCache {
@@ -99,6 +112,17 @@ impl Nodes {
             inner: new_cache(cfg.inner_bytes, INNER_NODE_ESTIMATE),
             leaves: new_cache(cfg.leaf_bytes, LEAF_ESTIMATE),
             loading: Mutex::new(HashMap::new()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    pub fn cache_stats(&self) -> CacheStats {
+        CacheStats {
+            inner_bytes: self.inner.weight(),
+            leaf_bytes: self.leaves.weight(),
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
         }
     }
 
@@ -120,8 +144,12 @@ impl Nodes {
 
     pub async fn load(&self, ptr: NodePtr) -> Result<Node> {
         if let Some(n) = self.inner.get(&ptr).or_else(|| self.leaves.get(&ptr)) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            // See `Snapshot::get`: reads served from memory must yield.
+            tokio::task::consume_budget().await;
             return Ok(n);
         }
+        self.misses.fetch_add(1, Ordering::Relaxed);
         let loading = self
             .loading
             .lock()

@@ -86,6 +86,15 @@ impl Tails {
     }
 }
 
+/// What a refresh pulls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// New manifests and every other writer's unapplied log entries.
+    AllWriters,
+    /// New manifests only: other writers' writes appear once applied.
+    ManifestOnly,
+}
+
 #[derive(Clone)]
 pub struct View {
     pub manifest_id: ManifestId,
@@ -177,10 +186,10 @@ impl Follower {
         self.writers.lock().extend(writers);
     }
 
-    /// Pulls new manifests and log entries. `discover` also LISTs, to find
-    /// new writers and to catch up when consecutive probing can't. Returns
-    /// whether anything new arrived.
-    pub async fn refresh(&self, discover: bool, now_ms: u64) -> Result<bool> {
+    /// Pulls new manifests and, for `Scope::AllWriters`, other writers' log
+    /// entries. `discover` also LISTs, to find new writers and to catch up
+    /// when consecutive probing can't. Returns whether anything new arrived.
+    pub async fn refresh(&self, discover: bool, scope: Scope, now_ms: u64) -> Result<bool> {
         let _guard = self.refreshing.lock().await;
         let store = self.nodes.store();
         if discover {
@@ -211,7 +220,7 @@ impl Follower {
                 .lock()
                 .iter()
                 .chain(applied.keys())
-                .filter(|w| Some(**w) != self.own)
+                .filter(|w| scope == Scope::AllWriters && Some(**w) != self.own)
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .map(|w| {

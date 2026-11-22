@@ -198,6 +198,7 @@ pub struct PollConfig {
     /// How often to LIST for new writers.
     #[serde(with = "humantime_serde")]
     pub discovery_interval: Duration,
+    pub follow: Follow,
 }
 
 impl Default for PollConfig {
@@ -206,8 +207,23 @@ impl Default for PollConfig {
             interval: Duration::from_millis(200),
             max_interval: Duration::from_secs(2),
             discovery_interval: Duration::from_secs(2),
+            follow: Follow::AllWriters,
         }
     }
+}
+
+/// Whose unapplied writes a writer pulls in the background.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Follow {
+    /// Every writer's: other writers' writes show up within a poll. Costs
+    /// about (writers - 1) x log bytes in GETs per writer.
+    #[default]
+    AllWriters,
+    /// Only the manifest: other writers' writes show up once applied (about
+    /// a checkpoint interval). Reads with `Freshness::Latest` still pull
+    /// everything. The applier always pulls every writer.
+    ManifestOnly,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

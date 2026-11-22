@@ -86,6 +86,19 @@ struct Args {
     /// Cross-writer visibility samples (betula, 2+ writers).
     #[arg(long, default_value_t = 100)]
     visibility_samples: u64,
+    /// Seconds of mixed reads and writes after the other phases (0: skip).
+    /// Shows how each engine behaves while background work (compaction,
+    /// checkpoints, cleaning) runs alongside traffic.
+    #[arg(long, default_value_t = 0)]
+    mixed_secs: u64,
+    /// Percentage of the mixed phase's clients that only read; the rest only
+    /// write batches (separate clients, so slow durable writes don't throttle
+    /// reads).
+    #[arg(long, default_value_t = 50)]
+    mixed_read_pct: u64,
+    /// Width of the windows in the mixed phase's read-latency timeline.
+    #[arg(long, default_value_t = 30)]
+    mixed_window_secs: u64,
     /// betula cleans segments whose live fraction is below this.
     #[arg(long, default_value_t = 0.25)]
     clean_below: f64,
@@ -219,6 +232,104 @@ async fn write_phase(
         }
     })
     .await
+}
+
+/// Mixed reads and write batches for `args.mixed_secs`. Prints a read-latency
+/// timeline per window to stderr; returns totals for reads and writes.
+async fn mixed_phase(
+    args: &Args,
+    kind: EngineKind,
+    db: Arc<Engine>,
+    wl: Arc<Workload>,
+    counters: &Counters,
+) -> Result<Vec<(&'static str, u64, Duration, Histogram<u64>)>> {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(args.mixed_secs);
+    let window = Duration::from_secs(args.mixed_window_secs.max(1));
+    let windows = args.mixed_secs.div_ceil(args.mixed_window_secs.max(1)) as usize;
+    let next = Arc::new(AtomicU64::new(0));
+    let batch = args.batch;
+    let readers =
+        (args.concurrency as u64 * args.mixed_read_pct / 100).clamp(1, args.concurrency as u64 - 1);
+    let tasks: Vec<_> = (0..args.concurrency as u64)
+        .map(|task| {
+            let reader = task < readers;
+            let (db, wl, next) = (db.clone(), wl.clone(), next.clone());
+            tokio::spawn(async move {
+                let mut reads = Histogram::<u64>::new(3)?;
+                let mut writes = Histogram::<u64>::new(3)?;
+                let mut per_window: Vec<Histogram<u64>> = (0..windows)
+                    .map(|_| Histogram::new(3))
+                    .collect::<Result<_, _>>()?;
+                while Instant::now() < deadline {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let t = Instant::now();
+                    if reader {
+                        let id = wl.random_id(7, i);
+                        // Concurrent updates make any version valid; it must
+                        // exist, though.
+                        ensure!(db.get(&wl.key(id)).await?.is_some(), "key {id} lost");
+                        let us = t.elapsed().as_micros() as u64;
+                        reads.record(us)?;
+                        let w = (t.duration_since(started).as_secs() / window.as_secs()) as usize;
+                        per_window[w.min(windows - 1)].record(us)?;
+                    } else {
+                        let pairs = (0..batch)
+                            .map(|j| wl.random_id(11, i * batch + j))
+                            .map(|id| (wl.key(id), wl.value(id, 2 + i % 7)))
+                            .collect();
+                        db.write(i, pairs).await?;
+                        writes.record(t.elapsed().as_micros() as u64)?;
+                    }
+                }
+                Ok::<_, anyhow::Error>((reads, writes, per_window))
+            })
+        })
+        .collect();
+    let results = futures::future::try_join_all(tasks).await?;
+    let elapsed = started.elapsed();
+    let mut reads = Histogram::<u64>::new(3)?;
+    let mut writes = Histogram::<u64>::new(3)?;
+    let mut per_window: Vec<Histogram<u64>> = (0..windows)
+        .map(|_| Histogram::new(3))
+        .collect::<Result<_, _>>()?;
+    for r in results {
+        let (r, w, pw) = r?;
+        reads.add(r)?;
+        writes.add(w)?;
+        for (acc, h) in per_window.iter_mut().zip(pw) {
+            acc.add(h)?;
+        }
+    }
+    eprintln!(
+        "[{}] mixed read latency by {}s window: reads/s p50 p99 p99.9 (ms)",
+        kind.name(),
+        window.as_secs()
+    );
+    for (w, h) in per_window.iter().enumerate() {
+        let ms = |q: f64| h.value_at_quantile(q) as f64 / 1000.0;
+        eprintln!(
+            "[{}]   {:>4}s {:>8.0} {:>7.2} {:>7.2} {:>7.2}",
+            kind.name(),
+            w as u64 * window.as_secs(),
+            h.len() as f64 / window.as_secs_f64(),
+            ms(0.5),
+            ms(0.99),
+            ms(0.999)
+        );
+    }
+    let io = counters.snapshot();
+    eprintln!(
+        "[{}] requests after mixed: {} GET, {} PUT",
+        kind.name(),
+        io.gets,
+        io.puts
+    );
+    let (nr, nw) = (reads.len(), writes.len() * batch);
+    Ok(vec![
+        ("mixed-read", nr, elapsed, reads),
+        ("mixed-write", nw, elapsed, writes),
+    ])
 }
 
 async fn timed<T>(f: impl Future<Output = Result<T>>) -> Result<(Duration, Histogram<u64>, T)> {
@@ -436,6 +547,13 @@ async fn bench_engine(
         db.get(&wl.key(probe)).await? == Some(wl.value(probe, 1)),
         "update lost"
     );
+
+    if args.mixed_secs > 0 {
+        let mixed = mixed_phase(args, kind, db.clone(), wl.clone(), &counters).await?;
+        mixed
+            .into_iter()
+            .for_each(|(name, ops, elapsed, hist)| record(name, ops, elapsed, hist, &mut phases));
+    }
 
     let db = Arc::try_unwrap(db).map_err(|_| anyhow::anyhow!("engine still shared"))?;
     db.close().await?;

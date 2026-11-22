@@ -251,6 +251,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "betula-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "betula",
+ "clap",
+ "futures",
+ "humantime-serde",
+ "serde",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

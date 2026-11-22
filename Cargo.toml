@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/betula", "crates/betula-bench"]
+members = ["crates/betula", "crates/betula-bench", "crates/betula-cli"]
 
 [workspace.package]
 edition = "2024"

@@ -16,6 +16,9 @@ pub struct Manifest {
     /// Bumped by every process that takes the applier role. Publishing with
     /// put-if-absent fences the previous applier.
     pub applier_epoch: Epoch,
+    /// The writer holding the applier role, or `None` once it released it
+    /// (on close). Others take over when it's `None` or its lease expired.
+    pub applier: Option<WriterId>,
     pub tree: Option<TreeRoot>,
     /// Writer log entries at or below these sequence numbers are in `tree`.
     pub frontier: Frontier,
@@ -35,6 +38,7 @@ impl Manifest {
     pub fn initial(now_ms: u64) -> Self {
         Self {
             applier_epoch: Epoch(0),
+            applier: None,
             tree: None,
             frontier: Frontier::new(),
             segment_watermark: SegmentId {
@@ -47,10 +51,21 @@ impl Manifest {
         }
     }
 
-    /// The same tree claimed by the next applier epoch.
-    pub fn fenced(&self, now_ms: u64) -> Self {
+    /// The same tree claimed by `by` with the next applier epoch.
+    pub fn fenced(&self, by: WriterId, now_ms: u64) -> Self {
         Self {
             applier_epoch: self.applier_epoch.next(),
+            applier: Some(by),
+            dead: Vec::new(),
+            created_at_ms: now_ms,
+            ..self.clone()
+        }
+    }
+
+    /// The same tree with the applier role given up.
+    pub fn released(&self, now_ms: u64) -> Self {
+        Self {
+            applier: None,
             dead: Vec::new(),
             created_at_ms: now_ms,
             ..self.clone()

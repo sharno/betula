@@ -8,6 +8,7 @@
 //!   that checkpoint wrote, back to back. Nodes are read with ranged GETs.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -25,6 +26,33 @@ const COALESCE_GAP: u64 = 128 << 10;
 pub struct Store {
     os: Arc<dyn ObjectStore>,
     root: Path,
+    counters: Arc<Counters>,
+}
+
+/// Object store requests made by one handle.
+#[derive(Debug, Default)]
+struct Counters {
+    gets: AtomicU64,
+    get_bytes: AtomicU64,
+    puts: AtomicU64,
+    put_bytes: AtomicU64,
+    lists: AtomicU64,
+    deletes: AtomicU64,
+}
+
+/// Object store requests made by a handle since it opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RequestStats {
+    pub gets: u64,
+    pub get_bytes: u64,
+    pub puts: u64,
+    pub put_bytes: u64,
+    pub lists: u64,
+    pub deletes: u64,
+}
+
+fn bump(c: &AtomicU64, n: u64) {
+    c.fetch_add(n, Ordering::Relaxed);
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -40,7 +68,31 @@ impl Store {
         Self {
             os,
             root: root.into(),
+            counters: Arc::default(),
         }
+    }
+
+    pub fn requests(&self) -> RequestStats {
+        let c = &self.counters;
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        RequestStats {
+            gets: l(&c.gets),
+            get_bytes: l(&c.get_bytes),
+            puts: l(&c.puts),
+            put_bytes: l(&c.put_bytes),
+            lists: l(&c.lists),
+            deletes: l(&c.deletes),
+        }
+    }
+
+    fn got(&self, b: &Bytes) {
+        bump(&self.counters.gets, 1);
+        bump(&self.counters.get_bytes, b.len() as u64);
+    }
+
+    fn put_counted(&self, n: usize) {
+        bump(&self.counters.puts, 1);
+        bump(&self.counters.put_bytes, n as u64);
     }
 
     fn dir(&self, name: &str) -> Path {
@@ -72,7 +124,11 @@ impl Store {
 
     pub async fn get(&self, path: &Path) -> Result<Option<Bytes>> {
         match self.os.get(path).await {
-            Ok(r) => Ok(Some(r.bytes().await?)),
+            Ok(r) => {
+                let b = r.bytes().await?;
+                self.got(&b);
+                Ok(Some(b))
+            }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -84,7 +140,10 @@ impl Store {
         range: std::ops::Range<u64>,
     ) -> Result<Option<Bytes>> {
         match self.os.get_range(path, range).await {
-            Ok(b) => Ok(Some(b)),
+            Ok(b) => {
+                self.got(&b);
+                Ok(Some(b))
+            }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -101,7 +160,11 @@ impl Store {
         // nodes costs little and saves requests.
         let fetched = object_store::coalesce_ranges(
             ranges,
-            |r| async move { self.os.get_range(path, r).await },
+            |r| async move {
+                let b = self.os.get_range(path, r).await?;
+                self.got(&b);
+                Ok(b)
+            },
             COALESCE_GAP,
         )
         .await;
@@ -113,6 +176,7 @@ impl Store {
     }
 
     pub async fn put(&self, path: &Path, data: Bytes) -> Result<()> {
+        self.put_counted(data.len());
         self.os.put(path, PutPayload::from(data)).await?;
         Ok(())
     }
@@ -124,6 +188,7 @@ impl Store {
             mode: PutMode::Create,
             ..Default::default()
         };
+        self.put_counted(data.len());
         match self.os.put_opts(path, PutPayload::from(data), opts).await {
             Ok(_) => Ok(CreateOutcome::Created),
             Err(object_store::Error::AlreadyExists { .. }) => {
@@ -140,6 +205,7 @@ impl Store {
     pub async fn delete_all(&self, paths: Vec<Path>) -> Result<()> {
         stream::iter(paths)
             .map(|p| async move {
+                bump(&self.counters.deletes, 1);
                 match self.os.delete(&p).await {
                     Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
                     Err(e) => Err(Error::from(e)),
@@ -151,6 +217,7 @@ impl Store {
     }
 
     async fn list_names(&self, dir: &str, offset: Option<Path>) -> Result<Vec<String>> {
+        bump(&self.counters.lists, 1);
         let prefix = self.dir(dir);
         let listing = match &offset {
             Some(o) => self.os.list_with_offset(Some(&prefix), o),
@@ -175,6 +242,7 @@ impl Store {
     }
 
     pub async fn list_writers(&self) -> Result<Vec<WriterId>> {
+        bump(&self.counters.lists, 1);
         let listing = self
             .os
             .list_with_delimiter(Some(&self.dir("writers")))
@@ -188,6 +256,7 @@ impl Store {
 
     pub async fn list_wals(&self, writer: WriterId) -> Result<Vec<u64>> {
         let prefix = self.writer_dir(writer).join("wal");
+        bump(&self.counters.lists, 1);
         let metas: Vec<_> = self.os.list(Some(&prefix)).try_collect().await?;
         let mut seqs: Vec<u64> = metas
             .iter()

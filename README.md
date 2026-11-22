@@ -86,6 +86,33 @@ RustFS or MinIO).
 having to write. Call `db.close().await` before exit: dropping a writer warns
 and may lose writes that were only queued.
 
+### Metrics
+
+`db.metrics()` returns:
+- the applier role and epoch, plus manifest id and age;
+- unapplied bytes and how long the oldest has waited;
+- segment and live bytes;
+- batches and log flushes written;
+- checkpoints run and the last one's duration;
+- node cache occupancy, hits and misses;
+- object store GETs, PUTs, LISTs and DELETEs, with byte counts.
+
+### Command line
+
+```sh
+cargo install --path crates/betula-cli      # installs `betula`
+betula info    s3://bucket/db               # manifest, applier, tree, space
+betula writers s3://bucket/db               # leases and unapplied logs
+betula get     s3://bucket/db user:1        # latest acknowledged value
+betula scan    s3://bucket/db --prefix user: --limit 20
+betula put     s3://bucket/db user:1 ada    # takes the applier role only if none is running
+betula delete  s3://bucket/db user:1
+betula shape   s3://bucket/db               # walks the whole tree
+betula gc      s3://bucket/db --retention 10m
+```
+
+The same operations are available as a library: `betula::Admin`.
+
 ## Design
 
 ```
@@ -104,8 +131,11 @@ writer C ─► writers/C/wal/{seq} ─┘
   order gives the same result, so a slow writer's late entries need no
   special handling.
 - **One applier at a time**, held through the manifest itself. Claiming the
-  role publishes the next manifest with applier epoch + 1 (put-if-absent),
-  which fences the previous applier. It folds every writer's unapplied
+  role publishes the next manifest with applier epoch + 1 and the claimant's
+  id (put-if-absent), which fences the previous applier. A closing applier
+  releases the role. Another writer takes it over when there's work and the
+  role is free, the applier's lease has expired, or nothing was published
+  for `steal_after`. It folds every writer's unapplied
   entries into the tree and records each writer's applied sequence number.
   Any writer takes the role over when entries sit unapplied too long. Losing
   the role never affects writing.
@@ -160,8 +190,12 @@ writer C ─► writers/C/wal/{seq} ─┘
   10 min).
 - Tombstone safety assumes clock skew between processes stays within the
   lease margin (a quarter of the lease TTL).
-- Every writer pulls every other writer's log to show unapplied writes, which
-  costs about (writers − 1) × log bytes in GETs.
+- By default every writer pulls every other writer's log to show unapplied
+  writes, which costs about (writers − 1) × log bytes in GETs. With
+  `poll.follow = "manifest_only"` a writer sees others' writes once applied
+  (about a checkpoint interval), unless it reads with `Freshness::Latest`.
+- GC deletes the leases of writers that expired long ago and have no logs
+  left, and the applier then drops them from the manifest.
 - No merging of underfull leaves (only empty ones are removed).
 
 ## Verification

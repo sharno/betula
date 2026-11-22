@@ -201,7 +201,7 @@ impl Engine {
     pub fn describe(&self) -> String {
         match self {
             Engine::Betula(dbs) => {
-                let s = dbs[0].stats();
+                let s = dbs[0].metrics();
                 format!(
                     "writers={} manifest={} height={} segments={} live={:.0}%",
                     dbs.len(),

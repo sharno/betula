@@ -13,6 +13,7 @@ use crate::error::Result;
 use crate::manifest;
 use crate::manifest::Frontier;
 use crate::store::Store;
+use crate::wal;
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -39,6 +40,7 @@ pub struct GcStats {
     pub manifests: usize,
     pub segments: usize,
     pub wals: usize,
+    pub writers: usize,
 }
 
 pub async fn run(store: &Store, now_ms: u64, retention: Duration) -> Result<GcStats> {
@@ -74,5 +76,28 @@ pub async fn run(store: &Store, now_ms: u64, retention: Duration) -> Result<GcSt
         stats.wals += paths.len();
         store.delete_all(paths).await?;
     }
+    stats.writers = forget_writers(store, now_ms, retention_ms).await?;
     Ok(stats)
+}
+
+/// Deletes the leases of writers that expired more than `retention_ms` ago
+/// and have no log objects left. Such a writer stopped writing long ago (an
+/// expired writer never writes again), so nothing can need its lease; once
+/// it's gone the applier also drops the writer from the manifest.
+async fn forget_writers(store: &Store, now_ms: u64, retention_ms: u64) -> Result<usize> {
+    let writers = store.list_writers().await?;
+    let gone: Vec<_> = futures::future::try_join_all(writers.into_iter().map(|w| async move {
+        let lease = wal::read_lease(store, w).await?;
+        let expired_long_ago =
+            lease.is_some_and(|l| now_ms.saturating_sub(l.expires_at_ms) > retention_ms);
+        let forget = expired_long_ago && store.list_wals(w).await?.is_empty();
+        Ok::<_, crate::error::Error>(forget.then(|| store.lease_path(w)))
+    }))
+    .await?
+    .into_iter()
+    .flatten()
+    .collect();
+    let n = gone.len();
+    store.delete_all(gone).await?;
+    Ok(n)
 }

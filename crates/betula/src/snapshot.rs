@@ -19,6 +19,11 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub async fn get(&self, nodes: &Nodes, key: &[u8]) -> Result<Option<Version>> {
+        // Reads served from memory never suspend, so a busy reader would hog
+        // its worker thread and starve background tasks (lease renewal, log
+        // flushes) until the lease lapses. Yield once tokio's cooperative
+        // budget is spent.
+        tokio::task::consume_budget().await;
         tree::get(nodes, self.tree, key, self.tails.get(key).cloned()).await
     }
 
@@ -44,6 +49,7 @@ impl DbIterator {
     /// The next live pair and the timestamp of the version it came from.
     pub async fn next_versioned(&mut self) -> Result<Option<(Bytes, Version)>> {
         loop {
+            tokio::task::consume_budget().await;
             if self.tree_buf.is_empty() && !self.tree_done {
                 match self.tree.next_chunk().await? {
                     Some(chunk) => self.tree_buf = chunk.into(),

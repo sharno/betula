@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 
 use crate::db::{Clock, Freshness, ReadOptions, SystemClock};
 use crate::error::Result;
-use crate::follow::Follower;
+use crate::follow::{Follower, Scope};
 use crate::location;
 use crate::nodes::Nodes;
 use crate::settings::ReaderSettings;
@@ -77,7 +77,10 @@ impl DbReader {
             follower,
             clock: Arc::new(SystemClock),
         });
-        shared.follower.refresh(true, shared.clock.now_ms()).await?;
+        shared
+            .follower
+            .refresh(true, Scope::AllWriters, shared.clock.now_ms())
+            .await?;
         let task = cfg.refresh_interval.map(|every| {
             let shared = shared.clone();
             tokio::spawn(async move {
@@ -90,7 +93,7 @@ impl DbReader {
                     }
                     if let Err(e) = shared
                         .follower
-                        .refresh(discover, shared.clock.now_ms())
+                        .refresh(discover, Scope::AllWriters, shared.clock.now_ms())
                         .await
                     {
                         tracing::warn!(%e, "reader refresh failed");
@@ -105,7 +108,7 @@ impl DbReader {
     pub async fn refresh(&self) -> Result<()> {
         self.shared
             .follower
-            .refresh(true, self.shared.clock.now_ms())
+            .refresh(true, Scope::AllWriters, self.shared.clock.now_ms())
             .await
             .map(|_| ())
     }

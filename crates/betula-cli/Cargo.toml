@@ -1,0 +1,20 @@
+[package]
+name = "betula-cli"
+version = "0.1.0"
+description = "Command-line tool for betula databases"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "betula"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+betula.workspace = true
+clap.workspace = true
+futures.workspace = true
+humantime-serde.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true

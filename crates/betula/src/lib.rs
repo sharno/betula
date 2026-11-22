@@ -43,6 +43,7 @@
 //!   part). They are cached and loaded on open, so a cold point read costs
 //!   one GET.
 
+mod admin;
 mod codec;
 mod db;
 mod error;
@@ -66,19 +67,24 @@ mod tree;
 mod types;
 mod wal;
 
+pub use admin::{Admin, ManifestInfo, WriterInfo};
 pub use db::{
-    Clock, Db, DbBuilder, DbStats, Durability, Freshness, ReadOptions, SystemClock, WriteBatch,
+    Clock, Db, DbBuilder, Durability, Freshness, Metrics, ReadOptions, SystemClock, WriteBatch,
     WriteOptions,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use gc::{GcConfig, GcStats};
 pub use hlc::{Ts, WriterId};
-pub use nodes::{CacheConfig, Warm};
+pub use location::parse as parse_url;
+pub use nodes::{CacheConfig, CacheStats, Warm};
+pub use object_store;
 pub use reader::{DbReader, DbReaderBuilder};
 pub use segments::{CleanerConfig, SegmentTable, SegmentUsage};
 pub use settings::{
-    ApplierRole, CheckpointConfig, Gc, LeaseConfig, PollConfig, ReaderSettings, Settings, WalConfig,
+    ApplierRole, CheckpointConfig, Follow, Gc, LeaseConfig, PollConfig, ReaderSettings, Settings,
+    WalConfig,
 };
 pub use snapshot::DbIterator;
+pub use store::RequestStats;
 pub use tree::{TreeConfig, TreeShape};
 pub use types::{Epoch, KeyRange, ManifestId, NodePtr, SegmentId, TreeRoot};

@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 /// `object_store` expects): credentials, regions, endpoints, and so on.
 const ENV_PREFIXES: [&str; 3] = ["AWS_", "GOOGLE_", "AZURE_"];
 
-/// The store and the database path within it for a URL like
+/// The object store and the database path within it for a URL like
 /// `s3://bucket/path`, `gs://bucket/path`, `az://container/path`,
 /// `file:///abs/path` or `memory:///`.
 pub fn parse(url: &str) -> Result<(Arc<dyn ObjectStore>, Path)> {
