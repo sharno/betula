@@ -57,7 +57,7 @@ interval = "2s"
 interval = "200ms"         # how fast writers see each other
 max_interval = "2s"        # back-off while idle
 [applier]
-mode = "auto"              # or "never" for write-only processes
+mode = "auto"              # or "standby" (backup), or "never" (write-only)
 steal_after = "10s"
 [gc]
 mode = "on"
@@ -78,10 +78,15 @@ the home bucket, and the applier pulls the regional log from there.
 # A writer in eu-west-1; the database lives in us-east-1.
 log = { region = "eu" }
 [applier]
-mode = "never"                 # leave applying to the home region
+mode = "standby"               # apply only while the home region can't
+after = "30s"
 [regions]
 eu = "s3://my-db-eu/orders"
 ```
+
+A `standby` writer takes the applier role only when work has waited `after`
+with no manifest published, and hands it back at its next checkpoint once a
+live `auto` writer exists. `mode = "never"` keeps a writer out entirely.
 
 Every process that pulls logs (the applier, readers that follow every
 writer, `sidra writers` and `sidra gc`) needs the same `[regions]` table, or
@@ -227,12 +232,11 @@ writer C ─► writers/C/wal/{seq} ─┘
 ## Roadmap
 
 Done: LZ4 compression (on by default), lighter cleaning of inner segments,
-paced GC deletes, regional writer logs.
+paced GC deletes, regional writer logs, standby appliers.
 
 1. **Multi-region reads.** Regional read replicas follow a replicated
    manifest. Segments are immutable, so bucket replication copies them
-   safely. Also a preferred applier region, instead of `mode = "never"` on
-   remote writers.
+   safely.
 2. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
 3. **Fault-injection and soak tests:** failed, slow and lost store requests;
    long runs.

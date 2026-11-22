@@ -15,6 +15,7 @@ use crate::codec;
 use crate::error::Result;
 use crate::hlc::WriterId;
 use crate::logs::LogHome;
+use crate::settings::Candidacy;
 use crate::store::{CreateOutcome, Store};
 use crate::types::Version;
 
@@ -63,6 +64,8 @@ pub struct Lease {
     pub writer: WriterId,
     /// Where this writer's log lives. Fixed for the writer's lifetime.
     pub log: LogHome,
+    /// A standby applier hands the role back while a primary is alive.
+    pub candidacy: Candidacy,
     /// Every timestamp the writer has not yet made durable is at least this.
     pub floor_hlc: u64,
     /// Writer clock. The writer stops acknowledging writes before this.

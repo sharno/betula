@@ -820,3 +820,69 @@ async fn regional_logs_are_followed_applied_and_collected() {
     remote.close().await.unwrap();
     applier.close().await.unwrap();
 }
+
+async fn wait_until(what: &str, f: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !f() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting: {what}"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standby_applies_only_while_no_primary_can() {
+    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = ManualClock::new();
+    let mut cfg = tiny_config();
+    cfg.checkpoint.interval = Duration::from_secs(1);
+    cfg.lease.ttl = Duration::from_secs(5);
+    let standby_cfg = Settings {
+        applier: ApplierRole::Standby {
+            after: Duration::from_secs(30),
+        },
+        ..cfg.clone()
+    };
+    let build = |cfg: Settings| {
+        Db::builder(ROOT, os.clone())
+            .with_settings(cfg)
+            .with_clock(clock.clone())
+            .build()
+    };
+    let p = build(cfg.clone()).await.unwrap();
+    assert!(p.is_applier());
+    let s = build(standby_cfg).await.unwrap();
+    clock.tick();
+    s.put("a", "1").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!s.is_applier(), "a live primary keeps the role");
+
+    // The primary crashes: the standby takes over after `after`.
+    drop(p);
+    clock.tick();
+    s.put("b", "2").await.unwrap();
+    clock.advance(Duration::from_secs(31));
+    wait_until("standby takes over", || s.is_applier()).await;
+    s.checkpoint().await.unwrap();
+
+    // A primary returns: the standby hands the role back at its next
+    // checkpoint, and the primary takes it.
+    let q = build(cfg).await.unwrap();
+    assert!(!q.is_applier());
+    clock.tick();
+    s.put("c", "3").await.unwrap();
+    s.checkpoint().await.unwrap();
+    assert!(!s.is_applier(), "hands back");
+    clock.tick();
+    q.put("d", "4").await.unwrap();
+    wait_until("primary takes the released role", || q.is_applier()).await;
+    q.checkpoint().await.unwrap();
+    for (k, v) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")] {
+        assert_eq!(
+            q.get(k).await.unwrap().as_deref(),
+            Some(v.as_bytes()),
+            "{k}"
+        );
+    }
+}

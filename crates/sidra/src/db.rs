@@ -39,7 +39,7 @@ use crate::manifest::{self, Manifest, Publish};
 use crate::nodes::{CacheStats, Nodes};
 use crate::retry::retry;
 use crate::segments::{self, SegmentKind, SegmentTable};
-use crate::settings::{ApplierRole, Follow, Gc, Settings};
+use crate::settings::{ApplierRole, Candidacy, Follow, Gc, Settings};
 use crate::snapshot::DbIterator;
 use crate::store::{RequestStats, Store};
 use crate::tree::{self, TreeShape};
@@ -244,6 +244,7 @@ impl Shared {
         let lease = Lease {
             writer: self.writer,
             log: self.cfg.log.clone(),
+            candidacy: self.cfg.applier.candidacy(),
             floor_hlc: self.floor_hlc(),
             expires_at_ms,
         };
@@ -308,9 +309,6 @@ impl Shared {
     }
 
     async fn maybe_claim(&self) -> Result<()> {
-        let ApplierRole::Auto { steal_after } = self.cfg.applier else {
-            return Ok(());
-        };
         if self.is_applier.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -319,6 +317,19 @@ impl Shared {
         let waiting_for = |d: Duration| {
             let d = d.as_millis() as u64;
             view.tails.since_ms.is_some_and(|t| now >= t + d)
+        };
+        let steal_after = match self.cfg.applier {
+            ApplierRole::Auto { steal_after } => steal_after,
+            ApplierRole::Standby { after } => {
+                // Whatever the reason nobody applied (no applier, stuck,
+                // dead), the home region had `after` to do it.
+                let idle = now >= view.manifest.created_at_ms + after.as_millis() as u64;
+                if waiting_for(after) && idle && view.manifest.applier != Some(self.writer) {
+                    self.claim().await?;
+                }
+                return Ok(());
+            }
+            ApplierRole::Never => return Ok(()),
         };
         let take = match view.manifest.applier {
             _ if view.manifest_id == ManifestId(0) => true,
@@ -351,10 +362,14 @@ impl Shared {
     /// Gives up the applier role so another writer can take it at once.
     async fn release(&self) -> Result<()> {
         let mut guard = self.applier.lock().await;
+        self.release_locked(&mut guard).await
+    }
+
+    async fn release_locked(&self, guard: &mut Option<Applier>) -> Result<()> {
         if guard.is_none() {
             return Ok(());
         }
-        self.set_role(&mut guard, None);
+        self.set_role(guard, None);
         let view = self.follower.view();
         let next = view.manifest.released(self.now());
         manifest::publish(self.store(), view.manifest_id.next(), &next).await?;
@@ -378,8 +393,9 @@ impl Shared {
     /// let a new writer's older entry arrive after a newer tombstone for the
     /// same key had been dropped, resurrecting the key.)
     ///
-    /// Also returns every writer with objects in storage.
-    async fn lease_floor(&self) -> Result<(u64, BTreeSet<WriterId>)> {
+    /// Also returns every writer with objects in storage, and whether a
+    /// primary candidate other than this writer is alive.
+    async fn lease_floor(&self) -> Result<LeaseScan> {
         let store = self.store();
         let now = self.now();
         let writers = store.list_writers().await?;
@@ -388,16 +404,25 @@ impl Shared {
             futures::future::try_join_all(writers.iter().map(|w| wal::read_lease(store, *w)))
                 .await?;
         let logs = self.follower.logs();
-        let floor = leases
+        let live: Vec<Lease> = leases
             .into_iter()
             .flatten()
             .inspect(|l| logs.learn(l))
             .filter(|l| l.expires_at_ms > now)
+            .collect();
+        let floor = live
+            .iter()
             .map(|l| l.floor_hlc)
             .chain([self.floor_hlc()])
             .min()
             .expect("chained with our own floor");
-        Ok((floor, writers.into_iter().collect()))
+        Ok(LeaseScan {
+            floor,
+            present: writers.into_iter().collect(),
+            primary_alive: live
+                .iter()
+                .any(|l| l.candidacy == Candidacy::Primary && l.writer != self.writer),
+        })
     }
 
     /// Folds every pulled log entry into the tree and publishes a manifest.
@@ -407,7 +432,11 @@ impl Shared {
             return Err(Error::NotApplier);
         };
         let started = Instant::now();
-        let (floor, present) = self.lease_floor().await?;
+        let LeaseScan {
+            floor,
+            present,
+            primary_alive,
+        } = self.lease_floor().await?;
         self.follower
             .refresh(false, Scope::AllWriters, self.now())
             .await?;
@@ -509,6 +538,10 @@ impl Shared {
                 c.checkpoints.fetch_add(1, Ordering::Relaxed);
                 let us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX - 1);
                 c.last_checkpoint_us.store(us + 1, Ordering::Relaxed);
+                if primary_alive && matches!(self.cfg.applier, ApplierRole::Standby { .. }) {
+                    tracing::info!(writer = %self.writer, "handing the applier role back");
+                    self.release_locked(&mut guard).await?;
+                }
                 Ok(())
             }
             Publish::Conflict => {
@@ -518,6 +551,12 @@ impl Shared {
             }
         }
     }
+}
+
+struct LeaseScan {
+    floor: u64,
+    present: BTreeSet<WriterId>,
+    primary_alive: bool,
 }
 
 pub struct Db {

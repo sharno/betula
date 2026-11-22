@@ -273,7 +273,33 @@ pub enum ApplierRole {
         #[serde(with = "humantime_serde")]
         steal_after: Duration,
     },
+    /// Take the role only when work has sat unapplied for `after` and no
+    /// manifest was published meanwhile (no applier, or a stuck or dead
+    /// one), and hand it back once a live `auto` writer exists. For writers
+    /// far from the home store: they apply only while the home region can't.
+    Standby {
+        #[serde(with = "humantime_serde")]
+        after: Duration,
+    },
     /// Only write; leave applying to other processes.
+    Never,
+}
+
+impl ApplierRole {
+    pub(crate) fn candidacy(&self) -> Candidacy {
+        match self {
+            ApplierRole::Auto { .. } => Candidacy::Primary,
+            ApplierRole::Standby { .. } => Candidacy::Standby,
+            ApplierRole::Never => Candidacy::Never,
+        }
+    }
+}
+
+/// How a writer competes for the applier role, as its lease advertises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Candidacy {
+    Primary,
+    Standby,
     Never,
 }
 
