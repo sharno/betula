@@ -208,8 +208,10 @@ impl Store {
     /// stalls writers' log PUTs behind GC. Missing objects count as deleted.
     pub async fn delete_all(&self, paths: Vec<Path>) -> Result<()> {
         bump(&self.counters.deletes, paths.len() as u64);
-        for chunk in paths.chunks(DELETE_BATCH) {
-            let input = stream::iter(chunk.iter().cloned().map(Ok)).boxed();
+        let mut paths = paths.into_iter().peekable();
+        while paths.peek().is_some() {
+            let chunk: Vec<Path> = paths.by_ref().take(DELETE_BATCH).collect();
+            let input = stream::iter(chunk.into_iter().map(Ok)).boxed();
             self.os
                 .delete_stream(input)
                 .map(|r| match r {
