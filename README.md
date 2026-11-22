@@ -202,6 +202,26 @@ writer C ─► writers/C/wal/{seq} ─┘
   left, and the applier then drops them from the manifest.
 - No merging of underfull leaves (only empty ones are removed).
 
+## Roadmap
+
+1. **Compression** (LZ4) of tree nodes and log batches, configurable.
+2. **Lighter cleaning:** inner segments (runs) are cleaned only when nearly
+   empty, since they empty out on their own.
+3. **Multi-region writers.**
+   - Each writer appends its log to a bucket in its own region (local write
+     latency, no cross-region traffic to write); its lease records where.
+   - The applier is pinned to the home region and pulls those logs
+     asynchronously.
+   - Regional read replicas follow a replicated manifest. Segments are
+     immutable, so bucket replication copies them safely.
+4. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
+5. **Fault-injection and soak tests:** failed, slow and lost store requests;
+   long runs.
+6. **Faster scans and bulk loads:** fewer sources per scan page; bottom-up
+   build into an empty tree.
+7. **Optional conditional writes** (compare-and-set) routed through the
+   applier, for workloads that need them.
+
 ## Verification
 
 See [`spec/README.md`](spec/README.md):
