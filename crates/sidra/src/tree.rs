@@ -391,16 +391,30 @@ pub struct Plan {
 /// Applies sorted, key-unique `msgs` to the tree at `root`, writing new nodes
 /// into `out`. Live nodes and runs in `victims` segments are rewritten
 /// too, so those segments can be deleted once nothing else references them.
+/// How one checkpoint writes: where to, what to relocate, which tombstones
+/// may go, and how to encode.
+pub struct Checkpoint<'a> {
+    pub out: Outputs,
+    /// Segments whose live nodes and runs are copied out.
+    pub victims: &'a HashSet<SegmentId>,
+    /// Tombstones older than this are dropped when their leaf is rewritten.
+    pub drop_tombstones_below: Ts,
+    pub compression: codec::Compression,
+}
+
 pub async fn apply(
     nodes: &Nodes,
     cfg: &TreeConfig,
-    out: Outputs,
+    ck: Checkpoint<'_>,
     root: Option<TreeRoot>,
     msgs: Vec<(Bytes, Version)>,
-    victims: &HashSet<SegmentId>,
-    drop_tombstones_below: Ts,
-    compression: codec::Compression,
 ) -> Result<Plan> {
+    let Checkpoint {
+        out,
+        victims,
+        drop_tombstones_below,
+        compression,
+    } = ck;
     let mut w = Writer {
         nodes,
         cfg,

@@ -111,6 +111,9 @@ struct Args {
     /// sidra: disable garbage collection (for experiments).
     #[arg(long)]
     no_gc: bool,
+    /// sidra: GC delete rate cap.
+    #[arg(long, default_value_t = 100)]
+    gc_deletes_per_sec: u32,
     /// sidra cleans inner segments (runs) below this live fraction.
     #[arg(long, default_value_t = 0.1)]
     clean_inner_below: f64,
@@ -483,7 +486,7 @@ async fn bench_engine(
         leaf_cache_bytes: args.leaf_cache_mib << 20,
         clean_below_live: args.clean_below,
         clean_inner_below_live: args.clean_inner_below,
-        gc: !args.no_gc,
+        gc: (!args.no_gc).then_some(args.gc_deletes_per_sec),
         poll: Duration::from_millis(args.poll_ms),
         max_runs: args.max_runs,
         compression: args.compression,

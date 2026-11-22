@@ -34,7 +34,8 @@ pub struct SidraParams {
     pub leaf_cache_bytes: u64,
     pub clean_below_live: f64,
     pub clean_inner_below_live: f64,
-    pub gc: bool,
+    /// GC delete rate, or `None` to disable GC.
+    pub gc: Option<u32>,
     /// How often sidra writers poll for each other's entries.
     pub poll: Duration,
     pub max_runs: usize,
@@ -85,10 +86,12 @@ impl Engine {
                         ..defaults.poll
                     },
                     warm: params.warm,
-                    gc: if params.gc {
-                        defaults.gc
-                    } else {
-                        sidra::Gc::Off
+                    gc: match params.gc {
+                        Some(rate) => sidra::Gc::On(sidra::GcConfig {
+                            max_deletes_per_sec: rate,
+                            ..sidra::GcConfig::default()
+                        }),
+                        None => sidra::Gc::Off,
                     },
                     compression: match params.compression {
                         crate::CompressionArg::None => sidra::Compression::None,

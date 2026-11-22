@@ -431,17 +431,13 @@ impl Shared {
         let msgs = view.tails.mem().to_sorted_vec();
         let msg_count = msgs.len();
         let msg_bytes = view.tails.mem().bytes();
-        let plan = tree::apply(
-            &self.nodes,
-            &self.cfg.tree,
+        let ck = tree::Checkpoint {
             out,
-            view.manifest.tree,
-            msgs,
-            &victims,
-            drop_below,
-            self.cfg.compression,
-        )
-        .await?;
+            victims: &victims,
+            drop_tombstones_below: drop_below,
+            compression: self.cfg.compression,
+        };
+        let plan = tree::apply(&self.nodes, &self.cfg.tree, ck, view.manifest.tree, msgs).await?;
         futures::future::try_join_all(
             plan.segments
                 .iter()
