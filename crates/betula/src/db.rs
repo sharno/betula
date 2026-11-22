@@ -3,12 +3,14 @@
 //! Write path: ops are batched into WAL objects (put-if-absent, so a fenced
 //! writer finds its next id taken). Once a WAL object is durable its ops enter
 //! the active memtable and become visible. A full memtable is frozen and the
-//! checkpointer applies it to the tree copy-on-write, uploads the new nodes,
+//! checkpointer applies it to the tree copy-on-write, uploads the new nodes
+//! as one segment object,
 //! and publishes the next manifest with put-if-absent.
 //!
 //! Open: claim the next writer epoch by publishing a manifest, fence the WAL
 //! by writing an empty batch at the next free id, replay WALs newer than the
-//! manifest, and delete nodes a crashed writer uploaded but never published.
+//! manifest, and delete segments a crashed writer uploaded but never
+//! published.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
@@ -29,10 +31,13 @@ use crate::manifest::{self, Manifest, Publish};
 use crate::memtable::Memtable;
 use crate::nodes::{CacheConfig, Nodes};
 use crate::retry::retry;
+use crate::segments::{self, CleanerConfig};
 use crate::snapshot::{DbIterator, Snapshot};
 use crate::store::Store;
-use crate::tree::{self, IdAlloc, Plan, TreeConfig, TreeShape};
-use crate::types::{Epoch, KeyRange, ManifestId, Msg, NodeId, TreeRoot, WalId, entry_bytes};
+use crate::tree::{self, TreeConfig, TreeShape};
+use crate::types::{
+    Epoch, KeyRange, ManifestId, Msg, NodePtr, SegmentId, TreeRoot, WalId, entry_bytes,
+};
 use crate::wal::{self, WalBatch, WalWrite};
 
 const REPLAY_CONCURRENCY: usize = 16;
@@ -66,6 +71,7 @@ pub struct DbConfig {
     /// Frozen memtables allowed before WAL writes stall.
     pub max_immutables: usize,
     pub gc: Option<GcConfig>,
+    pub cleaner: CleanerConfig,
     /// Load every internal node into cache on open.
     pub warm_inner_nodes: bool,
 }
@@ -80,6 +86,7 @@ impl Default for DbConfig {
             memtable_bytes: 32 << 20,
             max_immutables: 2,
             gc: Some(GcConfig::default()),
+            cleaner: CleanerConfig::default(),
             warm_inner_nodes: true,
         }
     }
@@ -123,6 +130,9 @@ pub struct DbStats {
     pub tree: Option<TreeRoot>,
     pub immutables: usize,
     pub active_bytes: usize,
+    pub segments: usize,
+    pub segment_bytes: u64,
+    pub live_bytes: u64,
 }
 
 /// A frozen memtable covering every WAL id up to `last_wal`.
@@ -233,7 +243,7 @@ impl Db {
         let epoch = manifest.writer_epoch;
         let fence = fence_wal(&store, epoch, manifest.wal_replay_after).await?;
         let replayed = replay(&store, manifest.wal_replay_after, fence).await?;
-        delete_orphans(&store, manifest.node_watermark, epoch).await?;
+        delete_orphans(&store, manifest.segment_watermark, epoch).await?;
 
         let nodes = Arc::new(Nodes::new(store, cfg.cache));
         if cfg.warm_inner_nodes {
@@ -275,10 +285,14 @@ impl Db {
             waiters: Vec::new(),
             bytes: 0,
         };
-        let alloc = IdAlloc::new(NodeId { epoch, seq: 0 });
+        let first_segment = SegmentId { epoch, seq: 0 };
         let mut tasks = vec![
             tokio::spawn(wal_task.run(rx)),
-            tokio::spawn(checkpoint_loop(shared.clone(), alloc, shutdown_rx.clone())),
+            tokio::spawn(checkpoint_loop(
+                shared.clone(),
+                first_segment,
+                shutdown_rx.clone(),
+            )),
         ];
         if let Some(gc_cfg) = shared.cfg.gc {
             tasks.push(tokio::spawn(gc_loop(shared.clone(), gc_cfg, shutdown_rx)));
@@ -354,6 +368,11 @@ impl Db {
         tree::shape(&self.shared.nodes, root).await
     }
 
+    /// Live and total bytes of every segment the current tree references.
+    pub fn segment_table(&self) -> segments::SegmentTable {
+        self.shared.state.read().manifest.segments.clone()
+    }
+
     pub fn stats(&self) -> DbStats {
         let s = self.shared.state.read();
         DbStats {
@@ -362,6 +381,9 @@ impl Db {
             tree: s.manifest.tree,
             immutables: s.immutables.len(),
             active_bytes: s.active.bytes(),
+            segments: s.manifest.segments.len(),
+            segment_bytes: s.manifest.segments.values().map(|u| u.total).sum(),
+            live_bytes: s.manifest.segments.values().map(|u| u.live).sum(),
         }
     }
 
@@ -458,16 +480,16 @@ async fn replay(store: &Store, after: WalId, fence: WalId) -> Result<Memtable> {
 
 /// Nodes at or above the published watermark from earlier epochs were
 /// uploaded by a writer that died (or was fenced) before publishing them.
-async fn delete_orphans(store: &Store, watermark: NodeId, epoch: Epoch) -> Result<()> {
+async fn delete_orphans(store: &Store, watermark: SegmentId, epoch: Epoch) -> Result<()> {
     let orphans: Vec<_> = store
-        .list_nodes_from(watermark)
+        .list_segments_from(watermark)
         .await?
         .into_iter()
         .filter(|id| id.epoch < epoch)
-        .map(|id| store.node_path(id))
+        .map(|id| store.segment_path(id))
         .collect();
     if !orphans.is_empty() {
-        tracing::info!(count = orphans.len(), "deleting orphaned nodes");
+        tracing::info!(count = orphans.len(), "deleting orphaned segments");
     }
     store.delete_all(orphans).await
 }
@@ -576,7 +598,7 @@ impl WalTask {
 
 async fn checkpoint_loop(
     shared: Arc<Shared>,
-    mut alloc: IdAlloc,
+    mut next_segment: SegmentId,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -598,9 +620,13 @@ async fn checkpoint_loop(
             }
             continue;
         };
-        match checkpoint(&shared, &mut alloc, frozen, id, &current).await {
-            Ok((id, manifest)) => {
-                shared.nodes.evict(&manifest.freed);
+        // A fresh segment id per attempt: a failed attempt may still have
+        // uploaded its segment, which then shows up as an orphan.
+        let seg = next_segment;
+        next_segment = seg.next();
+        match checkpoint(&shared, seg, frozen, id, &current).await {
+            Ok((id, manifest, freed)) => {
+                shared.nodes.evict(&freed);
                 let mut s = shared.state.write();
                 s.manifest_id = id;
                 s.manifest = Arc::new(manifest);
@@ -625,31 +651,38 @@ async fn checkpoint_loop(
 
 async fn checkpoint(
     shared: &Shared,
-    alloc: &mut IdAlloc,
+    seg: SegmentId,
     frozen: Frozen,
     id: ManifestId,
     current: &Manifest,
-) -> Result<(ManifestId, Manifest)> {
+) -> Result<(ManifestId, Manifest, Vec<NodePtr>)> {
     let started = std::time::Instant::now();
     let msgs = frozen.mem.to_sorted_vec();
     let msg_count = msgs.len();
-    let plan = match msgs.is_empty() {
-        true => Plan {
-            root: current.tree,
-            written: Vec::new(),
-            freed: Vec::new(),
-        },
-        false => tree::apply(&shared.nodes, &shared.cfg.tree, alloc, current.tree, msgs).await?,
-    };
+    let victims = segments::pick_victims(&current.segments, &shared.cfg.cleaner);
+    let plan = tree::apply(
+        &shared.nodes,
+        &shared.cfg.tree,
+        seg,
+        current.tree,
+        msgs,
+        &victims,
+    )
+    .await?;
     let applied = started.elapsed();
-    retry("node upload", || shared.nodes.upload(&plan.written)).await?;
+    if let Some(segment) = &plan.segment {
+        retry("segment upload", || shared.nodes.upload(segment)).await?;
+    }
     let uploaded = started.elapsed();
+    let new = plan.segment.as_ref().map(|s| (s.id, s.data.len() as u64));
+    let (table, dead) = segments::account(&current.segments, new, &plan.freed);
     let next = Manifest {
         writer_epoch: current.writer_epoch,
         tree: plan.root,
         wal_replay_after: frozen.last_wal,
-        node_watermark: alloc.watermark(),
-        freed: plan.freed,
+        segment_watermark: seg.next(),
+        segments: table,
+        dead,
         created_at_ms: shared.clock.now_ms(),
     };
     let next_id = id.next();
@@ -662,14 +695,17 @@ async fn checkpoint(
             tracing::debug!(
                 manifest = next_id.0,
                 msgs = msg_count,
-                written = plan.written.len(),
-                freed = next.freed.len(),
+                written = plan.segment.as_ref().map_or(0, |s| s.nodes.len()),
+                segment_bytes = new.map_or(0, |(_, b)| b),
+                freed = plan.freed.len(),
+                victims = victims.len(),
+                dead = next.dead.len(),
                 ?applied,
                 ?uploaded,
                 total = ?started.elapsed(),
                 "checkpoint published"
             );
-            Ok((next_id, next))
+            Ok((next_id, next, plan.freed))
         }
         Publish::Conflict => Err(Error::Fenced),
     }

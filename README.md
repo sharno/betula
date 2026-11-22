@@ -9,7 +9,7 @@ one writer, many readers, no local disk, no coordinator.
 ```
 writes ─► WAL objects ─► memtable ─► (frozen) ─► checkpoint: apply batch to tree COW
                                                     │
-                                    new nodes + manifest (put-if-absent)
+                                 one segment object + manifest (put-if-absent)
 ```
 
 - **Bε-tree.** Internal nodes hold pivots, child ids and a message buffer. A
@@ -17,13 +17,20 @@ writes ─► WAL objects ─► memtable ─► (frozen) ─► checkpoint: app
   buffer flushes the messages for its fullest child into that child,
   recursively. Leaves split by bytes. Empty subtrees are removed. The root
   grows and shrinks as needed.
-- **Copy-on-write.** Nodes are immutable objects (`node/{epoch}-{seq}.node`).
-  A checkpoint writes new nodes for every node it touches and shares the rest.
+- **Copy-on-write segments.** A checkpoint writes every node it touches into
+  one immutable segment object (`seg/{epoch}-{seq}.seg`) and shares the rest.
+  Parents point at children by `(segment, offset, len)`, so reading a node is
+  one ranged GET with no lookup. A checkpoint costs about 2 PUTs, however many
+  nodes it changes.
 - **Manifest.** `manifest/{id}.mf` objects are immutable. The highest id is
   current. Publishing id `n+1` with put-if-absent is the only coordination
-  point. A manifest records the root, its height, the WAL id it covers, the
-  writer epoch, a node-id watermark, and the nodes it freed from the previous
-  version.
+  point. A manifest records:
+  - the root and its height;
+  - the WAL id it covers;
+  - the writer epoch;
+  - a segment-id watermark;
+  - live and total bytes for every referenced segment;
+  - the segments that died going from the previous version to this one.
 - **WAL.** Batched every `wal_flush_interval` or `wal_max_bytes` into
   `wal/{id}.wal` with put-if-absent. A write is acknowledged, and becomes
   visible, once its WAL object is durable.
@@ -35,10 +42,17 @@ writes ─► WAL objects ─► memtable ─► (frozen) ─► checkpoint: app
   Concurrent misses on the same node share one fetch.
 - **Readers.** `DbReader` serves the latest manifest plus the WAL tail and
   refreshes on an interval.
-- **GC.** When manifest `m[i]` is older than `retention`, GC deletes the nodes
-  `m[i]` freed, then `m[i-1]`, then WALs already folded into `m[i]`. On open,
-  the writer also deletes nodes at or above the published watermark, i.e.
-  uploads a crashed writer never published.
+- **Cleaner.** Segments with less than `clean_below_live` (default 25%) of
+  their bytes still live are victims. The next checkpoint rewrites their live
+  nodes along with its normal work, which is ordinary copy-on-write. It finds
+  them by walking only internal nodes (cached): a leaf is judged by the
+  pointer its parent holds. Moves are capped per checkpoint. Cleaning at live
+  fraction *t* adds about *t*/(1−*t*) to write amplification and keeps space
+  amplification near 1/*t*.
+- **GC.** When manifest `m[i]` is older than `retention`, GC deletes the
+  segments that died in `m[i]`, then `m[i-1]`, then WALs already folded into
+  `m[i]`. On open, the writer also deletes segments at or above the published
+  watermark, i.e. uploads a crashed writer never published.
 
 ## Guarantees and limits
 
@@ -47,8 +61,8 @@ writes ─► WAL objects ─► memtable ─► (frozen) ─► checkpoint: app
   Otherwise reads fail with `Error::SnapshotExpired`.
 - Known gaps:
   - No merging of underfull leaves (only empty ones are removed).
-  - Nodes uploaded by a fenced zombie writer *after* a newer writer opened are
-    not reclaimed.
+  - Segments uploaded by a fenced zombie writer *after* a newer writer opened
+    are not reclaimed.
   - A zombie stalled past the GC retention could write a WAL id that GC
     already deleted.
   - Leaves are fetched whole, with no ranged block reads.
@@ -57,8 +71,11 @@ writes ─► WAL objects ─► memtable ─► (frozen) ─► checkpoint: app
 
 - `crates/betula`: the library.
 - `crates/betula/tests/model.rs`: model-based proptest against a `BTreeMap`
-  with tiny nodes (splits, flushes, removals, reopen, readers), plus tests for
-  fencing, GC (only the live tree remains), and crash orphans.
+  with tiny nodes and eager cleaning (splits, flushes, removals, relocation,
+  reopen, readers). After every checkpoint it checks that the manifest's live
+  bytes per segment equal the bytes of reachable nodes. Further tests cover
+  fencing, GC (only referenced segments remain, space amplification is
+  bounded), and crash orphans.
 - `crates/betula-bench`: betula vs SlateDB on an S3 endpoint, with a metered
   object store (request counts, bytes, optional added latency).
   `s3probe` measures the store's raw PUT/GET throughput.
@@ -78,3 +95,18 @@ reopen, cold random reads, updates, settle. Every read is checked against the
 expected value. Both engines get 640 MiB of cache: SlateDB keeps its defaults
 (512 MiB blocks + 128 MiB metadata), and betula uses 256 MiB inner + 384 MiB
 leaf.
+
+### Results (local RustFS, 1M keys × 256 B, defaults: 64 KiB leaves, 1 MiB internal, 16 MiB memtable)
+
+| | betula | SlateDB 0.18 |
+|---|---|---|
+| load keys/s (p99 ms) | 20.4k (123) | 19.9k (127) |
+| PUTs / MiB written during load | 525 / 1441 | 507 / 270 (+ deferred compaction) |
+| warm point reads/s | 803k, 0 GETs | 288k, 0 GETs |
+| cold point reads (50k): GETs, reads/s | 3.4k, 185k | 37.5k, 17k |
+| cold reads/s with 20 ms added per request | 35k | 3.3k |
+| 100-key scans/s (20 ms added) | 23k (24k) | 62k (690) |
+
+Load throughput for both engines is at the ceiling set by the 100 ms WAL
+interval × 64 clients × batches of 32. betula pays for its read advantage in
+bytes written: Bε buffers, plus the cleaner at a 25% threshold.

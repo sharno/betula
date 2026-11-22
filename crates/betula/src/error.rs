@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::types::NodeId;
+use crate::types::SegmentId;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
@@ -11,10 +11,10 @@ pub enum Error {
     ObjectStore(Arc<object_store::Error>),
     #[error("corrupt object {path}: {reason}")]
     Corrupt { path: String, reason: String },
-    /// A node referenced by a snapshot was garbage collected. The snapshot was
-    /// held longer than the GC retention.
-    #[error("snapshot expired: node {0} was garbage collected")]
-    SnapshotExpired(NodeId),
+    /// A segment referenced by a snapshot was garbage collected. The snapshot
+    /// was held longer than the GC retention.
+    #[error("snapshot expired: segment {0} was garbage collected")]
+    SnapshotExpired(SegmentId),
     #[error("database closed")]
     Closed,
 }

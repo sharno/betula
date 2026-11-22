@@ -5,20 +5,22 @@
 //! that child, recursively. Every node touched gets a new id; untouched
 //! subtrees are shared with the previous version.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{StreamExt, TryStreamExt, stream};
 
+use crate::codec;
 use crate::error::{Error, Result};
 use crate::node::{
     Internal, Leaf, Node, apply_to_entries, chunk_by_bytes, entries_bytes, group_starts, merge_msgs,
 };
 use crate::nodes::Nodes;
-use crate::types::{KeyRange, Msg, NodeId, TreeRoot, entry_bytes};
+use crate::nodes::Segment;
+use crate::types::{KeyRange, Msg, NodePtr, SegmentId, TreeRoot, entry_bytes};
 
 #[derive(Clone, Copy, Debug)]
 pub struct TreeConfig {
@@ -55,7 +57,7 @@ impl TreeConfig {
 
 pub async fn get(nodes: &Nodes, root: Option<TreeRoot>, key: &[u8]) -> Result<Option<Bytes>> {
     let Some(root) = root else { return Ok(None) };
-    let mut id = root.id;
+    let mut id = root.ptr;
     loop {
         match nodes.load(id).await? {
             Node::Leaf(leaf) => return Ok(leaf.get(key).cloned()),
@@ -74,15 +76,15 @@ pub struct TreeShape {
     pub internal: usize,
     pub leaves: usize,
     /// Every reachable node.
-    pub nodes: Vec<NodeId>,
+    pub nodes: Vec<NodePtr>,
 }
 
 /// Walks the whole tree. Diagnostic: loads every leaf.
 pub async fn shape(nodes: &Nodes, root: Option<TreeRoot>) -> Result<TreeShape> {
     let mut shape = TreeShape::default();
-    let mut level: Vec<NodeId> = root.map(|r| r.id).into_iter().collect();
+    let mut level: Vec<NodePtr> = root.map(|r| r.ptr).into_iter().collect();
     while !level.is_empty() {
-        let loaded: Vec<(NodeId, Node)> = stream::iter(level)
+        let loaded: Vec<(NodePtr, Node)> = stream::iter(level)
             .map(|id| async move { Ok::<_, Error>((id, nodes.load(id).await?)) })
             .buffered(16)
             .try_collect()
@@ -144,7 +146,7 @@ impl TreeIter {
                 IterState::Done | IterState::Start(None) => return Ok(None),
                 IterState::Start(Some(root)) => {
                     let mut stack = Vec::new();
-                    let leaf = self.descend(root.id, &mut stack).await?;
+                    let leaf = self.descend(root.ptr, &mut stack).await?;
                     (stack, leaf)
                 }
                 IterState::Walking(mut stack) => match self.advance(&mut stack).await? {
@@ -160,7 +162,7 @@ impl TreeIter {
         }
     }
 
-    async fn descend(&self, mut id: NodeId, stack: &mut Vec<Frame>) -> Result<Arc<Leaf>> {
+    async fn descend(&self, mut id: NodePtr, stack: &mut Vec<Frame>) -> Result<Arc<Leaf>> {
         loop {
             match self.nodes.load(id).await? {
                 Node::Leaf(leaf) => return Ok(leaf),
@@ -224,29 +226,6 @@ impl TreeIter {
 // ---------------------------------------------------------------------------
 // Copy-on-write application
 
-/// Allocates node ids for one writer epoch.
-#[derive(Clone, Copy, Debug)]
-pub struct IdAlloc {
-    next: NodeId,
-}
-
-impl IdAlloc {
-    pub fn new(next: NodeId) -> Self {
-        Self { next }
-    }
-
-    fn alloc(&mut self) -> NodeId {
-        let id = self.next;
-        self.next.seq += 1;
-        id
-    }
-
-    /// First id not yet handed out.
-    pub fn watermark(&self) -> NodeId {
-        self.next
-    }
-}
-
 /// Result of rewriting a subtree.
 enum Rewrite {
     /// The subtree became empty.
@@ -254,39 +233,53 @@ enum Rewrite {
     /// The subtree is now `first` followed by `rest`, each tagged with its
     /// lowest key (the pivot to insert before it).
     Nodes {
-        first: NodeId,
-        rest: Vec<(Bytes, NodeId)>,
+        first: NodePtr,
+        rest: Vec<(Bytes, NodePtr)>,
     },
 }
 
 /// A new tree version, not yet uploaded or published.
 pub struct Plan {
     pub root: Option<TreeRoot>,
-    /// New nodes, children before parents.
-    pub written: Vec<(NodeId, Node)>,
+    /// New nodes, or `None` if nothing changed.
+    pub segment: Option<Segment>,
     /// Nodes of the previous version that the new version no longer uses.
-    pub freed: Vec<NodeId>,
+    pub freed: Vec<NodePtr>,
 }
 
-/// Applies sorted, key-unique `msgs` to the tree at `root`.
+/// Applies sorted, key-unique `msgs` to the tree at `root`, writing new nodes
+/// into segment `seg`. Live nodes in `victims` segments are rewritten too,
+/// so those segments can be deleted once nothing else references them.
 pub async fn apply(
     nodes: &Nodes,
     cfg: &TreeConfig,
-    alloc: &mut IdAlloc,
+    seg: SegmentId,
     root: Option<TreeRoot>,
     msgs: Vec<(Bytes, Msg)>,
+    victims: &HashSet<SegmentId>,
 ) -> Result<Plan> {
     let mut w = Writer {
         nodes,
         cfg,
-        alloc,
+        victims,
+        dirty: HashSet::new(),
+        seg,
+        buf: BytesMut::new(),
         written: Vec::new(),
         freed: Vec::new(),
     };
+    if let Some(r) = root.filter(|_| !victims.is_empty()) {
+        w.mark_dirty(r.ptr, r.height).await?;
+    }
     let root = w.apply_root(root, msgs).await?;
+    let segment = (!w.written.is_empty()).then(|| Segment {
+        id: seg,
+        data: w.buf.freeze(),
+        nodes: w.written,
+    });
     Ok(Plan {
         root,
-        written: w.written,
+        segment,
         freed: w.freed,
     })
 }
@@ -294,14 +287,44 @@ pub async fn apply(
 struct Writer<'a> {
     nodes: &'a Nodes,
     cfg: &'a TreeConfig,
-    alloc: &'a mut IdAlloc,
-    written: Vec<(NodeId, Node)>,
-    freed: Vec<NodeId>,
+    victims: &'a HashSet<SegmentId>,
+    /// Internal nodes with a node in `victims` at or below them.
+    dirty: HashSet<NodePtr>,
+    seg: SegmentId,
+    buf: BytesMut,
+    written: Vec<(NodePtr, Node)>,
+    freed: Vec<NodePtr>,
 }
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 impl Writer<'_> {
+    /// Whether the subtree at `ptr` holds a node that must move.
+    fn needs_move(&self, ptr: NodePtr) -> bool {
+        self.victims.contains(&ptr.seg) || self.dirty.contains(&ptr)
+    }
+
+    /// Finds internal nodes on paths to victim nodes. Walks only internal
+    /// nodes (cached); a leaf is judged by the pointer its parent holds.
+    fn mark_dirty(&mut self, ptr: NodePtr, height: u32) -> BoxFut<'_, bool> {
+        Box::pin(async move {
+            if height == 0 {
+                return Ok(self.victims.contains(&ptr.seg));
+            }
+            let Node::Internal(node) = self.nodes.load(ptr).await? else {
+                return Ok(self.victims.contains(&ptr.seg));
+            };
+            let mut dirty = self.victims.contains(&ptr.seg);
+            for &child in &node.children {
+                dirty |= self.mark_dirty(child, height - 1).await?;
+            }
+            if dirty {
+                self.dirty.insert(ptr);
+            }
+            Ok(dirty)
+        })
+    }
+
     async fn apply_root(
         &mut self,
         root: Option<TreeRoot>,
@@ -315,14 +338,15 @@ impl Writer<'_> {
                     .collect();
                 (self.write_leaves(puts), 0)
             }
-            Some(r) => (self.apply_node(r.id, msgs).await?, r.height),
+            Some(r) if msgs.is_empty() && !self.needs_move(r.ptr) => return Ok(Some(r)),
+            Some(r) => (self.rewrite(r.ptr, msgs).await?, r.height),
         };
         // Grow upward while the top level still has several nodes.
         let mut root = loop {
             match level {
                 Rewrite::Removed => return Ok(None),
                 Rewrite::Nodes { first, rest } if rest.is_empty() => {
-                    break TreeRoot { id: first, height };
+                    break TreeRoot { ptr: first, height };
                 }
                 Rewrite::Nodes { first, rest } => {
                     let (pivots, more): (Vec<_>, Vec<_>) = rest.into_iter().unzip();
@@ -337,25 +361,33 @@ impl Writer<'_> {
             }
         };
         // Shrink: a root with one child and nothing buffered is just a hop.
-        // The root is always the node written last.
-        while let Some((id, Node::Internal(node))) = self.written.last() {
-            if *id != root.id || node.children.len() != 1 || !node.buffer.is_empty() {
+        // The root is always the node written last, so unwrite it.
+        while let Some((ptr, Node::Internal(node))) = self.written.last() {
+            if *ptr != root.ptr || node.children.len() != 1 || !node.buffer.is_empty() {
                 break;
             }
             root = TreeRoot {
-                id: node.children[0],
+                ptr: node.children[0],
                 height: root.height - 1,
             };
+            self.buf.truncate(ptr.offset as usize);
             self.written.pop();
         }
         Ok(Some(root))
     }
 
-    fn apply_node(&mut self, id: NodeId, msgs: Vec<(Bytes, Msg)>) -> BoxFut<'_, Rewrite> {
+    /// Rewrites the node at `ptr` with `msgs` applied, moving any victim
+    /// nodes below it.
+    fn rewrite(&mut self, ptr: NodePtr, msgs: Vec<(Bytes, Msg)>) -> BoxFut<'_, Rewrite> {
         Box::pin(async move {
-            let node = self.nodes.load(id).await?;
-            self.freed.push(id);
+            let node = self.nodes.load(ptr).await?;
+            self.freed.push(ptr);
             match node {
+                // A pure move keeps the leaf as is.
+                Node::Leaf(leaf) if msgs.is_empty() => Ok(Rewrite::Nodes {
+                    first: self.write(Node::Leaf(leaf)),
+                    rest: Vec::new(),
+                }),
                 Node::Leaf(leaf) => {
                     Ok(self.write_leaves(apply_to_entries(leaf.entries.clone(), msgs)))
                 }
@@ -373,8 +405,19 @@ impl Writer<'_> {
                             .max_by_key(|(_, b)| **b)
                             .expect("an internal node has children");
                         let slice = node.buffer.drain(node.buffer_slice(i)).collect();
-                        let rewrite = self.apply_node(node.children[i], slice).await?;
+                        let rewrite = self.rewrite(node.children[i], slice).await?;
                         splice(&mut node, i, rewrite);
+                    }
+                    // Move children still holding victims. Replacements live
+                    // in the new segment, so the scan steps past them.
+                    let mut i = 0;
+                    while i < node.children.len() {
+                        if self.needs_move(node.children[i]) {
+                            let rewrite = self.rewrite(node.children[i], Vec::new()).await?;
+                            splice(&mut node, i, rewrite);
+                        } else {
+                            i += 1;
+                        }
                     }
                     if node.children.is_empty() {
                         // Every child was flushed empty, so its buffer was too.
@@ -388,10 +431,16 @@ impl Writer<'_> {
         })
     }
 
-    fn write(&mut self, node: Node) -> NodeId {
-        let id = self.alloc.alloc();
-        self.written.push((id, node));
-        id
+    fn write(&mut self, node: Node) -> NodePtr {
+        let frame = codec::encode(codec::NODE, &node);
+        let ptr = NodePtr {
+            seg: self.seg,
+            offset: self.buf.len() as u64,
+            len: u32::try_from(frame.len()).expect("a node fits in 4 GiB"),
+        };
+        self.buf.extend_from_slice(&frame);
+        self.written.push((ptr, node));
+        ptr
     }
 
     fn write_leaves(&mut self, entries: Vec<(Bytes, Bytes)>) -> Rewrite {

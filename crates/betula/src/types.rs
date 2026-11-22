@@ -15,25 +15,55 @@ impl Epoch {
     }
 }
 
-/// Immutable node identity. The epoch prefix makes ids unique across writers
-/// without coordination, and lets a new writer find a crashed writer's orphans
-/// with one ordered listing.
+/// A checkpoint's output object. The epoch prefix makes ids unique across
+/// writers without coordination, and lets a new writer find a crashed
+/// writer's orphans with one ordered listing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct NodeId {
+pub struct SegmentId {
     pub epoch: Epoch,
     pub seq: u64,
 }
 
-impl fmt::Display for NodeId {
+impl SegmentId {
+    pub fn next(self) -> Self {
+        Self {
+            seq: self.seq + 1,
+            ..self
+        }
+    }
+}
+
+impl fmt::Display for SegmentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}-{}", self.epoch.0, self.seq)
+    }
+}
+
+/// Where an immutable node lives: a byte range of a segment. Parents store
+/// these directly, so reading a node is one ranged GET with no lookup.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct NodePtr {
+    pub seg: SegmentId,
+    pub offset: u64,
+    pub len: u32,
+}
+
+impl NodePtr {
+    pub fn range(&self) -> std::ops::Range<u64> {
+        self.offset..self.offset + u64::from(self.len)
+    }
+}
+
+impl fmt::Display for NodePtr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}+{}", self.seg, self.offset, self.len)
     }
 }
 
 /// Root of a non-empty tree. `height` 0 means the root is a leaf.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeRoot {
-    pub id: NodeId,
+    pub ptr: NodePtr,
     pub height: u32,
 }
 

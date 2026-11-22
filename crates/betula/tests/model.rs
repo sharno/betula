@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use betula::{
-    CacheConfig, Clock, Db, DbConfig, DbReader, Error, KeyRange, ReaderConfig, TreeConfig,
+    CacheConfig, CleanerConfig, Clock, Db, DbConfig, DbReader, Error, KeyRange, ReaderConfig,
+    SegmentId, TreeConfig,
 };
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -37,8 +38,30 @@ fn tiny_config() -> DbConfig {
         memtable_bytes: 200,
         max_immutables: 2,
         gc: None,
+        // Clean eagerly so relocation runs constantly.
+        cleaner: CleanerConfig {
+            clean_below_live: 0.6,
+            max_moved_bytes: 2048,
+        },
         warm_inner_nodes: true,
     }
+}
+
+/// The manifest's live bytes per segment equal the bytes of reachable nodes.
+async fn assert_accounting(db: &Db) {
+    let reachable = db.tree_shape().await.unwrap().nodes.iter().fold(
+        BTreeMap::<SegmentId, u64>::new(),
+        |mut m, p| {
+            *m.entry(p.seg).or_default() += u64::from(p.len);
+            m
+        },
+    );
+    let table: BTreeMap<SegmentId, u64> = db
+        .segment_table()
+        .iter()
+        .map(|(id, u)| (*id, u.live))
+        .collect();
+    assert_eq!(table, reachable, "segment accounting");
 }
 
 fn reader_config() -> ReaderConfig {
@@ -124,7 +147,10 @@ async fn run(ops: Vec<Op>) {
                     assert_eq!(got, model_range(&model, &r), "scan {r:?}");
                 }
             }
-            Op::Checkpoint => db.checkpoint().await.unwrap(),
+            Op::Checkpoint => {
+                db.checkpoint().await.unwrap();
+                assert_accounting(&db).await;
+            }
             Op::FlushWal => db.flush_wal().await.unwrap(),
             Op::Reopen => {
                 db.close().await.unwrap();
@@ -217,8 +243,8 @@ impl Clock for ManualClock {
     }
 }
 
-async fn node_objects(os: &Arc<dyn ObjectStore>) -> usize {
-    let prefix = Path::from(format!("{ROOT}/node"));
+async fn segment_objects(os: &Arc<dyn ObjectStore>) -> usize {
+    let prefix = Path::from(format!("{ROOT}/seg"));
     os.list(Some(&prefix))
         .try_collect::<Vec<_>>()
         .await
@@ -243,19 +269,26 @@ async fn gc_keeps_exactly_the_live_tree() {
         }
         db.checkpoint().await.unwrap();
     }
-    let before = node_objects(&os).await;
+    let before = segment_objects(&os).await;
 
     // Within retention nothing is deleted.
     let stats = db.run_gc(Duration::from_secs(60)).await.unwrap();
-    assert_eq!(stats.nodes, 0);
+    assert_eq!(stats.segments, 0);
 
     clock.0.fetch_add(120_000, Ordering::SeqCst);
     let stats = db.run_gc(Duration::from_secs(60)).await.unwrap();
-    assert!(stats.nodes > 0 && stats.manifests > 0, "{stats:?}");
-    let live = db.tree_shape().await.unwrap().nodes.len();
-    let after = node_objects(&os).await;
+    assert!(stats.segments > 0 && stats.manifests > 0, "{stats:?}");
+    assert_accounting(&db).await;
+    let after = segment_objects(&os).await;
     assert!(after < before);
-    assert_eq!(after, live, "only the live tree remains");
+    assert_eq!(
+        after,
+        db.segment_table().len(),
+        "only referenced segments remain"
+    );
+    // The cleaner keeps space amplification bounded.
+    let s = db.stats();
+    assert!(s.live_bytes * 10 >= s.segment_bytes * 4, "{s:?}");
 
     db.close().await.unwrap();
     let reader = DbReader::open(os, ROOT, reader_config()).await.unwrap();
@@ -298,11 +331,11 @@ async fn crash_orphans_are_deleted_on_open() {
     }
     db.checkpoint().await.unwrap();
     db.close().await.unwrap();
-    let published = node_objects(&os).await;
+    let published = segment_objects(&os).await;
     // Simulate a writer that uploaded nodes but crashed before publishing.
-    let orphan = Path::from(format!("{ROOT}/node/{:020}-{:020}.node", 1, 1_000_000));
+    let orphan = Path::from(format!("{ROOT}/seg/{:020}-{:020}.seg", 1, 1_000_000));
     os.put(&orphan, "junk".into()).await.unwrap();
     let db = Db::open(os.clone(), ROOT, tiny_config()).await.unwrap();
-    assert_eq!(node_objects(&os).await, published);
+    assert_eq!(segment_objects(&os).await, published);
     assert_eq!(db.get(b"k0042").await.unwrap(), Some(Bytes::from("v42")));
 }

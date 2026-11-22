@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec;
 use crate::error::{Error, Result};
+use crate::segments::SegmentTable;
 use crate::store::{CreateOutcome, Store};
-use crate::types::{Epoch, ManifestId, NodeId, TreeRoot, WalId};
+use crate::types::{Epoch, ManifestId, SegmentId, TreeRoot, WalId};
 
 /// One published database version.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,13 +13,15 @@ pub struct Manifest {
     pub tree: Option<TreeRoot>,
     /// Every WAL id at or below this is reflected in `tree`.
     pub wal_replay_after: WalId,
-    /// First node id the publishing writer had not allocated. Nodes at or
+    /// First segment id the publishing writer had not used. Segments at or
     /// above it that exist in storage are orphans of a writer that died
     /// before publishing.
-    pub node_watermark: NodeId,
-    /// Nodes of the previous manifest's tree that this tree no longer uses.
-    /// Deleted by GC once the previous manifest is past retention.
-    pub freed: Vec<NodeId>,
+    pub segment_watermark: SegmentId,
+    /// Every segment this tree references, with its live bytes.
+    pub segments: SegmentTable,
+    /// Segments the previous tree referenced and this one doesn't. Deleted by
+    /// GC once this manifest is past retention.
+    pub dead: Vec<SegmentId>,
     pub created_at_ms: u64,
 }
 
@@ -28,11 +31,12 @@ impl Manifest {
             writer_epoch: Epoch(0),
             tree: None,
             wal_replay_after: WalId::NONE,
-            node_watermark: NodeId {
+            segment_watermark: SegmentId {
                 epoch: Epoch(0),
                 seq: 0,
             },
-            freed: Vec::new(),
+            segments: SegmentTable::new(),
+            dead: Vec::new(),
             created_at_ms: now_ms,
         }
     }
@@ -41,7 +45,7 @@ impl Manifest {
     pub fn fenced(&self, now_ms: u64) -> Self {
         Self {
             writer_epoch: self.writer_epoch.next(),
-            freed: Vec::new(),
+            dead: Vec::new(),
             created_at_ms: now_ms,
             ..self.clone()
         }

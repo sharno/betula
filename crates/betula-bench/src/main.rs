@@ -69,6 +69,9 @@ struct Args {
     inner_cache_mib: u64,
     #[arg(long, default_value_t = 384)]
     leaf_cache_mib: u64,
+    /// betula cleans segments whose live fraction is below this.
+    #[arg(long, default_value_t = 0.25)]
+    clean_below: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +292,7 @@ async fn bench_engine(
         memtable_bytes: args.memtable_mib << 20,
         inner_cache_bytes: args.inner_cache_mib << 20,
         leaf_cache_bytes: args.leaf_cache_mib << 20,
+        clean_below_live: args.clean_below,
     };
     let c = args.concurrency;
     let mut phases = Vec::new();

@@ -3,7 +3,8 @@
 //! - `manifest/{id:020}.mf`: immutable manifests; the highest id is current.
 //!   Writers publish with put-if-absent, which is the only coordination point.
 //! - `wal/{id:020}.wal`: write-ahead log batches, also put-if-absent.
-//! - `node/{epoch:020}-{seq:020}.node`: immutable tree nodes.
+//! - `seg/{epoch:020}-{seq:020}.seg`: one per checkpoint, holding every node
+//!   that checkpoint wrote, back to back. Nodes are read with ranged GETs.
 
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
 use crate::error::{Error, Result};
-use crate::types::{Epoch, ManifestId, NodeId, WalId};
+use crate::types::{Epoch, ManifestId, SegmentId, WalId};
 
 const DELETE_CONCURRENCY: usize = 32;
 
@@ -51,14 +52,26 @@ impl Store {
         self.dir("wal").join(format!("{:020}.wal", id.0))
     }
 
-    pub fn node_path(&self, id: NodeId) -> Path {
-        self.dir("node")
-            .join(format!("{:020}-{:020}.node", id.epoch.0, id.seq))
+    pub fn segment_path(&self, id: SegmentId) -> Path {
+        self.dir("seg")
+            .join(format!("{:020}-{:020}.seg", id.epoch.0, id.seq))
     }
 
     pub async fn get(&self, path: &Path) -> Result<Option<Bytes>> {
         match self.os.get(path).await {
             Ok(r) => Ok(Some(r.bytes().await?)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn get_range(
+        &self,
+        path: &Path,
+        range: std::ops::Range<u64>,
+    ) -> Result<Option<Bytes>> {
+        match self.os.get_range(path, range).await {
+            Ok(b) => Ok(Some(b)),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -137,17 +150,17 @@ impl Store {
         Ok(ids)
     }
 
-    /// Node ids at or after `from`, sorted.
-    pub async fn list_nodes_from(&self, from: NodeId) -> Result<Vec<NodeId>> {
+    /// Segment ids at or after `from`, sorted.
+    pub async fn list_segments_from(&self, from: SegmentId) -> Result<Vec<SegmentId>> {
         let offset = from
             .seq
             .checked_sub(1)
-            .map(|seq| self.node_path(NodeId { seq, ..from }));
+            .map(|seq| self.segment_path(SegmentId { seq, ..from }));
         let mut ids: Vec<_> = self
-            .list_names("node", offset)
+            .list_names("seg", offset)
             .await?
             .iter()
-            .filter_map(|n| parse_node(n))
+            .filter_map(|n| parse_segment(n))
             .filter(|id| *id >= from)
             .collect();
         ids.sort();
@@ -159,9 +172,9 @@ fn parse_num(name: &str, suffix: &str) -> Option<u64> {
     name.strip_suffix(suffix)?.parse().ok()
 }
 
-fn parse_node(name: &str) -> Option<NodeId> {
-    let (epoch, seq) = name.strip_suffix(".node")?.split_once('-')?;
-    Some(NodeId {
+fn parse_segment(name: &str) -> Option<SegmentId> {
+    let (epoch, seq) = name.strip_suffix(".seg")?.split_once('-')?;
+    Some(SegmentId {
         epoch: Epoch(epoch.parse().ok()?),
         seq: seq.parse().ok()?,
     })

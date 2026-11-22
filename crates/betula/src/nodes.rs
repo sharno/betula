@@ -15,9 +15,8 @@ use crate::codec;
 use crate::error::{Error, Result};
 use crate::node::Node;
 use crate::store::Store;
-use crate::types::{NodeId, TreeRoot};
+use crate::types::{NodePtr, SegmentId, TreeRoot};
 
-const UPLOAD_CONCURRENCY: usize = 64;
 const LOAD_CONCURRENCY: usize = 16;
 /// Conservative size estimates for cache sharding. quick_cache splits its
 /// capacity evenly across shards, so a shard must fit many of the largest
@@ -44,22 +43,22 @@ impl Default for CacheConfig {
 #[derive(Clone)]
 struct EncodedSize;
 
-impl Weighter<NodeId, (Node, u32)> for EncodedSize {
-    fn weight(&self, _: &NodeId, (_, size): &(Node, u32)) -> u64 {
-        u64::from(*size).max(1)
+impl Weighter<NodePtr, Node> for EncodedSize {
+    fn weight(&self, ptr: &NodePtr, _: &Node) -> u64 {
+        u64::from(ptr.len).max(1)
     }
 }
 
-type NodeCache = Cache<NodeId, (Node, u32), EncodedSize>;
+type NodeCache = Cache<NodePtr, Node, EncodedSize>;
 
 /// A fetch shared by every concurrent reader of the same missing node.
-type Loading = Shared<BoxFuture<'static, Result<(Node, usize)>>>;
+type Loading = Shared<BoxFuture<'static, Result<Node>>>;
 
 pub struct Nodes {
     store: Store,
     inner: NodeCache,
     leaves: NodeCache,
-    loading: Mutex<HashMap<NodeId, Loading>>,
+    loading: Mutex<HashMap<NodePtr, Loading>>,
 }
 
 fn new_cache(bytes: u64, item_estimate: u64) -> NodeCache {
@@ -95,70 +94,74 @@ impl Nodes {
         }
     }
 
-    fn insert(&self, id: NodeId, node: Node, size: usize) {
-        let size = u32::try_from(size).unwrap_or(u32::MAX);
-        self.cache_for(&node).insert(id, (node, size));
+    fn insert(&self, ptr: NodePtr, node: Node) {
+        self.cache_for(&node).insert(ptr, node);
     }
 
-    pub async fn load(&self, id: NodeId) -> Result<Node> {
-        if let Some((n, _)) = self.inner.get(&id).or_else(|| self.leaves.get(&id)) {
+    pub async fn load(&self, ptr: NodePtr) -> Result<Node> {
+        if let Some(n) = self.inner.get(&ptr).or_else(|| self.leaves.get(&ptr)) {
             return Ok(n);
         }
         let loading = self
             .loading
             .lock()
-            .entry(id)
-            .or_insert_with(|| fetch(self.store.clone(), id).boxed().shared())
+            .entry(ptr)
+            .or_insert_with(|| fetch(self.store.clone(), ptr).boxed().shared())
             .clone();
         let result = loading.await;
         // Cache before dropping the in-flight entry so no reader slips
         // between the two and fetches again.
-        if let Ok((node, size)) = &result {
-            self.insert(id, node.clone(), *size);
+        if let Ok(node) = &result {
+            self.insert(ptr, node.clone());
         }
-        self.loading.lock().remove(&id);
-        result.map(|(node, _)| node)
+        self.loading.lock().remove(&ptr);
+        result
     }
 
     /// Drops nodes the current tree no longer uses.
-    pub fn evict(&self, ids: &[NodeId]) {
-        ids.iter().for_each(|id| {
-            self.inner.remove(id);
-            self.leaves.remove(id);
+    pub fn evict(&self, ptrs: &[NodePtr]) {
+        ptrs.iter().for_each(|ptr| {
+            self.inner.remove(ptr);
+            self.leaves.remove(ptr);
         });
     }
 
-    /// Uploads new nodes and caches them, so the writer never re-reads its own
-    /// writes.
-    pub async fn upload(&self, nodes: &[(NodeId, Node)]) -> Result<()> {
-        // Owned items: a borrowing closure trips higher-ranked lifetime
-        // inference once this future is spawned.
-        stream::iter(nodes.to_vec())
-            .map(|(id, node)| async move {
-                let data: Bytes = codec::encode(codec::NODE, &node);
-                let size = data.len();
-                self.store.put(&self.store.node_path(id), data).await?;
-                self.insert(id, node, size);
-                Ok::<_, Error>(())
-            })
-            .buffer_unordered(UPLOAD_CONCURRENCY)
-            .try_collect()
-            .await
+    /// Uploads a checkpoint's segment and caches its nodes, so the writer
+    /// never re-reads its own writes.
+    pub async fn upload(&self, segment: &Segment) -> Result<()> {
+        self.store
+            .put(&self.store.segment_path(segment.id), segment.data.clone())
+            .await?;
+        segment
+            .nodes
+            .iter()
+            .for_each(|(ptr, node)| self.insert(*ptr, node.clone()));
+        Ok(())
     }
 }
 
-async fn fetch(store: Store, id: NodeId) -> Result<(Node, usize)> {
-    let path = store.node_path(id);
-    let data = store.get(&path).await?.ok_or(Error::SnapshotExpired(id))?;
-    let node = codec::decode(codec::NODE, path.as_ref(), &data)?;
-    Ok((node, data.len()))
+/// Every node a checkpoint wrote, encoded back to back.
+#[derive(Clone, Debug)]
+pub struct Segment {
+    pub id: SegmentId,
+    pub data: Bytes,
+    pub nodes: Vec<(NodePtr, Node)>,
+}
+
+async fn fetch(store: Store, ptr: NodePtr) -> Result<Node> {
+    let path = store.segment_path(ptr.seg);
+    let data = store
+        .get_range(&path, ptr.range())
+        .await?
+        .ok_or(Error::SnapshotExpired(ptr.seg))?;
+    codec::decode(codec::NODE, &format!("{path}@{}", ptr.offset), &data)
 }
 
 impl Nodes {
     /// Loads every internal node of the tree, one level at a time.
     pub async fn warm_inner(&self, root: Option<TreeRoot>) -> Result<usize> {
         let Some(root) = root else { return Ok(0) };
-        let mut level = vec![root.id];
+        let mut level = vec![root.ptr];
         let mut loaded = 0;
         for _ in 0..root.height {
             let nodes: Vec<Node> = stream::iter(level)

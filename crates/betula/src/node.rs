@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Msg, NodeId, entry_bytes};
+use crate::types::{Msg, NodePtr, entry_bytes};
 
 /// Tree node. Nodes are immutable once written: every change produces a new
 /// node under a new id (copy-on-write).
@@ -27,7 +27,7 @@ pub struct Leaf {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Internal {
     pub pivots: Vec<Bytes>,
-    pub children: Vec<NodeId>,
+    pub children: Vec<NodePtr>,
     pub buffer: Vec<(Bytes, Msg)>,
 }
 
@@ -91,7 +91,7 @@ impl Internal {
     }
 
     pub fn routing_bytes(&self) -> usize {
-        self.pivots.iter().map(|p| p.len() + 8).sum::<usize>() + self.children.len() * 16
+        self.pivots.iter().map(|p| p.len() + 8).sum::<usize>() + self.children.len() * 32
     }
 
     /// Buffered bytes per child, in child order.

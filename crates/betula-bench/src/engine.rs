@@ -32,6 +32,7 @@ pub struct BetulaParams {
     /// 512 MiB block cache + 128 MiB metadata cache.
     pub inner_cache_bytes: u64,
     pub leaf_cache_bytes: u64,
+    pub clean_below_live: f64,
 }
 
 pub enum Engine {
@@ -61,6 +62,10 @@ impl Engine {
                     // Same WAL flush interval as SlateDB's default.
                     wal_flush_interval: Duration::from_millis(100),
                     memtable_bytes: params.memtable_bytes,
+                    cleaner: betula::CleanerConfig {
+                        clean_below_live: params.clean_below_live,
+                        ..betula::CleanerConfig::default()
+                    },
                     ..betula::DbConfig::default()
                 };
                 Engine::Betula(betula::Db::open(os, path, cfg).await?)
@@ -138,9 +143,11 @@ impl Engine {
             Engine::Betula(db) => {
                 let s = db.stats();
                 format!(
-                    "manifest={} height={}",
+                    "manifest={} height={} segments={} live={:.0}%",
                     s.manifest_id.0,
-                    s.tree.map_or(0, |t| t.height)
+                    s.tree.map_or(0, |t| t.height),
+                    s.segments,
+                    100.0 * s.live_bytes as f64 / s.segment_bytes.max(1) as f64
                 )
             }
             Engine::Slatedb(_) => String::new(),

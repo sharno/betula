@@ -1,10 +1,10 @@
 //! Deletes nodes, WALs and manifests that no reader can need anymore.
 //!
-//! Manifest `m[i]` lists the nodes it freed from `m[i-1]`. Once `m[i]` is older
-//! than the retention, nobody may still be reading `m[i-1]` (readers must
-//! refresh within the retention), so `m[i]`'s freed nodes, `m[i-1]` itself,
-//! and WALs already folded into `m[i]` can go. The latest manifest is never
-//! deleted.
+//! Manifest `m[i]` lists the segments that died going from `m[i-1]` to `m[i]`.
+//! Once `m[i]` is older than the retention, nobody may still be reading
+//! `m[i-1]` (readers must refresh within the retention), so `m[i]`'s dead
+//! segments, `m[i-1]` itself, and WALs already folded into `m[i]` can go. The
+//! latest manifest is never deleted.
 
 use std::time::Duration;
 
@@ -33,7 +33,7 @@ impl Default for GcConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GcStats {
     pub manifests: usize,
-    pub nodes: usize,
+    pub segments: usize,
     pub wals: usize,
 }
 
@@ -51,9 +51,9 @@ pub async fn run(store: &Store, now_ms: u64, retention: Duration) -> Result<GcSt
             break;
         }
         store
-            .delete_all(m.freed.iter().map(|id| store.node_path(*id)).collect())
+            .delete_all(m.dead.iter().map(|id| store.segment_path(*id)).collect())
             .await?;
-        stats.nodes += m.freed.len();
+        stats.segments += m.dead.len();
         // Delete the manifest last so a crash mid-way is retried next run.
         store.delete_all(vec![store.manifest_path(prev)]).await?;
         stats.manifests += 1;
