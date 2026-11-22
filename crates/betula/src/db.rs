@@ -139,7 +139,7 @@ impl Default for DbConfig {
             },
             gc: Some(GcConfig::default()),
             cleaner: CleanerConfig::default(),
-            warm: Warm::Background,
+            warm: Warm::Blocking,
             rewarm: Warm::Off,
         }
     }

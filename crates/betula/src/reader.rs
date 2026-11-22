@@ -37,7 +37,7 @@ impl Default for ReaderConfig {
             cache: CacheConfig::default(),
             refresh_interval: Some(Duration::from_millis(500)),
             discovery_interval: Duration::from_secs(2),
-            warm: Warm::Background,
+            warm: Warm::Blocking,
             rewarm: Warm::Background,
         }
     }

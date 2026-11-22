@@ -55,9 +55,10 @@ writer C ─► writers/C/wal/{seq} ─┘
 
   Child pointers record each subtree's oldest tombstone, so leaves whose
   tombstones became droppable are found without loading leaves.
-- **Inner-node cache.** Internal nodes and runs have their own cache. On
-  open, internal nodes load before returning and runs load in the background
-  (`Warm::Background`); `Warm::Blocking` waits for both. Once warm, a cold
+- **Inner-node cache.** Internal nodes and runs have their own cache. By
+  default, open loads both before returning (`Warm::Blocking`), so reads are
+  full speed from the first request. `Warm::Background` returns after the
+  internal nodes and streams runs in behind, opening about 4x faster. Once warm, a cold
   point read is at most one GET. Polling for other writers backs off while
   nothing changes.
 - **Cleaner.** Segments below 25% live get their live nodes rewritten by the
@@ -131,8 +132,8 @@ betula builds:
 | MiB written during load | 1,475 | **780** | 270 (+ deferred compaction) |
 | warm point reads/s | 931k | 1.03M | 336k |
 | 100-key scans/s | 33k | 36k | 80k |
-| open (reopen) | 52 ms | 29 ms (`Blocking`: 140 ms) | 53 ms |
-| cold point reads (50k): GETs, reads/s | 4.0k, 297k | 3.8k, 262k (`Blocking`: 3.8k, 319k) | 43k, 32k |
+| open (reopen) | 52 ms | 140 ms (`Background`: 29 ms) | 53 ms |
+| cold point reads (50k): GETs, reads/s | 4.0k, 297k | 3.8k, 319k (`Background`: 3.8k, 262k) | 43k, 32k |
 
 At 64 clients × batches of 32, load for both engines sits at the ceiling set
 by the 100 ms log flush interval.

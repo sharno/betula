@@ -61,10 +61,10 @@ struct Args {
     internal_kib: usize,
     #[arg(long, default_value_t = 32)]
     fanout: usize,
-    /// betula: load buffered runs on open before returning (otherwise in
-    /// the background).
+    /// betula: load buffered runs in the background on open instead of
+    /// before returning.
     #[arg(long)]
-    warm_blocking: bool,
+    warm_background: bool,
     /// betula: buffered runs per child before it is flushed.
     #[arg(long, default_value_t = 16)]
     max_runs: usize,
@@ -312,10 +312,10 @@ async fn bench_engine(
         clean_below_live: args.clean_below,
         poll: Duration::from_millis(args.poll_ms),
         max_runs: args.max_runs,
-        warm: if args.warm_blocking {
-            betula::Warm::Blocking
-        } else {
+        warm: if args.warm_background {
             betula::Warm::Background
+        } else {
+            betula::Warm::Blocking
         },
     };
     let writers = match kind {

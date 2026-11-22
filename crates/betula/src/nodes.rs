@@ -33,10 +33,12 @@ pub enum Warm {
     /// Load on first use.
     Off,
     /// Load internal nodes before returning and runs in the background:
-    /// fast open; reads that need a run before it arrives wait for its batch.
-    #[default]
+    /// fast open (about 4x faster); reads that need a run before it arrives
+    /// wait for its batch. Suits processes that start often.
     Background,
-    /// Load everything before returning: slower open, full-speed reads after.
+    /// Load everything before returning: slower open, full-speed reads from
+    /// the first request. Suits long-running services.
+    #[default]
     Blocking,
 }
 
