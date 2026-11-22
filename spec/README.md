@@ -49,19 +49,22 @@ cargo install everystate --locked
 
 ## Code proofs (Kani)
 
-Each harness is checked over every input up to small bounds:
+Each harness checks every value of its inputs at the listed sizes. Sizes are
+concrete per harness (CBMC's formulas blow up with symbolic lengths or 64-bit
+division); contents are symbolic.
 
-| Harness | Property |
-|---|---|
-| `merge_newest_keeps_newest_per_key` | Merge output is sorted, keeps each key once with its newest version, and invents nothing |
-| `merge_newest_is_commutative` / `_is_associative` | Applying writes in any order or grouping gives the same result |
-| `chunk_by_bytes_partitions_in_order` | Leaf splits keep every entry in order, have no empty leaves, and meet the size target |
-| `group_starts_respect_fanout` | Internal-node splits cover every child and respect the fanout |
-| `routing_is_consistent` | A key goes to the child that covers it; range scans start and stop at the right children |
-| `splice_keeps_node_shape` | Child replacement and removal keep `children = pivots + 1`, with pivots sorted |
-| `hlc_is_strictly_monotonic` | The hybrid clock never repeats or goes back, and orders after anything it observed |
-| `account_tracks_live_bytes` | Segment live bytes drop by exactly what was freed; dead exactly when zero |
-| `victims_respect_threshold_and_budget` | The cleaner picks only segments below the threshold, within its budget |
+| Harnesses | Property | Sizes | Result |
+|---|---|---|---|
+| `merge_newest_*` (4) | Merge output is sorted, keeps each key once with its newest version, and invents nothing | runs of 1–2 entries | ✅ |
+| `merge_commutes_*` (3), `merge_associates_*` (3) | Applying writes in any order or grouping gives the same result | runs of 1–2 | ✅ |
+| `chunks_*` (3) | Leaf splits keep every entry in order, have no empty leaves, and meet the size target | 1–3 entries | ✅ |
+| `group_starts_*` (6) | Internal-node splits cover every child and respect the fanout | n ∈ {1,3,5,7,8,9}, fanout 1–8 | ✅ |
+| `routing_*` (4) | A key goes to the child that covers it; range scans start and stop at the right children | 0–3 pivots | ✅ |
+| `splice_*` (7) | Child replacement and removal keep `children = pivots + 1`, with pivots sorted | 0–2 pivots, every position | ✅ |
+| `hlc_is_strictly_monotonic` | The hybrid clock never repeats or goes back, and orders after anything it observed | any 40-bit time | ✅ |
+| `account_tracks_live_bytes`, `victims_respect_threshold_and_budget` | Segment accounting; cleaner victim selection | 1–2 segments | ⏱ times out (`BTreeMap`); gated behind `--cfg kani_slow`. The proptest checks accounting after every checkpoint |
+
+30 harnesses verified.
 
 ```sh
 cargo install --locked kani-verifier && cargo kani setup
