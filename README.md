@@ -68,6 +68,28 @@ retention = "10m"
 SIDRA_WAL__FLUSH_INTERVAL=20ms SIDRA_APPLIER__MODE=never ./my-service
 ```
 
+#### Writers in other regions
+
+A writer far from the home bucket can put its log in a bucket in its own
+region, so a write costs a local PUT. Manifests, segments and leases stay in
+the home bucket, and the applier pulls the regional log from there.
+
+```toml
+# A writer in eu-west-1; the database lives in us-east-1.
+log = { region = "eu" }
+[applier]
+mode = "never"                 # leave applying to the home region
+[regions]
+eu = "s3://my-db-eu/orders"
+```
+
+Every process that pulls logs (the applier, readers that follow every
+writer, `sidra writers` and `sidra gc`) needs the same `[regions]` table, or
+`Db::builder(..).with_region(..)` in code. One without it fails with
+`InvalidConfig` when it meets a writer logging there. A write is durable in
+its own region first: if that region fails before the applier pulls it, the
+write is unavailable until the region recovers, not lost.
+
 Credentials and endpoints come from the usual `AWS_*`, `GOOGLE_*` and
 `AZURE_*` variables (for example `AWS_ENDPOINT` and `AWS_ALLOW_HTTP` for
 RustFS or MinIO).
@@ -205,15 +227,12 @@ writer C ─► writers/C/wal/{seq} ─┘
 ## Roadmap
 
 Done: LZ4 compression (on by default), lighter cleaning of inner segments,
-paced GC deletes.
+paced GC deletes, regional writer logs.
 
-1. **Multi-region writers.**
-   - Each writer appends its log to a bucket in its own region (local write
-     latency, no cross-region traffic to write); its lease records where.
-   - The applier is pinned to the home region and pulls those logs
-     asynchronously.
-   - Regional read replicas follow a replicated manifest. Segments are
-     immutable, so bucket replication copies them safely.
+1. **Multi-region reads.** Regional read replicas follow a replicated
+   manifest. Segments are immutable, so bucket replication copies them
+   safely. Also a preferred applier region, instead of `mode = "never"` on
+   remote writers.
 2. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
 3. **Fault-injection and soak tests:** failed, slow and lost store requests;
    long runs.

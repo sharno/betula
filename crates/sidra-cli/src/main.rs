@@ -145,8 +145,8 @@ async fn main() -> Result<()> {
         Cmd::Writers { url } => {
             let writers = Admin::open(&url)?.writers().await?;
             println!(
-                "{:<18} {:<6} {:>6} {:>10}  lease",
-                "writer", "live", "logs", "unapplied"
+                "{:<18} {:<6} {:<10} {:>6} {:>10}  lease",
+                "writer", "live", "log in", "logs", "unapplied"
             );
             for w in writers {
                 let lease = w.lease_expires_at_ms.map_or("none".into(), |t| {
@@ -156,10 +156,15 @@ async fn main() -> Result<()> {
                         format!("expired {}", ago(t))
                     }
                 });
+                let at = match &w.log {
+                    Some(sidra::LogHome::Region(r)) => r.to_string(),
+                    Some(sidra::LogHome::Home) | None => "home".into(),
+                };
                 println!(
-                    "{:<18} {:<6} {:>6} {:>10}  {lease}",
+                    "{:<18} {:<6} {:<10} {:>6} {:>10}  {lease}",
                     w.id.to_string(),
                     w.live,
+                    at,
                     w.log_objects,
                     w.unapplied
                 );

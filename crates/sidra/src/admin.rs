@@ -13,8 +13,10 @@ use crate::error::Result;
 use crate::gc::{self, GcStats};
 use crate::hlc::WriterId;
 use crate::location;
+use crate::logs::{LogHome, Logs, Region, RegionStores};
 use crate::manifest;
 use crate::nodes::{CacheConfig, Nodes};
+use crate::settings::Settings;
 use crate::store::Store;
 use crate::tree::{self, TreeShape};
 use crate::types::{Epoch, ManifestId, TreeRoot};
@@ -39,6 +41,8 @@ pub struct ManifestInfo {
 #[derive(Clone, Debug)]
 pub struct WriterInfo {
     pub id: WriterId,
+    /// Where its log lives; `None` if it never wrote a lease.
+    pub log: Option<LogHome>,
     /// Lease expiry by the writer's clock; `None` if it never wrote one.
     pub lease_expires_at_ms: Option<u64>,
     pub live: bool,
@@ -49,23 +53,55 @@ pub struct WriterInfo {
 
 pub struct Admin {
     nodes: Nodes,
+    regions: RegionStores,
+    logs: Logs,
     clock: Arc<dyn Clock>,
 }
 
 impl Admin {
+    /// Log regions come from [`Settings::load`].
     pub fn open(url: &str) -> Result<Self> {
         let (store, path) = location::parse(url)?;
-        Ok(Self::new(path, store))
+        let regions = RegionStores::from_urls(&Settings::load()?.regions)?;
+        Ok(Self::with_regions(path, store, regions))
     }
 
     pub fn new(path: impl Into<Path>, store: Arc<dyn ObjectStore>) -> Self {
+        Self::with_regions(path, store, RegionStores::default())
+    }
+
+    fn with_regions(
+        path: impl Into<Path>,
+        store: Arc<dyn ObjectStore>,
+        regions: RegionStores,
+    ) -> Self {
         let cache = CacheConfig {
             inner_bytes: 64 << 20,
             leaf_bytes: 16 << 20,
         };
+        let home = Store::new(store, path);
         Self {
-            nodes: Nodes::new(Store::new(store, path), cache),
+            logs: Logs::new(home.clone(), regions.clone()),
+            nodes: Nodes::new(home, cache),
+            regions,
             clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// Adds a store holding writers' logs (see [`Settings::regions`]).
+    pub fn with_region(
+        self,
+        region: Region,
+        store: Arc<dyn ObjectStore>,
+        path: impl Into<Path>,
+    ) -> Self {
+        let mut regions = self.regions;
+        regions.insert(region, store, path.into());
+        let home = self.nodes.store().clone();
+        Self {
+            logs: Logs::new(home, regions.clone()),
+            regions,
+            ..self
         }
     }
 
@@ -102,11 +138,13 @@ impl Admin {
         try_join_all(ids.into_iter().map(|id| {
             let upto = applied.get(&id).copied().unwrap_or(0);
             async move {
-                let (lease, seqs) =
-                    futures::try_join!(wal::read_lease(store, id), store.list_wals(id))?;
+                let (lease, seqs) = futures::try_join!(wal::read_lease(store, id), async {
+                    self.logs.of(id).await?.list_wals(id).await
+                })?;
                 Ok(WriterInfo {
                     id,
-                    lease_expires_at_ms: lease.map(|l| l.expires_at_ms),
+                    log: lease.as_ref().map(|l| l.log.clone()),
+                    lease_expires_at_ms: lease.as_ref().map(|l| l.expires_at_ms),
                     live: lease.is_some_and(|l| l.expires_at_ms > now),
                     log_objects: seqs.len(),
                     unapplied: seqs.iter().filter(|s| **s > upto).count(),
@@ -125,12 +163,6 @@ impl Admin {
     /// Deletes what no reader within `retention` can need. Safe to run while
     /// writers are active.
     pub async fn gc(&self, retention: Duration) -> Result<GcStats> {
-        gc::run(
-            self.store(),
-            self.clock.now_ms(),
-            retention,
-            gc::Speed::Full,
-        )
-        .await
+        gc::run(&self.logs, self.clock.now_ms(), retention, gc::Speed::Full).await
     }
 }

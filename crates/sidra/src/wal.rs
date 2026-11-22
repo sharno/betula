@@ -4,6 +4,9 @@
 //! never coordinate. A writer's lease, `writers/{id}/lease`, says it is alive
 //! and gives a floor under every timestamp it may still write. The applier
 //! uses the floors to decide when tombstones can be dropped.
+//!
+//! Leases always live in the home store; a log may live in a regional store
+//! (see `logs`).
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -11,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::codec;
 use crate::error::Result;
 use crate::hlc::WriterId;
+use crate::logs::LogHome;
 use crate::store::{CreateOutcome, Store};
 use crate::types::Version;
 
@@ -54,9 +58,11 @@ pub async fn read(store: &Store, writer: WriterId, seq: u64) -> Result<Option<Wa
         .transpose()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lease {
     pub writer: WriterId,
+    /// Where this writer's log lives. Fixed for the writer's lifetime.
+    pub log: LogHome,
     /// Every timestamp the writer has not yet made durable is at least this.
     pub floor_hlc: u64,
     /// Writer clock. The writer stops acknowledging writes before this.

@@ -17,6 +17,7 @@
 //! SIDRA_WAL__FLUSH_INTERVAL=20ms SIDRA_APPLIER__MODE=never
 //! ```
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -27,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::codec::Compression;
 use crate::error::{Error, Result};
 use crate::gc::GcConfig;
+use crate::logs::{LogHome, Region};
 use crate::nodes::{CacheConfig, Warm};
 use crate::segments::CleanerConfig;
 use crate::tree::TreeConfig;
@@ -49,6 +51,14 @@ pub struct Settings {
     pub cleaner: CleanerConfig,
     /// Compression of tree nodes and log batches. Readers decode either.
     pub compression: Compression,
+    /// Where this writer's log goes. A writer far from the home store puts
+    /// it in a store in its own region (listed in `regions`), so writes stay
+    /// local; the applier pulls it from there.
+    pub log: LogHome,
+    /// Stores holding writers' logs, by region name: URLs such as
+    /// `s3://bucket-eu/db`. Every process that pulls logs (applier, readers,
+    /// GC) needs each region that any writer logs to.
+    pub regions: BTreeMap<Region, String>,
     /// Loading of internal nodes and buffered runs on open.
     pub warm: Warm,
     /// Loading of each new manifest's changed internal nodes and runs as
@@ -70,6 +80,8 @@ impl Default for Settings {
             cache: CacheConfig::default(),
             cleaner: CleanerConfig::default(),
             compression: Compression::default(),
+            log: LogHome::Home,
+            regions: BTreeMap::new(),
             warm: Warm::Blocking,
             rewarm: Warm::Off,
         }
@@ -89,6 +101,8 @@ pub struct ReaderSettings {
     pub cache: CacheConfig,
     pub warm: Warm,
     pub rewarm: Warm,
+    /// Stores holding writers' logs, by region name (see `Settings`).
+    pub regions: BTreeMap<Region, String>,
 }
 
 impl Default for ReaderSettings {
@@ -99,6 +113,7 @@ impl Default for ReaderSettings {
             cache: CacheConfig::default(),
             warm: Warm::Blocking,
             rewarm: Warm::Background,
+            regions: BTreeMap::new(),
         }
     }
 }

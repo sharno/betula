@@ -15,6 +15,7 @@ use crate::db::{Clock, Freshness, ReadOptions, SystemClock};
 use crate::error::Result;
 use crate::follow::{Follower, Scope};
 use crate::location;
+use crate::logs::{Logs, Region, RegionStores};
 use crate::nodes::Nodes;
 use crate::settings::ReaderSettings;
 use crate::snapshot::DbIterator;
@@ -32,6 +33,7 @@ pub struct DbReaderBuilder {
     store: Arc<dyn ObjectStore>,
     path: Path,
     settings: ReaderSettings,
+    regions: RegionStores,
 }
 
 impl DbReaderBuilder {
@@ -40,8 +42,22 @@ impl DbReaderBuilder {
         self
     }
 
+    /// Adds a store holding writers' logs, overriding a URL for the same
+    /// region in settings.
+    pub fn with_region(
+        mut self,
+        region: Region,
+        store: Arc<dyn ObjectStore>,
+        path: impl Into<Path>,
+    ) -> Self {
+        self.regions.insert(region, store, path.into());
+        self
+    }
+
     pub async fn build(self) -> Result<DbReader> {
-        DbReader::start(self.store, self.path, self.settings).await
+        let mut regions = RegionStores::from_urls(&self.settings.regions)?;
+        regions.extend(self.regions);
+        DbReader::start(self.store, self.path, self.settings, regions).await
     }
 }
 
@@ -66,12 +82,20 @@ impl DbReader {
             store,
             path: path.into(),
             settings: ReaderSettings::default(),
+            regions: RegionStores::default(),
         }
     }
 
-    async fn start(os: Arc<dyn ObjectStore>, path: Path, cfg: ReaderSettings) -> Result<Self> {
-        let nodes = Arc::new(Nodes::new(Store::new(os, path), cfg.cache));
-        let follower = Follower::open(nodes.clone(), cfg.warm, cfg.rewarm, None).await?;
+    async fn start(
+        os: Arc<dyn ObjectStore>,
+        path: Path,
+        cfg: ReaderSettings,
+        regions: RegionStores,
+    ) -> Result<Self> {
+        let home = Store::new(os, path);
+        let logs = Arc::new(Logs::new(home.clone(), regions));
+        let nodes = Arc::new(Nodes::new(home, cfg.cache));
+        let follower = Follower::open(nodes.clone(), logs, cfg.warm, cfg.rewarm, None).await?;
         let shared = Arc::new(Shared {
             nodes,
             follower,

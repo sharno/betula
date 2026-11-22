@@ -92,6 +92,8 @@ fn tiny_config() -> Settings {
         },
         // Exercise the compressed path everywhere in tests.
         compression: sidra::Compression::Lz4,
+        log: sidra::LogHome::Home,
+        regions: BTreeMap::new(),
         warm: Warm::Blocking,
         rewarm: Warm::Blocking,
     }
@@ -107,6 +109,7 @@ fn reader_config() -> ReaderSettings {
         discovery_interval: Duration::from_millis(20),
         warm: Warm::Off,
         rewarm: Warm::Off,
+        regions: BTreeMap::new(),
     }
 }
 
@@ -720,4 +723,100 @@ async fn busy_readers_do_not_starve_the_lease() {
     stop.store(true, Ordering::Relaxed);
     futures::future::join_all(readers).await;
     db.status().unwrap();
+}
+
+async fn objects(os: &Arc<dyn ObjectStore>, prefix: &str) -> usize {
+    let prefix = Path::from(format!("{ROOT}/{prefix}"));
+    os.list(Some(&prefix))
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap()
+        .len()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn regional_logs_are_followed_applied_and_collected() {
+    let home: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let eu_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let eu = sidra::Region::new("eu");
+    let clock = ManualClock::new();
+    let local = open(&home, &clock).await;
+    let remote = Db::builder(ROOT, home.clone())
+        .with_settings(Settings {
+            log: sidra::LogHome::Region(eu.clone()),
+            applier: ApplierRole::Never,
+            ..tiny_config()
+        })
+        .with_region(eu.clone(), eu_store.clone(), ROOT)
+        .with_clock(clock.clone())
+        .build()
+        .await
+        .unwrap();
+    clock.tick();
+    remote.put("from-eu", "1").await.unwrap();
+    clock.tick();
+    local.put("from-home", "2").await.unwrap();
+
+    // The remote writer's log is in its own store, not the home one.
+    let wid = remote.writer_id();
+    assert!(objects(&eu_store, &format!("writers/{wid}/wal")).await > 0);
+    assert_eq!(objects(&home, &format!("writers/{wid}/wal")).await, 0);
+
+    // The applier needs the region to pull it.
+    let blind = Db::builder(ROOT, home.clone())
+        .with_settings(Settings {
+            applier: ApplierRole::Never,
+            ..tiny_config()
+        })
+        .with_clock(clock.clone())
+        .build()
+        .await;
+    assert!(
+        matches!(blind, Err(Error::InvalidConfig(_))),
+        "{:?}",
+        blind.err()
+    );
+
+    // The home writer was opened without the region: give the role to one
+    // that has it.
+    local.close().await.unwrap();
+    let applier = Db::builder(ROOT, home.clone())
+        .with_settings(tiny_config())
+        .with_region(eu.clone(), eu_store.clone(), ROOT)
+        .with_clock(clock.clone())
+        .build()
+        .await
+        .unwrap();
+    assert!(applier.claim_applier().await.unwrap() || applier.is_applier());
+    applier.refresh().await.unwrap();
+    assert_eq!(
+        applier.get("from-eu").await.unwrap().as_deref(),
+        Some(&b"1"[..])
+    );
+    applier.checkpoint().await.unwrap();
+
+    let reader = DbReader::builder(ROOT, home.clone())
+        .with_settings(reader_config())
+        .with_region(eu.clone(), eu_store.clone(), ROOT)
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(
+        reader.get("from-eu").await.unwrap().as_deref(),
+        Some(&b"1"[..])
+    );
+    assert_eq!(
+        reader.get("from-home").await.unwrap().as_deref(),
+        Some(&b"2"[..])
+    );
+
+    // GC deletes applied log objects from the regional store too.
+    clock.tick();
+    applier.checkpoint().await.unwrap();
+    clock.advance(Duration::from_secs(120));
+    let stats = applier.run_gc(Duration::from_secs(60)).await.unwrap();
+    assert!(stats.wals > 0, "{stats:?}");
+    assert_eq!(objects(&eu_store, &format!("writers/{wid}/wal")).await, 0);
+    remote.close().await.unwrap();
+    applier.close().await.unwrap();
 }

@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 
 use crate::error::{Error, Result};
 use crate::hlc::WriterId;
+use crate::logs::Logs;
 use crate::manifest::{self, Frontier, Manifest};
 use crate::memtable::Memtable;
 use crate::nodes::{Nodes, Warm};
@@ -104,6 +105,7 @@ pub struct View {
 
 pub struct Follower {
     nodes: Arc<Nodes>,
+    logs: Arc<Logs>,
     rewarm: Warm,
     view: RwLock<View>,
     writers: Mutex<BTreeSet<WriterId>>,
@@ -119,6 +121,7 @@ impl Follower {
     /// for every new manifest (worth it only for processes serving reads).
     pub async fn open(
         nodes: Arc<Nodes>,
+        logs: Arc<Logs>,
         warm: Warm,
         rewarm: Warm,
         own: Option<WriterId>,
@@ -132,6 +135,7 @@ impl Follower {
         nodes.warm(manifest.tree, warm).await?;
         Ok(Self {
             nodes,
+            logs,
             rewarm,
             view: RwLock::new(View {
                 manifest_id,
@@ -143,6 +147,10 @@ impl Follower {
             refreshing: tokio::sync::Mutex::new(()),
             installed: Notify::new(),
         })
+    }
+
+    pub fn logs(&self) -> &Logs {
+        &self.logs
     }
 
     pub fn view(&self) -> View {
@@ -237,7 +245,7 @@ impl Follower {
         let fresh = futures::future::try_join_all(
             starts
                 .into_iter()
-                .map(|(w, from)| read_log_from(store, w, from)),
+                .map(|(w, from)| read_log_from(&self.logs, w, from)),
         )
         .await?;
 
@@ -286,10 +294,11 @@ async fn probe_manifests(
 
 /// Consecutive log entries of `writer` from `from`, stopping at the first gap.
 async fn read_log_from(
-    store: &crate::store::Store,
+    logs: &Logs,
     writer: WriterId,
     from: u64,
 ) -> Result<Vec<(u64, Arc<WalBatch>)>> {
+    let store = logs.of(writer).await?;
     let mut out = Vec::new();
     let mut seq = from;
     while let Some(batch) = wal::read(store, writer, seq).await? {

@@ -10,9 +10,11 @@
 use std::time::Duration;
 
 use crate::error::Result;
+use crate::logs::Logs;
 use crate::manifest;
 use crate::manifest::Frontier;
 use crate::store::{Pace, Store};
+use object_store::path::Path;
 
 use crate::wal;
 
@@ -59,7 +61,8 @@ pub enum Speed {
     Spread { over: Duration, max_per_sec: u32 },
 }
 
-pub async fn run(store: &Store, now_ms: u64, retention: Duration, speed: Speed) -> Result<GcStats> {
+pub async fn run(logs: &Logs, now_ms: u64, retention: Duration, speed: Speed) -> Result<GcStats> {
+    let store = logs.home();
     let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
     let ids = store.list_manifests().await?;
     let mut stats = GcStats::default();
@@ -78,35 +81,41 @@ pub async fn run(store: &Store, now_ms: u64, retention: Duration, speed: Speed) 
         manifests.push(store.manifest_path(prev));
         applied = m.frontier;
     }
-    let wals: Vec<_> =
+    // Log objects may live in regional stores, so deletes go per store.
+    let wals: Vec<(&Store, Vec<Path>)> =
         futures::future::try_join_all(applied.into_iter().map(|(writer, upto)| async move {
-            Ok::<_, crate::error::Error>(
-                store
-                    .list_wals(writer)
-                    .await?
-                    .into_iter()
-                    .filter(move |seq| *seq <= upto)
-                    .map(move |seq| store.wal_path(writer, seq)),
-            )
+            let at = logs.of(writer).await?;
+            let paths = at
+                .list_wals(writer)
+                .await?
+                .into_iter()
+                .filter(|seq| *seq <= upto)
+                .map(|seq| at.wal_path(writer, seq))
+                .collect();
+            Ok::<_, crate::error::Error>((at, paths))
         }))
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
+        .await?;
     stats.segments = segments.len();
-    stats.wals = wals.len();
+    stats.wals = wals.iter().map(|(_, p)| p.len()).sum();
     stats.manifests = manifests.len();
     // Manifests go last, so a crash mid-way leaves them to retry the run.
-    let all: Vec<_> = segments.into_iter().chain(wals).chain(manifests).collect();
+    let groups: Vec<(&Store, Vec<Path>)> = [(store, segments)]
+        .into_iter()
+        .chain(wals)
+        .chain([(store, manifests)])
+        .collect();
+    let total: usize = groups.iter().map(|(_, p)| p.len()).sum();
     let pace = match speed {
         Speed::Full => Pace::Unlimited,
         Speed::Spread { over, max_per_sec } => {
-            let needed = (all.len() as f64 / over.as_secs_f64().max(1.0)).ceil() as u32;
+            let needed = (total as f64 / over.as_secs_f64().max(1.0)).ceil() as u32;
             Pace::PerSecond(needed.clamp(1, max_per_sec.max(1)))
         }
     };
-    store.delete_paced(all, pace).await?;
-    stats.writers = forget_writers(store, now_ms, retention_ms).await?;
+    for (at, paths) in groups {
+        at.delete_paced(paths, pace).await?;
+    }
+    stats.writers = forget_writers(logs, now_ms, retention_ms).await?;
     Ok(stats)
 }
 
@@ -114,13 +123,16 @@ pub async fn run(store: &Store, now_ms: u64, retention: Duration, speed: Speed) 
 /// and have no log objects left. Such a writer stopped writing long ago (an
 /// expired writer never writes again), so nothing can need its lease; once
 /// it's gone the applier also drops the writer from the manifest.
-async fn forget_writers(store: &Store, now_ms: u64, retention_ms: u64) -> Result<usize> {
+async fn forget_writers(logs: &Logs, now_ms: u64, retention_ms: u64) -> Result<usize> {
+    let store = logs.home();
     let writers = store.list_writers().await?;
     let gone: Vec<_> = futures::future::try_join_all(writers.into_iter().map(|w| async move {
-        let lease = wal::read_lease(store, w).await?;
-        let expired_long_ago =
-            lease.is_some_and(|l| now_ms.saturating_sub(l.expires_at_ms) > retention_ms);
-        let forget = expired_long_ago && store.list_wals(w).await?.is_empty();
+        let forget = match wal::read_lease(store, w).await? {
+            Some(l) if now_ms.saturating_sub(l.expires_at_ms) > retention_ms => {
+                logs.at(&l.log)?.list_wals(w).await?.is_empty()
+            }
+            _ => false,
+        };
         Ok::<_, crate::error::Error>(forget.then(|| store.lease_path(w)))
     }))
     .await?

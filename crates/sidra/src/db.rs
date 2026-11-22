@@ -34,6 +34,7 @@ use crate::follow::{Follower, Scope};
 use crate::gc::{self, GcConfig, GcStats};
 use crate::hlc::{Hlc, Ts, WriterId};
 use crate::location;
+use crate::logs::{Logs, Region, RegionStores};
 use crate::manifest::{self, Manifest, Publish};
 use crate::nodes::{CacheStats, Nodes};
 use crate::retry::retry;
@@ -181,6 +182,8 @@ struct Applier {
 struct Shared {
     nodes: Arc<Nodes>,
     follower: Follower,
+    /// Where this writer's log goes (`cfg.log`, resolved).
+    own_log: Store,
     cfg: Settings,
     clock: Arc<dyn Clock>,
     writer: WriterId,
@@ -240,6 +243,7 @@ impl Shared {
     async fn write_lease(&self, expires_at_ms: u64) -> Result<()> {
         let lease = Lease {
             writer: self.writer,
+            log: self.cfg.log.clone(),
             floor_hlc: self.floor_hlc(),
             expires_at_ms,
         };
@@ -383,9 +387,11 @@ impl Shared {
         let leases =
             futures::future::try_join_all(writers.iter().map(|w| wal::read_lease(store, *w)))
                 .await?;
+        let logs = self.follower.logs();
         let floor = leases
             .into_iter()
             .flatten()
+            .inspect(|l| logs.learn(l))
             .filter(|l| l.expires_at_ms > now)
             .map(|l| l.floor_hlc)
             .chain([self.floor_hlc()])
@@ -532,6 +538,7 @@ pub struct DbBuilder {
     store: Arc<dyn ObjectStore>,
     path: Path,
     settings: Settings,
+    regions: RegionStores,
     clock: Arc<dyn Clock>,
 }
 
@@ -547,8 +554,22 @@ impl DbBuilder {
         self
     }
 
+    /// Adds a store holding writers' logs, overriding a URL for the same
+    /// region in settings. See [`Settings::regions`].
+    pub fn with_region(
+        mut self,
+        region: Region,
+        store: Arc<dyn ObjectStore>,
+        path: impl Into<Path>,
+    ) -> Self {
+        self.regions.insert(region, store, path.into());
+        self
+    }
+
     pub async fn build(self) -> Result<Db> {
-        Db::start(self.store, self.path, self.settings, self.clock).await
+        let mut regions = RegionStores::from_urls(&self.settings.regions)?;
+        regions.extend(self.regions);
+        Db::start(self.store, self.path, self.settings, regions, self.clock).await
     }
 }
 
@@ -571,6 +592,7 @@ impl Db {
             store,
             path: path.into(),
             settings: Settings::default(),
+            regions: RegionStores::default(),
             clock: Arc::new(SystemClock),
         }
     }
@@ -579,15 +601,21 @@ impl Db {
         os: Arc<dyn ObjectStore>,
         path: Path,
         cfg: Settings,
+        regions: RegionStores,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
-        let nodes = Arc::new(Nodes::new(Store::new(os, path), cfg.cache));
+        let home = Store::new(os, path);
+        let logs = Arc::new(Logs::new(home.clone(), regions));
+        let own_log = logs.at(&cfg.log)?.clone();
+        let nodes = Arc::new(Nodes::new(home, cfg.cache));
         let writer = random_writer_id(clock.now_ms());
-        let follower = Follower::open(nodes.clone(), cfg.warm, cfg.rewarm, Some(writer)).await?;
+        let follower =
+            Follower::open(nodes.clone(), logs, cfg.warm, cfg.rewarm, Some(writer)).await?;
         let (shutdown, shutdown_rx) = watch::channel(false);
         let shared = Arc::new(Shared {
             nodes,
             follower,
+            own_log,
             writer,
             hlc: Hlc::default(),
             inflight: Mutex::new(BTreeMap::new()),
@@ -782,7 +810,7 @@ impl Db {
 
     pub async fn run_gc(&self, retention: Duration) -> Result<GcStats> {
         gc::run(
-            self.shared.store(),
+            self.shared.follower.logs(),
             self.shared.now(),
             retention,
             gc::Speed::Full,
@@ -1008,7 +1036,7 @@ impl WalTask {
         let seq = self.next_seq;
         let compression = shared.cfg.compression;
         match retry("wal write", || {
-            wal::write(shared.store(), seq, &batch, compression)
+            wal::write(&shared.own_log, seq, &batch, compression)
         })
         .await
         {
@@ -1106,7 +1134,7 @@ async fn gc_loop(shared: Arc<Shared>, cfg: GcConfig, mut shutdown: watch::Receiv
             over: cfg.interval,
             max_per_sec: cfg.max_deletes_per_sec,
         };
-        match gc::run(shared.store(), shared.now(), cfg.retention, speed).await {
+        match gc::run(shared.follower.logs(), shared.now(), cfg.retention, speed).await {
             Ok(stats) => tracing::debug!(?stats, "gc"),
             Err(e) => tracing::warn!(%e, "gc failed"),
         }

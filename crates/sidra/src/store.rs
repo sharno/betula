@@ -79,6 +79,15 @@ impl Store {
         }
     }
 
+    /// Another store whose requests count toward this handle's stats.
+    pub fn sibling(&self, os: Arc<dyn ObjectStore>, root: impl Into<Path>) -> Self {
+        Self {
+            os,
+            root: root.into(),
+            counters: self.counters.clone(),
+        }
+    }
+
     pub fn requests(&self) -> RequestStats {
         let c = &self.counters;
         let l = |a: &AtomicU64| a.load(Ordering::Relaxed);

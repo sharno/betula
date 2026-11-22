@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 // 2: timestamped versions, per-writer logs. 3: append-only runs, manifest
-// records the applier. 4: codec byte.
-const VERSION: u8 = 4;
+// records the applier. 4: codec byte. 5: leases record log placement.
+const VERSION: u8 = 5;
 const HEADER: usize = 6;
 
 #[derive(Copy, Clone, Debug)]
