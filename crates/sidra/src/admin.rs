@@ -15,7 +15,7 @@ use crate::hlc::WriterId;
 use crate::location;
 use crate::manifest;
 use crate::nodes::{CacheConfig, Nodes};
-use crate::store::{Pace, Store};
+use crate::store::Store;
 use crate::tree::{self, TreeShape};
 use crate::types::{Epoch, ManifestId, TreeRoot};
 use crate::wal;
@@ -129,7 +129,7 @@ impl Admin {
             self.store(),
             self.clock.now_ms(),
             retention,
-            Pace::Unlimited,
+            gc::Speed::Full,
         )
         .await
     }

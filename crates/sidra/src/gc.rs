@@ -13,6 +13,7 @@ use crate::error::Result;
 use crate::manifest;
 use crate::manifest::Frontier;
 use crate::store::{Pace, Store};
+
 use crate::wal;
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -24,9 +25,9 @@ pub struct GcConfig {
     /// deleted. Must exceed the longest snapshot or reader refresh interval.
     #[serde(with = "humantime_serde")]
     pub retention: Duration,
-    /// Deletes per second. GC spreads its deletes out so they don't stall
-    /// writers on the store; it must exceed the garbage rate (about one
-    /// object per log flush plus a few per checkpoint).
+    /// Ceiling on deletes per second. Each run spreads its deletes evenly
+    /// over the interval, so the rate adapts to the garbage produced; bursts
+    /// of deletes otherwise compete with writers' log PUTs and stall them.
     pub max_deletes_per_sec: u32,
 }
 
@@ -48,11 +49,23 @@ pub struct GcStats {
     pub writers: usize,
 }
 
-pub async fn run(store: &Store, now_ms: u64, retention: Duration, pace: Pace) -> Result<GcStats> {
+/// How fast a GC run deletes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Speed {
+    /// As fast as the store allows (explicit runs).
+    Full,
+    /// Spread evenly over `over`, so deletes trickle instead of bursting,
+    /// but never faster than `max_per_sec`.
+    Spread { over: Duration, max_per_sec: u32 },
+}
+
+pub async fn run(store: &Store, now_ms: u64, retention: Duration, speed: Speed) -> Result<GcStats> {
     let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
     let ids = store.list_manifests().await?;
     let mut stats = GcStats::default();
     let mut applied = Frontier::new();
+    let mut segments = Vec::new();
+    let mut manifests = Vec::new();
     for pair in ids.windows(2) {
         let (prev, cur) = (pair[0], pair[1]);
         let Some(m) = manifest::load(store, cur).await? else {
@@ -61,29 +74,38 @@ pub async fn run(store: &Store, now_ms: u64, retention: Duration, pace: Pace) ->
         if now_ms.saturating_sub(m.created_at_ms) < retention_ms {
             break;
         }
-        store
-            .delete_paced(
-                m.dead.iter().map(|id| store.segment_path(*id)).collect(),
-                pace,
-            )
-            .await?;
-        stats.segments += m.dead.len();
-        // Delete the manifest last so a crash mid-way is retried next run.
-        store.delete_all(vec![store.manifest_path(prev)]).await?;
-        stats.manifests += 1;
+        segments.extend(m.dead.iter().map(|id| store.segment_path(*id)));
+        manifests.push(store.manifest_path(prev));
         applied = m.frontier;
     }
-    for (writer, upto) in applied {
-        let paths: Vec<_> = store
-            .list_wals(writer)
-            .await?
-            .into_iter()
-            .filter(|seq| *seq <= upto)
-            .map(|seq| store.wal_path(writer, seq))
-            .collect();
-        stats.wals += paths.len();
-        store.delete_paced(paths, pace).await?;
-    }
+    let wals: Vec<_> =
+        futures::future::try_join_all(applied.into_iter().map(|(writer, upto)| async move {
+            Ok::<_, crate::error::Error>(
+                store
+                    .list_wals(writer)
+                    .await?
+                    .into_iter()
+                    .filter(move |seq| *seq <= upto)
+                    .map(move |seq| store.wal_path(writer, seq)),
+            )
+        }))
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
+    stats.segments = segments.len();
+    stats.wals = wals.len();
+    stats.manifests = manifests.len();
+    // Manifests go last, so a crash mid-way leaves them to retry the run.
+    let all: Vec<_> = segments.into_iter().chain(wals).chain(manifests).collect();
+    let pace = match speed {
+        Speed::Full => Pace::Unlimited,
+        Speed::Spread { over, max_per_sec } => {
+            let needed = (all.len() as f64 / over.as_secs_f64().max(1.0)).ceil() as u32;
+            Pace::PerSecond(needed.clamp(1, max_per_sec.max(1)))
+        }
+    };
+    store.delete_paced(all, pace).await?;
     stats.writers = forget_writers(store, now_ms, retention_ms).await?;
     Ok(stats)
 }

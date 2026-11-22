@@ -40,7 +40,7 @@ use crate::retry::retry;
 use crate::segments::{self, SegmentKind, SegmentTable};
 use crate::settings::{ApplierRole, Follow, Gc, Settings};
 use crate::snapshot::DbIterator;
-use crate::store::{Pace, RequestStats, Store};
+use crate::store::{RequestStats, Store};
 use crate::tree::{self, TreeShape};
 use crate::types::{Epoch, KeyRange, ManifestId, Msg, SegmentId, TreeRoot, Version, entry_bytes};
 use crate::wal::{self, Lease, WalBatch, WalWrite};
@@ -785,7 +785,7 @@ impl Db {
             self.shared.store(),
             self.shared.now(),
             retention,
-            Pace::Unlimited,
+            gc::Speed::Full,
         )
         .await
     }
@@ -1102,8 +1102,11 @@ async fn gc_loop(shared: Arc<Shared>, cfg: GcConfig, mut shutdown: watch::Receiv
         if !shared.is_applier.load(Ordering::Acquire) {
             continue;
         }
-        let pace = Pace::PerSecond(cfg.max_deletes_per_sec);
-        match gc::run(shared.store(), shared.now(), cfg.retention, pace).await {
+        let speed = gc::Speed::Spread {
+            over: cfg.interval,
+            max_per_sec: cfg.max_deletes_per_sec,
+        };
+        match gc::run(shared.store(), shared.now(), cfg.retention, speed).await {
             Ok(stats) => tracing::debug!(?stats, "gc"),
             Err(e) => tracing::warn!(%e, "gc failed"),
         }
