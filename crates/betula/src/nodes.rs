@@ -28,7 +28,8 @@ const LEAF_ESTIMATE: u64 = 128 << 10;
 const ITEMS_PER_SHARD: u64 = 192;
 
 /// How to load a tree version's internal nodes and buffered runs.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Warm {
     /// Load on first use.
     Off,
@@ -42,7 +43,8 @@ pub enum Warm {
     Blocking,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CacheConfig {
     pub inner_bytes: u64,
     pub leaf_bytes: u64,

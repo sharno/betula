@@ -13,6 +13,8 @@ async-trait = "0.1"
 bytes = { version = "1.12", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 crc32fast = "1.5"
+figment = { version = "0.10", features = ["toml", "env"] }
+humantime-serde = "1.1"
 futures = "0.3"
 hdrhistogram = "7.5"
 imbl = "7"
@@ -27,6 +29,7 @@ thiserror = "2"
 tokio = { version = "1.47", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
 
 [profile.release]
 debug = 1

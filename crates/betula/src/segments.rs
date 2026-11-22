@@ -21,7 +21,8 @@ pub struct SegmentUsage {
 
 pub type SegmentTable = BTreeMap<SegmentId, SegmentUsage>;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CleanerConfig {
     /// Clean segments whose live fraction is below this.
     pub clean_below_live: f64,

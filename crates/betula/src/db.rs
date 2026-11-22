@@ -33,15 +33,18 @@ use crate::error::{Error, Result};
 use crate::follow::Follower;
 use crate::gc::{self, GcConfig, GcStats};
 use crate::hlc::{Hlc, Ts, WriterId};
+use crate::location;
 use crate::manifest::{self, Manifest, Publish};
-use crate::nodes::{CacheConfig, Nodes, Warm};
+use crate::nodes::Nodes;
 use crate::retry::retry;
-use crate::segments::{self, CleanerConfig, SegmentTable};
+use crate::segments::{self, SegmentTable};
+use crate::settings::{ApplierRole, Gc, Settings};
 use crate::snapshot::DbIterator;
 use crate::store::Store;
-use crate::tree::{self, TreeConfig, TreeShape};
+use crate::tree::{self, TreeShape};
 use crate::types::{Epoch, KeyRange, ManifestId, Msg, SegmentId, TreeRoot, Version, entry_bytes};
 use crate::wal::{self, Lease, WalBatch, WalWrite};
+use std::ops::RangeBounds;
 
 const CMD_QUEUE: usize = 1024;
 
@@ -61,90 +64,6 @@ impl Clock for SystemClock {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum ApplierRole {
-    /// Take the role when the database has no applier, or when entries have
-    /// sat unapplied longer than `steal_after`.
-    Auto { steal_after: Duration },
-    /// Only write; leave applying to other processes.
-    Never,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct LeaseConfig {
-    pub interval: Duration,
-    /// Must comfortably exceed `interval` plus clock skew between processes.
-    pub ttl: Duration,
-}
-
-impl Default for LeaseConfig {
-    fn default() -> Self {
-        Self {
-            interval: Duration::from_secs(2),
-            ttl: Duration::from_secs(20),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct DbConfig {
-    pub tree: TreeConfig,
-    pub cache: CacheConfig,
-    pub wal_flush_interval: Duration,
-    /// Flush the log early once this many bytes are pending.
-    pub wal_max_bytes: usize,
-    /// The applier checkpoints once unapplied entries reach this size...
-    pub checkpoint_bytes: usize,
-    /// ...or once the oldest has waited this long.
-    pub checkpoint_interval: Duration,
-    /// Writers stall while unapplied entries exceed this.
-    pub max_unapplied_bytes: usize,
-    /// How often to poll for other writers' entries and new manifests while
-    /// they are arriving.
-    pub poll_interval: Duration,
-    /// Polling backs off exponentially up to this while nothing new arrives,
-    /// so an idle database costs few requests. Visibility of the first write
-    /// after a quiet period is delayed by up to this.
-    pub max_poll_interval: Duration,
-    /// How often to LIST for new writers.
-    pub discovery_interval: Duration,
-    pub lease: LeaseConfig,
-    pub applier: ApplierRole,
-    pub gc: Option<GcConfig>,
-    pub cleaner: CleanerConfig,
-    /// Loading internal nodes and buffered runs on open.
-    pub warm: Warm,
-    /// Loading of each new manifest's changed internal nodes and runs as
-    /// soon as it is seen. Every writer doing this costs GETs proportional to
-    /// writers × checkpoint size, so writers default to loading on first use.
-    pub rewarm: Warm,
-}
-
-impl Default for DbConfig {
-    fn default() -> Self {
-        Self {
-            tree: TreeConfig::default(),
-            cache: CacheConfig::default(),
-            wal_flush_interval: Duration::from_millis(50),
-            wal_max_bytes: 4 << 20,
-            checkpoint_bytes: 32 << 20,
-            checkpoint_interval: Duration::from_secs(2),
-            max_unapplied_bytes: 512 << 20,
-            poll_interval: Duration::from_millis(200),
-            max_poll_interval: Duration::from_secs(2),
-            discovery_interval: Duration::from_secs(2),
-            lease: LeaseConfig::default(),
-            applier: ApplierRole::Auto {
-                steal_after: Duration::from_secs(10),
-            },
-            gc: Some(GcConfig::default()),
-            cleaner: CleanerConfig::default(),
-            warm: Warm::Blocking,
-            rewarm: Warm::Off,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Durability {
     /// Return once the batch is in a durable log object (and visible here).
@@ -153,6 +72,29 @@ pub enum Durability {
     /// Return once the batch is queued. It becomes durable and visible with
     /// the next log flush.
     Queued,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WriteOptions {
+    pub durability: Durability,
+}
+
+/// How current a read must be.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Freshness {
+    /// What this process has seen: its own writes immediately, other
+    /// writers' within a poll interval.
+    #[default]
+    Local,
+    /// First pull every writer's durable entries and the newest manifest
+    /// (a few GETs), so the read sees every write acknowledged before it
+    /// started.
+    Latest,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadOptions {
+    pub freshness: Freshness,
 }
 
 /// Ops applied atomically at one timestamp. A later op on the same key in the
@@ -167,14 +109,32 @@ impl WriteBatch {
         Self::default()
     }
 
-    pub fn put(mut self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Self {
-        self.ops.push((key.into(), Msg::Put(value.into())));
+    /// Copies the key and value.
+    pub fn put(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> &mut Self {
+        self.put_bytes(
+            Bytes::copy_from_slice(key.as_ref()),
+            Bytes::copy_from_slice(value.as_ref()),
+        )
+    }
+
+    /// Takes owned buffers without copying.
+    pub fn put_bytes(&mut self, key: Bytes, value: Bytes) -> &mut Self {
+        self.ops.push((key, Msg::Put(value)));
         self
     }
 
-    pub fn delete(mut self, key: impl Into<Bytes>) -> Self {
-        self.ops.push((key.into(), Msg::Delete));
+    pub fn delete(&mut self, key: impl AsRef<[u8]>) -> &mut Self {
+        self.ops
+            .push((Bytes::copy_from_slice(key.as_ref()), Msg::Delete));
         self
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
     }
 }
 
@@ -199,7 +159,7 @@ struct Applier {
 struct Shared {
     nodes: Arc<Nodes>,
     follower: Follower,
-    cfg: DbConfig,
+    cfg: Settings,
     clock: Arc<dyn Clock>,
     writer: WriterId,
     hlc: Hlc,
@@ -329,8 +289,8 @@ impl Shared {
 
     fn should_checkpoint(&self) -> bool {
         let view = self.follower.view();
-        let interval = self.cfg.checkpoint_interval.as_millis() as u64;
-        view.tails.mem().bytes() >= self.cfg.checkpoint_bytes
+        let interval = self.cfg.checkpoint.interval.as_millis() as u64;
+        view.tails.mem().bytes() >= self.cfg.checkpoint.bytes
             || view
                 .tails
                 .since_ms
@@ -468,19 +428,58 @@ fn random_writer_id(now_ms: u64) -> WriterId {
     WriterId(seed.hash_one((now_ms, std::process::id())))
 }
 
-impl Db {
-    pub async fn open(
-        os: Arc<dyn ObjectStore>,
-        path: impl Into<Path>,
-        cfg: DbConfig,
-    ) -> Result<Self> {
-        Self::open_with_clock(os, path, cfg, Arc::new(SystemClock)).await
+/// Configures and opens a writer. See [`Db::builder`].
+pub struct DbBuilder {
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    settings: Settings,
+    clock: Arc<dyn Clock>,
+}
+
+impl DbBuilder {
+    pub fn with_settings(mut self, settings: Settings) -> Self {
+        self.settings = settings;
+        self
     }
 
-    pub async fn open_with_clock(
+    /// Replaces the wall clock (for tests and simulations).
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub async fn build(self) -> Result<Db> {
+        Db::start(self.store, self.path, self.settings, self.clock).await
+    }
+}
+
+impl Db {
+    /// Opens a writer at a URL such as `s3://bucket/path`, `gs://`, `az://`,
+    /// `file:///tmp/db` or `memory:///`. Credentials and endpoints come from
+    /// the usual environment variables (`AWS_*`, `GOOGLE_*`, `AZURE_*`);
+    /// settings from [`Settings::load`].
+    pub async fn open(url: &str) -> Result<Self> {
+        let (store, path) = location::parse(url)?;
+        Self::builder(path, store)
+            .with_settings(Settings::load()?)
+            .build()
+            .await
+    }
+
+    /// A writer on `store` under `path`, with default settings until changed.
+    pub fn builder(path: impl Into<Path>, store: Arc<dyn ObjectStore>) -> DbBuilder {
+        DbBuilder {
+            store,
+            path: path.into(),
+            settings: Settings::default(),
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    async fn start(
         os: Arc<dyn ObjectStore>,
-        path: impl Into<Path>,
-        cfg: DbConfig,
+        path: Path,
+        cfg: Settings,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
         let nodes = Arc::new(Nodes::new(Store::new(os, path), cfg.cache));
@@ -521,7 +520,7 @@ impl Db {
             tokio::spawn(follow_loop(shared.clone(), shutdown_rx.clone())),
             tokio::spawn(applier_loop(shared.clone(), shutdown_rx.clone())),
         ];
-        if let Some(gc_cfg) = shared.cfg.gc {
+        if let Gc::On(gc_cfg) = shared.cfg.gc {
             tasks.push(tokio::spawn(gc_loop(shared.clone(), gc_cfg, shutdown_rx)));
         }
         Ok(Self {
@@ -535,17 +534,33 @@ impl Db {
         self.shared.writer
     }
 
-    pub async fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Result<()> {
-        self.write(WriteBatch::new().put(key, value), Durability::AwaitDurable)
-            .await
+    /// Writes one key, copying it and the value; returns once durable.
+    pub async fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.put(key, value);
+        self.write(batch).await
     }
 
-    pub async fn delete(&self, key: impl Into<Bytes>) -> Result<()> {
-        self.write(WriteBatch::new().delete(key), Durability::AwaitDurable)
-            .await
+    /// Writes one key without copying; returns once durable.
+    pub async fn put_bytes(&self, key: Bytes, value: Bytes) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.put_bytes(key, value);
+        self.write(batch).await
     }
 
-    pub async fn write(&self, batch: WriteBatch, durability: Durability) -> Result<()> {
+    pub async fn delete(&self, key: impl AsRef<[u8]>) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.delete(key);
+        self.write(batch).await
+    }
+
+    /// Writes the batch atomically; returns once durable.
+    pub async fn write(&self, batch: WriteBatch) -> Result<()> {
+        self.write_with(batch, WriteOptions::default()).await
+    }
+
+    pub async fn write_with(&self, batch: WriteBatch, opts: WriteOptions) -> Result<()> {
+        let durability = opts.durability;
         self.shared.check()?;
         if batch.ops.is_empty() {
             return Ok(());
@@ -578,12 +593,23 @@ impl Db {
         }
     }
 
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>> {
+        self.get_with(key, ReadOptions::default()).await
+    }
+
+    pub async fn get_with(
+        &self,
+        key: impl AsRef<[u8]>,
+        opts: ReadOptions,
+    ) -> Result<Option<Bytes>> {
+        if opts.freshness == Freshness::Latest {
+            self.refresh().await?;
+        }
         let version = self
             .shared
             .follower
             .snapshot()
-            .get(&self.shared.nodes, key)
+            .get(&self.shared.nodes, key.as_ref())
             .await?;
         // Later writes from this process must order after what it has seen.
         if let Some(v) = &version {
@@ -592,11 +618,30 @@ impl Db {
         Ok(version.and_then(|v| v.value().cloned()))
     }
 
-    pub fn scan(&self, range: impl Into<KeyRange>) -> DbIterator {
+    /// Live pairs in `range`, in key order, from a consistent snapshot.
+    /// Accepts any range of byte-like keys: `"a".."m"`, `key..`, `..=key`.
+    pub fn scan<K: AsRef<[u8]>>(&self, range: impl RangeBounds<K>) -> DbIterator {
         self.shared
             .follower
             .snapshot()
-            .scan(self.shared.nodes.clone(), range.into())
+            .scan(self.shared.nodes.clone(), KeyRange::from_bounds(range))
+    }
+
+    pub async fn scan_with<K: AsRef<[u8]>>(
+        &self,
+        range: impl RangeBounds<K>,
+        opts: ReadOptions,
+    ) -> Result<DbIterator> {
+        if opts.freshness == Freshness::Latest {
+            self.refresh().await?;
+        }
+        Ok(self.scan(range))
+    }
+
+    /// `Ok` while this writer can write; otherwise the error that stopped it
+    /// (for example a lost lease). Background failures surface here.
+    pub fn status(&self) -> Result<()> {
+        self.shared.check()
     }
 
     /// Pulls other writers' entries and the latest manifest now.
@@ -696,6 +741,13 @@ impl Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
+        if self.cmd.is_some() {
+            tracing::warn!(
+                writer = %self.shared.writer,
+                "Db dropped without close(): queued (not yet durable) writes may be lost; \
+                 durable ones are applied later by whoever holds the applier role"
+            );
+        }
         self.shared.shutdown.send_replace(true);
     }
 }
@@ -742,7 +794,7 @@ struct WalTask {
 
 impl WalTask {
     async fn run(mut self, mut rx: mpsc::Receiver<WalCmd>) {
-        let mut tick = tokio::time::interval(self.shared.cfg.wal_flush_interval);
+        let mut tick = tokio::time::interval(self.shared.cfg.wal.flush_interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -752,7 +804,7 @@ impl WalTask {
                         self.ops.extend(ops);
                         self.stamps.push(hlc);
                         self.waiters.extend(done);
-                        if self.bytes >= self.shared.cfg.wal_max_bytes {
+                        if self.bytes >= self.shared.cfg.wal.max_bytes {
                             let _ = self.flush().await;
                         }
                     }
@@ -806,7 +858,7 @@ impl WalTask {
         loop {
             let installed = shared.follower.installed.notified();
             shared.check()?;
-            if shared.follower.tails_bytes() < shared.cfg.max_unapplied_bytes {
+            if shared.follower.tails_bytes() < shared.cfg.checkpoint.max_unapplied_bytes {
                 break;
             }
             installed.await;
@@ -853,16 +905,16 @@ async fn lease_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
 
 async fn follow_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     let mut last_discovery = Instant::now();
-    let mut period = shared.cfg.poll_interval;
+    let mut period = shared.cfg.poll.interval;
     while every(period, &mut shutdown).await {
-        let discover = last_discovery.elapsed() >= shared.cfg.discovery_interval;
+        let discover = last_discovery.elapsed() >= shared.cfg.poll.discovery_interval;
         if discover {
             last_discovery = Instant::now();
         }
         match shared.follower.refresh(discover, shared.now()).await {
             // Poll fast while things arrive, back off while quiet.
-            Ok(true) => period = shared.cfg.poll_interval,
-            Ok(false) => period = (period * 2).min(shared.cfg.max_poll_interval),
+            Ok(true) => period = shared.cfg.poll.interval,
+            Ok(false) => period = (period * 2).min(shared.cfg.poll.max_interval),
             Err(e) => {
                 tracing::warn!(%e, "refresh failed");
                 continue;
@@ -879,7 +931,7 @@ async fn applier_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) 
     loop {
         tokio::select! {
             _ = shared.wake_applier.notified() => {}
-            _ = tokio::time::sleep(shared.cfg.poll_interval) => {}
+            _ = tokio::time::sleep(shared.cfg.poll.interval) => {}
             _ = shutdown.changed() => return,
         }
         if *shutdown.borrow() {

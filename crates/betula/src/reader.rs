@@ -2,51 +2,47 @@
 //! log tail, refreshed periodically. Must refresh more often than the GC
 //! retention, or segments of its tree version may be deleted under it.
 
+use std::ops::RangeBounds;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use tokio::task::JoinHandle;
 
-use crate::db::{Clock, SystemClock};
+use crate::db::{Clock, Freshness, ReadOptions, SystemClock};
 use crate::error::Result;
 use crate::follow::Follower;
-use crate::nodes::{CacheConfig, Nodes, Warm};
+use crate::location;
+use crate::nodes::Nodes;
+use crate::settings::ReaderSettings;
 use crate::snapshot::DbIterator;
 use crate::store::Store;
 use crate::types::{KeyRange, ManifestId};
-
-#[derive(Clone, Debug)]
-pub struct ReaderConfig {
-    pub cache: CacheConfig,
-    /// Background refresh period; `None` means refresh only on demand.
-    pub refresh_interval: Option<Duration>,
-    /// How often background refreshes also LIST for new writers.
-    pub discovery_interval: Duration,
-    /// Loading internal nodes and buffered runs on open.
-    pub warm: Warm,
-    /// Loading of each new manifest's internal nodes as soon as it is seen.
-    pub rewarm: Warm,
-}
-
-impl Default for ReaderConfig {
-    fn default() -> Self {
-        Self {
-            cache: CacheConfig::default(),
-            refresh_interval: Some(Duration::from_millis(500)),
-            discovery_interval: Duration::from_secs(2),
-            warm: Warm::Blocking,
-            rewarm: Warm::Background,
-        }
-    }
-}
 
 struct Shared {
     nodes: Arc<Nodes>,
     follower: Follower,
     clock: Arc<dyn Clock>,
+}
+
+/// Configures and opens a reader. See [`DbReader::builder`].
+pub struct DbReaderBuilder {
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    settings: ReaderSettings,
+}
+
+impl DbReaderBuilder {
+    pub fn with_settings(mut self, settings: ReaderSettings) -> Self {
+        self.settings = settings;
+        self
+    }
+
+    pub async fn build(self) -> Result<DbReader> {
+        DbReader::start(self.store, self.path, self.settings).await
+    }
 }
 
 pub struct DbReader {
@@ -55,11 +51,25 @@ pub struct DbReader {
 }
 
 impl DbReader {
-    pub async fn open(
-        os: Arc<dyn ObjectStore>,
-        path: impl Into<Path>,
-        cfg: ReaderConfig,
-    ) -> Result<Self> {
+    /// Opens a reader at a URL (see [`crate::Db::open`]), with settings from
+    /// [`ReaderSettings::load`].
+    pub async fn open(url: &str) -> Result<Self> {
+        let (store, path) = location::parse(url)?;
+        Self::builder(path, store)
+            .with_settings(ReaderSettings::load()?)
+            .build()
+            .await
+    }
+
+    pub fn builder(path: impl Into<Path>, store: Arc<dyn ObjectStore>) -> DbReaderBuilder {
+        DbReaderBuilder {
+            store,
+            path: path.into(),
+            settings: ReaderSettings::default(),
+        }
+    }
+
+    async fn start(os: Arc<dyn ObjectStore>, path: Path, cfg: ReaderSettings) -> Result<Self> {
         let nodes = Arc::new(Nodes::new(Store::new(os, path), cfg.cache));
         let follower = Follower::open(nodes.clone(), cfg.warm, cfg.rewarm, None).await?;
         let shared = Arc::new(Shared {
@@ -91,6 +101,7 @@ impl DbReader {
         Ok(Self { shared, task })
     }
 
+    /// Pulls every writer's durable entries and the newest manifest now.
     pub async fn refresh(&self) -> Result<()> {
         self.shared
             .follower
@@ -103,21 +114,44 @@ impl DbReader {
         self.shared.follower.view().manifest_id
     }
 
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>> {
+        self.get_with(key, ReadOptions::default()).await
+    }
+
+    pub async fn get_with(
+        &self,
+        key: impl AsRef<[u8]>,
+        opts: ReadOptions,
+    ) -> Result<Option<Bytes>> {
+        if opts.freshness == Freshness::Latest {
+            self.refresh().await?;
+        }
         let version = self
             .shared
             .follower
             .snapshot()
-            .get(&self.shared.nodes, key)
+            .get(&self.shared.nodes, key.as_ref())
             .await?;
         Ok(version.and_then(|v| v.value().cloned()))
     }
 
-    pub fn scan(&self, range: impl Into<KeyRange>) -> DbIterator {
+    /// Live pairs in `range`, in key order, from a consistent snapshot.
+    pub fn scan<K: AsRef<[u8]>>(&self, range: impl RangeBounds<K>) -> DbIterator {
         self.shared
             .follower
             .snapshot()
-            .scan(self.shared.nodes.clone(), range.into())
+            .scan(self.shared.nodes.clone(), KeyRange::from_bounds(range))
+    }
+
+    pub async fn scan_with<K: AsRef<[u8]>>(
+        &self,
+        range: impl RangeBounds<K>,
+        opts: ReadOptions,
+    ) -> Result<DbIterator> {
+        if opts.freshness == Freshness::Latest {
+            self.refresh().await?;
+        }
+        Ok(self.scan(range))
     }
 }
 

@@ -56,7 +56,8 @@ impl Engine {
     ) -> Result<Self> {
         Ok(match kind {
             EngineKind::Betula => {
-                let cfg = betula::DbConfig {
+                let defaults = betula::Settings::default();
+                let cfg = betula::Settings {
                     tree: betula::TreeConfig {
                         leaf_max_bytes: params.leaf_bytes,
                         internal_max_bytes: params.internal_bytes,
@@ -68,19 +69,33 @@ impl Engine {
                         leaf_bytes: params.leaf_cache_bytes,
                     },
                     // Same WAL flush interval as SlateDB's default.
-                    wal_flush_interval: Duration::from_millis(100),
-                    checkpoint_bytes: params.memtable_bytes,
+                    wal: betula::WalConfig {
+                        flush_interval: Duration::from_millis(100),
+                        ..defaults.wal
+                    },
+                    checkpoint: betula::CheckpointConfig {
+                        bytes: params.memtable_bytes,
+                        ..defaults.checkpoint
+                    },
+                    poll: betula::PollConfig {
+                        interval: params.poll,
+                        ..defaults.poll
+                    },
                     warm: params.warm,
-                    poll_interval: params.poll,
                     cleaner: betula::CleanerConfig {
                         clean_below_live: params.clean_below_live,
                         ..betula::CleanerConfig::default()
                     },
-                    ..betula::DbConfig::default()
+                    ..defaults
                 };
                 let mut dbs = Vec::with_capacity(writers);
                 for _ in 0..writers.max(1) {
-                    dbs.push(betula::Db::open(os.clone(), path, cfg.clone()).await?);
+                    dbs.push(
+                        betula::Db::builder(path, os.clone())
+                            .with_settings(cfg.clone())
+                            .build()
+                            .await?,
+                    );
                 }
                 Engine::Betula(dbs)
             }
@@ -93,12 +108,11 @@ impl Engine {
     pub async fn write(&self, slot: u64, pairs: Vec<(Bytes, Bytes)>) -> Result<()> {
         match self {
             Engine::Betula(dbs) => {
-                let batch = pairs
-                    .into_iter()
-                    .fold(betula::WriteBatch::new(), |b, (k, v)| b.put(k, v));
-                dbs[slot as usize % dbs.len()]
-                    .write(batch, betula::Durability::AwaitDurable)
-                    .await?
+                let mut batch = betula::WriteBatch::new();
+                pairs.into_iter().for_each(|(k, v)| {
+                    batch.put_bytes(k, v);
+                });
+                dbs[slot as usize % dbs.len()].write(batch).await?
             }
             Engine::Slatedb(db) => {
                 let batch = pairs

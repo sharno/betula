@@ -4,6 +4,88 @@ A copy-on-write Bε-tree key-value store on object storage (S3, RustFS, anything
 `object_store` supports with put-if-absent). No local disk and no coordinator,
 like SlateDB, but with **any number of concurrent writers**.
 
+## Quickstart
+
+```rust
+use betula::{Db, Freshness, ReadOptions, WriteBatch};
+
+let db = Db::open("s3://bucket/mydb").await?;     // also gs://, az://, file://, memory://
+db.put("user:1", "ada").await?;                    // durable when it returns
+
+let mut batch = WriteBatch::new();                 // atomic, one timestamp
+batch.put("user:2", "grace").delete("user:3");
+db.write(batch).await?;
+
+let v = db.get("user:1").await?;
+let fresh = db.get_with("user:1", ReadOptions { freshness: Freshness::Latest }).await?;
+let users = db.scan("user:".."user;").collect().await?;  // or .into_stream()
+db.close().await?;
+```
+
+Open the same URL from any number of processes to get any number of
+writers. `DbReader::open(url)` gives a read-only handle. Examples:
+`cargo run --example quickstart -- <url>` and `cargo run --example multi_writer`.
+
+For more control, use the builder:
+
+```rust
+let db = Db::builder("mydb", store)              // any Arc<dyn ObjectStore>
+    .with_settings(Settings::from_file("betula.toml")?)
+    .build()
+    .await?;
+```
+
+### Configuration
+
+Every setting has a default. `Settings::load()` (used by `Db::open`) layers:
+1. the defaults;
+2. the TOML file named by `BETULA_CONFIG`;
+3. `BETULA_*` environment variables, with `__` between sections.
+
+```toml
+warm = "blocking"          # or "background": open ~4x faster, reads warm up after
+[wal]
+flush_interval = "50ms"    # write latency vs PUTs per second
+[checkpoint]
+bytes = 33554432
+interval = "2s"
+[poll]
+interval = "200ms"         # how fast writers see each other
+max_interval = "2s"        # back-off while idle
+[applier]
+mode = "auto"              # or "never" for write-only processes
+steal_after = "10s"
+[gc]
+mode = "on"
+retention = "10m"
+```
+
+```sh
+BETULA_WAL__FLUSH_INTERVAL=20ms BETULA_APPLIER__MODE=never ./my-service
+```
+
+Credentials and endpoints come from the usual `AWS_*`, `GOOGLE_*` and
+`AZURE_*` variables (for example `AWS_ENDPOINT` and `AWS_ALLOW_HTTP` for
+RustFS or MinIO).
+
+### Errors
+
+`err.kind()` says what to do:
+
+| Kind | Meaning |
+|---|---|
+| `Unavailable` | The store failed after retries. Safe to retry (`err.is_retryable()`) |
+| `WriterLost` | Lease expired or writer id taken. Open a new writer |
+| `NotApplier` | An applier-only call on a process without the role |
+| `Closed` | The handle was closed |
+| `SnapshotExpired` | A snapshot was held past the GC retention |
+| `Corrupt` | Stored data failed validation |
+| `InvalidConfig` | Bad settings or URL |
+
+`db.status()` reports a background failure (such as a lost lease) without
+having to write. Call `db.close().await` before exit: dropping a writer warns
+and may lose writes that were only queued.
+
 ## Design
 
 ```

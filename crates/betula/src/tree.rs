@@ -25,7 +25,8 @@ use crate::node::{
 use crate::nodes::{Nodes, Segment};
 use crate::types::{KeyRange, NodePtr, SegmentId, TreeRoot, Version, entry_bytes};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct TreeConfig {
     /// Leaves larger than this are split.
     pub leaf_max_bytes: usize,

@@ -168,7 +168,11 @@ fn check_group_starts(n: usize, max: usize) {
     assert!(starts.len() == n.div_ceil(max));
     assert!(starts[0] == 0);
     for g in 0..starts.len() {
-        let end = if g + 1 < starts.len() { starts[g + 1] } else { n };
+        let end = if g + 1 < starts.len() {
+            starts[g + 1]
+        } else {
+            n
+        };
         assert!(end > starts[g] && end - starts[g] <= max);
     }
 }

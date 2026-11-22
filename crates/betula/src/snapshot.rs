@@ -79,6 +79,16 @@ impl DbIterator {
         }))
     }
 
+    /// The remaining pairs as a `Stream` (boxed, so it is `Unpin` and works
+    /// with `StreamExt`/`TryStreamExt` directly).
+    pub fn into_stream(self) -> futures::stream::BoxStream<'static, Result<(Bytes, Bytes)>> {
+        use futures::StreamExt;
+        futures::stream::try_unfold(self, |mut it| async move {
+            Ok(it.next().await?.map(|kv| (kv, it)))
+        })
+        .boxed()
+    }
+
     pub async fn collect(mut self) -> Result<Vec<(Bytes, Bytes)>> {
         let mut out = Vec::new();
         while let Some(kv) = self.next().await? {

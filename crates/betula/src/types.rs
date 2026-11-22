@@ -184,11 +184,24 @@ impl KeyRange {
     }
 }
 
-impl<R: std::ops::RangeBounds<Bytes>> From<R> for KeyRange {
-    fn from(r: R) -> Self {
+impl KeyRange {
+    /// From any range of byte-like keys (`"a".."m"`, `key..`, `..=key`),
+    /// copying the bounds.
+    pub fn from_bounds<K: AsRef<[u8]>>(r: impl std::ops::RangeBounds<K>) -> Self {
+        let own = |b: Bound<&K>| b.map(|k| Bytes::copy_from_slice(k.as_ref()));
         Self {
-            start: r.start_bound().cloned(),
-            end: r.end_bound().cloned(),
+            start: own(r.start_bound()),
+            end: own(r.end_bound()),
         }
+    }
+}
+
+impl std::ops::RangeBounds<Bytes> for KeyRange {
+    fn start_bound(&self) -> Bound<&Bytes> {
+        self.start.as_ref()
+    }
+
+    fn end_bound(&self) -> Bound<&Bytes> {
+        self.end.as_ref()
     }
 }

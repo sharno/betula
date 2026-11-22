@@ -14,8 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use betula::{
-    ApplierRole, CacheConfig, CleanerConfig, Clock, Db, DbConfig, DbReader, Durability, Error,
-    KeyRange, LeaseConfig, ReaderConfig, SegmentId, TreeConfig, Warm, WriteBatch,
+    ApplierRole, CacheConfig, CheckpointConfig, CleanerConfig, Clock, Db, DbReader, Durability,
+    Error, Gc, KeyRange, LeaseConfig, PollConfig, ReaderSettings, SegmentId, Settings, TreeConfig,
+    WalConfig, Warm, WriteBatch, WriteOptions,
 };
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -48,8 +49,8 @@ impl Clock for ManualClock {
     }
 }
 
-fn tiny_config() -> DbConfig {
-    DbConfig {
+fn tiny_config() -> Settings {
+    Settings {
         tree: TreeConfig {
             leaf_max_bytes: 200,
             internal_max_bytes: 400,
@@ -61,21 +62,27 @@ fn tiny_config() -> DbConfig {
             inner_bytes: 4096,
             leaf_bytes: 1024,
         },
-        wal_flush_interval: Duration::from_millis(2),
-        wal_max_bytes: 256,
-        checkpoint_bytes: 400,
+        wal: WalConfig {
+            flush_interval: Duration::from_millis(2),
+            max_bytes: 256,
+        },
         // Manual-clock durations: these never elapse unless a test advances.
-        checkpoint_interval: HOUR,
-        max_unapplied_bytes: 1 << 30,
-        poll_interval: Duration::from_millis(5),
-        max_poll_interval: Duration::from_millis(20),
-        discovery_interval: Duration::from_millis(20),
+        checkpoint: CheckpointConfig {
+            bytes: 400,
+            interval: HOUR,
+            max_unapplied_bytes: 1 << 30,
+        },
+        poll: PollConfig {
+            interval: Duration::from_millis(5),
+            max_interval: Duration::from_millis(20),
+            discovery_interval: Duration::from_millis(20),
+        },
         lease: LeaseConfig {
             interval: Duration::from_millis(5),
             ttl: HOUR,
         },
         applier: ApplierRole::Auto { steal_after: HOUR },
-        gc: None,
+        gc: Gc::Off,
         // Clean eagerly so relocation runs constantly.
         cleaner: CleanerConfig {
             clean_below_live: 0.6,
@@ -86,8 +93,8 @@ fn tiny_config() -> DbConfig {
     }
 }
 
-fn reader_config() -> ReaderConfig {
-    ReaderConfig {
+fn reader_config() -> ReaderSettings {
+    ReaderSettings {
         cache: CacheConfig {
             inner_bytes: 4096,
             leaf_bytes: 1024,
@@ -100,7 +107,10 @@ fn reader_config() -> ReaderConfig {
 }
 
 async fn open(os: &Arc<dyn ObjectStore>, clock: &Arc<ManualClock>) -> Db {
-    Db::open_with_clock(os.clone(), ROOT, tiny_config(), clock.clone())
+    Db::builder(ROOT, os.clone())
+        .with_settings(tiny_config())
+        .with_clock(clock.clone())
+        .build()
         .await
         .unwrap()
 }
@@ -207,8 +217,12 @@ async fn run(ops: Vec<Op>) {
             }
             Op::PutQueued(w, k, v) => {
                 clock.tick();
-                let batch = WriteBatch::new().put(key(k), v.clone());
-                dbs[w].write(batch, Durability::Queued).await.unwrap();
+                let mut batch = WriteBatch::new();
+                batch.put(key(k), &v);
+                let queued = WriteOptions {
+                    durability: Durability::Queued,
+                };
+                dbs[w].write_with(batch, queued).await.unwrap();
                 model.insert(key(k), Bytes::from(v));
             }
             Op::Delete(w, k) => {
@@ -245,7 +259,9 @@ async fn run(ops: Vec<Op>) {
             }
             Op::ReaderScan => {
                 sync(&dbs, 0).await;
-                let reader = DbReader::open(os.clone(), ROOT, reader_config())
+                let reader = DbReader::builder(ROOT, os.clone())
+                    .with_settings(reader_config())
+                    .build()
                     .await
                     .unwrap();
                 let got = reader.scan(KeyRange::all()).collect().await.unwrap();
@@ -321,7 +337,9 @@ async fn concurrent_writers_all_land() {
     futures::future::try_join_all(tasks).await.unwrap();
     let applier = dbs.iter().find(|d| d.is_applier()).unwrap();
     applier.checkpoint().await.unwrap();
-    let reader = DbReader::open(os.clone(), ROOT, reader_config())
+    let reader = DbReader::builder(ROOT, os.clone())
+        .with_settings(reader_config())
+        .build()
         .await
         .unwrap();
     let all = reader.scan(KeyRange::all()).collect().await.unwrap();
@@ -340,11 +358,17 @@ async fn applier_failover_applies_the_dead_appliers_writes() {
     cfg.applier = ApplierRole::Auto {
         steal_after: Duration::from_secs(10),
     };
-    cfg.checkpoint_bytes = 1 << 30;
-    let a = Db::open_with_clock(os.clone(), ROOT, cfg.clone(), clock.clone())
+    cfg.checkpoint.bytes = 1 << 30;
+    let a = Db::builder(ROOT, os.clone())
+        .with_settings(cfg.clone())
+        .with_clock(clock.clone())
+        .build()
         .await
         .unwrap();
-    let b = Db::open_with_clock(os.clone(), ROOT, cfg, clock.clone())
+    let b = Db::builder(ROOT, os.clone())
+        .with_settings(cfg)
+        .with_clock(clock.clone())
+        .build()
         .await
         .unwrap();
     assert!(a.is_applier() && !b.is_applier());
@@ -363,7 +387,11 @@ async fn applier_failover_applies_the_dead_appliers_writes() {
     .await
     .expect("b takes over the applier role");
     b.checkpoint().await.unwrap();
-    let reader = DbReader::open(os, ROOT, reader_config()).await.unwrap();
+    let reader = DbReader::builder(ROOT, os)
+        .with_settings(reader_config())
+        .build()
+        .await
+        .unwrap();
     assert_eq!(reader.get(b"from-a").await.unwrap(), Some(Bytes::from("1")));
     assert_eq!(reader.get(b"from-b").await.unwrap(), Some(Bytes::from("2")));
     assert!(b.stats().unapplied_bytes == 0);
@@ -464,7 +492,11 @@ async fn gc_keeps_exactly_the_live_tree() {
     assert!(s.live_bytes * 10 >= s.segment_bytes * 4, "{s:?}");
 
     db.close().await.unwrap();
-    let reader = DbReader::open(os, ROOT, reader_config()).await.unwrap();
+    let reader = DbReader::builder(ROOT, os)
+        .with_settings(reader_config())
+        .build()
+        .await
+        .unwrap();
     let all = reader.scan(KeyRange::all()).collect().await.unwrap();
     assert_eq!(all, model_range(&model, &KeyRange::all()));
 }
@@ -503,8 +535,11 @@ async fn paged_scans_match_model() {
         max_fanout: 8,
         max_runs_per_child: 6,
     };
-    cfg.checkpoint_bytes = 1 << 30;
-    let db = Db::open_with_clock(os.clone(), ROOT, cfg, clock.clone())
+    cfg.checkpoint.bytes = 1 << 30;
+    let db = Db::builder(ROOT, os.clone())
+        .with_settings(cfg)
+        .with_clock(clock.clone())
+        .build()
         .await
         .unwrap();
     let mut model = Model::new();

@@ -14,11 +14,14 @@ use crate::manifest;
 use crate::manifest::Frontier;
 use crate::store::Store;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct GcConfig {
+    #[serde(with = "humantime_serde")]
     pub interval: Duration,
     /// Minimum age of a superseding manifest before the version it replaced is
     /// deleted. Must exceed the longest snapshot or reader refresh interval.
+    #[serde(with = "humantime_serde")]
     pub retention: Duration,
 }
 
