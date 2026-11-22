@@ -33,9 +33,12 @@ pub struct SidraParams {
     pub inner_cache_bytes: u64,
     pub leaf_cache_bytes: u64,
     pub clean_below_live: f64,
+    pub clean_inner_below_live: f64,
+    pub gc: bool,
     /// How often sidra writers poll for each other's entries.
     pub poll: Duration,
     pub max_runs: usize,
+    pub compression: crate::CompressionArg,
     pub warm: sidra::Warm,
 }
 
@@ -82,8 +85,18 @@ impl Engine {
                         ..defaults.poll
                     },
                     warm: params.warm,
+                    gc: if params.gc {
+                        defaults.gc
+                    } else {
+                        sidra::Gc::Off
+                    },
+                    compression: match params.compression {
+                        crate::CompressionArg::None => sidra::Compression::None,
+                        crate::CompressionArg::Lz4 => sidra::Compression::Lz4,
+                    },
                     cleaner: sidra::CleanerConfig {
                         clean_below_live: params.clean_below_live,
+                        clean_inner_below_live: params.clean_inner_below_live,
                         ..sidra::CleanerConfig::default()
                     },
                     ..defaults
@@ -99,7 +112,21 @@ impl Engine {
                 }
                 Engine::Sidra(dbs)
             }
-            EngineKind::Slatedb => Engine::Slatedb(slatedb::Db::builder(path, os).build().await?),
+            EngineKind::Slatedb => {
+                let settings = slatedb::Settings {
+                    compression_codec: match params.compression {
+                        crate::CompressionArg::None => None,
+                        crate::CompressionArg::Lz4 => Some(slatedb::config::CompressionCodec::Lz4),
+                    },
+                    ..slatedb::Settings::default()
+                };
+                Engine::Slatedb(
+                    slatedb::Db::builder(path, os)
+                        .with_settings(settings)
+                        .build()
+                        .await?,
+                )
+            }
         })
     }
 

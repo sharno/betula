@@ -68,6 +68,7 @@ mod types;
 mod wal;
 
 pub use admin::{Admin, ManifestInfo, WriterInfo};
+pub use codec::Compression;
 pub use db::{
     Clock, Db, DbBuilder, Durability, Freshness, Metrics, ReadOptions, SystemClock, WriteBatch,
     WriteOptions,
@@ -79,7 +80,7 @@ pub use location::parse as parse_url;
 pub use nodes::{CacheConfig, CacheStats, Warm};
 pub use object_store;
 pub use reader::{DbReader, DbReaderBuilder};
-pub use segments::{CleanerConfig, SegmentTable, SegmentUsage};
+pub use segments::{CleanerConfig, SegmentKind, SegmentTable, SegmentUsage};
 pub use settings::{
     ApplierRole, CheckpointConfig, Follow, Gc, LeaseConfig, PollConfig, ReaderSettings, Settings,
     WalConfig,

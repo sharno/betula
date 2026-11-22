@@ -1617,6 +1617,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lz4_flex"
+version = "0.11.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13591d77a9b6d941f7e6fcade7f9dfd9e801308752bde50c0a9bb5852778c22c"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2600,6 +2609,7 @@ dependencies = [
  "futures",
  "humantime-serde",
  "imbl",
+ "lz4_flex",
  "object_store",
  "parking_lot",
  "postcard",
@@ -2711,6 +2721,7 @@ dependencies = [
  "futures",
  "log",
  "lru",
+ "lz4_flex",
  "object_store",
  "ouroboros",
  "parking_lot",

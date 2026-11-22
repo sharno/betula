@@ -87,8 +87,11 @@ fn tiny_config() -> Settings {
         // Clean eagerly so relocation runs constantly.
         cleaner: CleanerConfig {
             clean_below_live: 0.6,
+            clean_inner_below_live: 0.6,
             max_moved_bytes: 2048,
         },
+        // Exercise the compressed path everywhere in tests.
+        compression: sidra::Compression::Lz4,
         warm: Warm::Blocking,
         rewarm: Warm::Blocking,
     }

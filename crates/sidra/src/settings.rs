@@ -24,6 +24,7 @@ use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 
+use crate::codec::Compression;
 use crate::error::{Error, Result};
 use crate::gc::GcConfig;
 use crate::nodes::{CacheConfig, Warm};
@@ -46,6 +47,8 @@ pub struct Settings {
     pub tree: TreeConfig,
     pub cache: CacheConfig,
     pub cleaner: CleanerConfig,
+    /// Compression of tree nodes and log batches. Readers decode either.
+    pub compression: Compression,
     /// Loading of internal nodes and buffered runs on open.
     pub warm: Warm,
     /// Loading of each new manifest's changed internal nodes and runs as
@@ -66,6 +69,7 @@ impl Default for Settings {
             tree: TreeConfig::default(),
             cache: CacheConfig::default(),
             cleaner: CleanerConfig::default(),
+            compression: Compression::default(),
             warm: Warm::Blocking,
             rewarm: Warm::Off,
         }

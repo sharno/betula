@@ -55,6 +55,13 @@ fn bump(c: &AtomicU64, n: u64) {
     c.fetch_add(n, Ordering::Relaxed);
 }
 
+/// Rate limit for deletes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pace {
+    Unlimited,
+    PerSecond(u32),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CreateOutcome {
     Created,
@@ -207,10 +214,30 @@ impl Store {
     /// object swamps the store, and so do huge batches on some servers; either
     /// stalls writers' log PUTs behind GC. Missing objects count as deleted.
     pub async fn delete_all(&self, paths: Vec<Path>) -> Result<()> {
+        self.delete_paced(paths, Pace::Unlimited).await
+    }
+
+    /// Like `delete_all`, at most `pace` objects per second: GC's bursts of
+    /// deletes otherwise compete with writers' log PUTs and stall them.
+    pub async fn delete_paced(&self, paths: Vec<Path>, pace: Pace) -> Result<()> {
+        let (batch, gap) = match pace {
+            Pace::Unlimited => (DELETE_BATCH, None),
+            Pace::PerSecond(rate) => {
+                let rate = rate.max(1) as usize;
+                // About four batches a second.
+                let batch = (rate / 4).clamp(1, DELETE_BATCH);
+                (
+                    batch,
+                    Some(std::time::Duration::from_secs_f64(
+                        batch as f64 / rate as f64,
+                    )),
+                )
+            }
+        };
         bump(&self.counters.deletes, paths.len() as u64);
         let mut paths = paths.into_iter().peekable();
         while paths.peek().is_some() {
-            let chunk: Vec<Path> = paths.by_ref().take(DELETE_BATCH).collect();
+            let chunk: Vec<Path> = paths.by_ref().take(batch).collect();
             let input = stream::iter(chunk.into_iter().map(Ok)).boxed();
             self.os
                 .delete_stream(input)
@@ -220,6 +247,9 @@ impl Store {
                 })
                 .try_collect::<Vec<()>>()
                 .await?;
+            if let (Some(gap), true) = (gap, paths.peek().is_some()) {
+                tokio::time::sleep(gap).await;
+            }
         }
         Ok(())
     }

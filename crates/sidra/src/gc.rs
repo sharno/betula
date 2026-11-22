@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::error::Result;
 use crate::manifest;
 use crate::manifest::Frontier;
-use crate::store::Store;
+use crate::store::{Pace, Store};
 use crate::wal;
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -24,6 +24,10 @@ pub struct GcConfig {
     /// deleted. Must exceed the longest snapshot or reader refresh interval.
     #[serde(with = "humantime_serde")]
     pub retention: Duration,
+    /// Deletes per second. GC spreads its deletes out so they don't stall
+    /// writers on the store; it must exceed the garbage rate (about one
+    /// object per log flush plus a few per checkpoint).
+    pub max_deletes_per_sec: u32,
 }
 
 impl Default for GcConfig {
@@ -31,6 +35,7 @@ impl Default for GcConfig {
         Self {
             interval: Duration::from_secs(60),
             retention: Duration::from_secs(600),
+            max_deletes_per_sec: 100,
         }
     }
 }
@@ -43,7 +48,7 @@ pub struct GcStats {
     pub writers: usize,
 }
 
-pub async fn run(store: &Store, now_ms: u64, retention: Duration) -> Result<GcStats> {
+pub async fn run(store: &Store, now_ms: u64, retention: Duration, pace: Pace) -> Result<GcStats> {
     let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
     let ids = store.list_manifests().await?;
     let mut stats = GcStats::default();
@@ -57,7 +62,10 @@ pub async fn run(store: &Store, now_ms: u64, retention: Duration) -> Result<GcSt
             break;
         }
         store
-            .delete_all(m.dead.iter().map(|id| store.segment_path(*id)).collect())
+            .delete_paced(
+                m.dead.iter().map(|id| store.segment_path(*id)).collect(),
+                pace,
+            )
             .await?;
         stats.segments += m.dead.len();
         // Delete the manifest last so a crash mid-way is retried next run.
@@ -74,7 +82,7 @@ pub async fn run(store: &Store, now_ms: u64, retention: Duration) -> Result<GcSt
             .map(|seq| store.wal_path(writer, seq))
             .collect();
         stats.wals += paths.len();
-        store.delete_all(paths).await?;
+        store.delete_paced(paths, pace).await?;
     }
     stats.writers = forget_writers(store, now_ms, retention_ms).await?;
     Ok(stats)

@@ -15,7 +15,7 @@ use crate::hlc::WriterId;
 use crate::location;
 use crate::manifest;
 use crate::nodes::{CacheConfig, Nodes};
-use crate::store::Store;
+use crate::store::{Pace, Store};
 use crate::tree::{self, TreeShape};
 use crate::types::{Epoch, ManifestId, TreeRoot};
 use crate::wal;
@@ -125,6 +125,12 @@ impl Admin {
     /// Deletes what no reader within `retention` can need. Safe to run while
     /// writers are active.
     pub async fn gc(&self, retention: Duration) -> Result<GcStats> {
-        gc::run(self.store(), self.clock.now_ms(), retention).await
+        gc::run(
+            self.store(),
+            self.clock.now_ms(),
+            retention,
+            Pace::Unlimited,
+        )
+        .await
     }
 }

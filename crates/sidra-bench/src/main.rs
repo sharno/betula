@@ -37,6 +37,12 @@ struct Args {
     keys: u64,
     #[arg(long, default_value_t = 256)]
     value_size: usize,
+    /// `random` (incompressible) or `text` (JSON-like, compressible).
+    #[arg(long, value_enum, default_value_t = ValueKind::Random)]
+    values: ValueKind,
+    /// Compression for both engines.
+    #[arg(long, value_enum, default_value_t = CompressionArg::None)]
+    compression: CompressionArg,
     /// Concurrent clients per phase.
     #[arg(long, default_value_t = 64)]
     concurrency: usize,
@@ -102,6 +108,12 @@ struct Args {
     /// sidra cleans segments whose live fraction is below this.
     #[arg(long, default_value_t = 0.25)]
     clean_below: f64,
+    /// sidra: disable garbage collection (for experiments).
+    #[arg(long)]
+    no_gc: bool,
+    /// sidra cleans inner segments (runs) below this live fraction.
+    #[arg(long, default_value_t = 0.1)]
+    clean_inner_below: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +127,18 @@ fn splitmix(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum ValueKind {
+    Random,
+    Text,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum CompressionArg {
+    None,
+    Lz4,
+}
+
 struct Workload {
     keys: u64,
     value_size: usize,
@@ -124,10 +148,37 @@ struct Workload {
 }
 
 impl Workload {
-    fn new(keys: u64, value_size: usize) -> Self {
-        let pool: Vec<u8> = (0..(4 << 20) / 8)
-            .flat_map(|i| splitmix(i).to_le_bytes())
-            .collect();
+    fn new(keys: u64, value_size: usize, values: ValueKind) -> Self {
+        let pool: Vec<u8> = match values {
+            ValueKind::Random => (0..(4 << 20) / 8)
+                .flat_map(|i| splitmix(i).to_le_bytes())
+                .collect(),
+            // JSON-like records with varying fields: compresses about as
+            // well as typical application data.
+            ValueKind::Text => {
+                let plans = ["free", "pro", "team", "enterprise"];
+                let countries = ["EG", "AE", "SA", "US", "DE", "IN", "BR", "JP"];
+                (0..)
+                    .map(|i: u64| {
+                        let r = splitmix(i);
+                        format!(
+                            r#"{{"user_id":{},"name":"user{}","email":"user{}@example.com","country":"{}","plan":"{}","score":{},"active":{},"tags":["t{}","t{}"]}}"#,
+                            r % 10_000_000,
+                            r % 10_000_000,
+                            r % 10_000_000,
+                            countries[(r >> 8) as usize % countries.len()],
+                            plans[(r >> 16) as usize % plans.len()],
+                            (r >> 24) % 1000,
+                            (r >> 34) % 2 == 0,
+                            (r >> 40) % 50,
+                            (r >> 48) % 50,
+                        )
+                    })
+                    .flat_map(String::into_bytes)
+                    .take(4 << 20)
+                    .collect()
+            }
+        };
         let stride = (0x9E37_79B9u64..)
             .find(|s| gcd(*s, keys) == 1)
             .expect("a coprime exists");
@@ -431,8 +482,11 @@ async fn bench_engine(
         inner_cache_bytes: args.inner_cache_mib << 20,
         leaf_cache_bytes: args.leaf_cache_mib << 20,
         clean_below_live: args.clean_below,
+        clean_inner_below_live: args.clean_inner_below,
+        gc: !args.no_gc,
         poll: Duration::from_millis(args.poll_ms),
         max_runs: args.max_runs,
+        compression: args.compression,
         warm: if args.warm_background {
             sidra::Warm::Background
         } else {
@@ -596,7 +650,7 @@ async fn main() -> Result<()> {
             .build()?,
     );
     preflight(&raw).await?;
-    let wl = Arc::new(Workload::new(args.keys, args.value_size));
+    let wl = Arc::new(Workload::new(args.keys, args.value_size, args.values));
     eprintln!("{args:?}");
 
     let mut results = Vec::new();

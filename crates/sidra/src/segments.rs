@@ -17,6 +17,15 @@ use crate::types::{NodePtr, SegmentId};
 pub struct SegmentUsage {
     pub total: u64,
     pub live: u64,
+    pub kind: SegmentKind,
+}
+
+/// What a segment holds. Inner segments (internal nodes and buffered runs)
+/// empty out on their own as runs flush down; leaf segments decay slowly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SegmentKind {
+    Inner,
+    Leaf,
 }
 
 pub type SegmentTable = BTreeMap<SegmentId, SegmentUsage>;
@@ -24,8 +33,12 @@ pub type SegmentTable = BTreeMap<SegmentId, SegmentUsage>;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CleanerConfig {
-    /// Clean segments whose live fraction is below this.
+    /// Clean leaf segments whose live fraction is below this.
     pub clean_below_live: f64,
+    /// Clean inner segments only below this lower fraction: they empty out
+    /// by themselves, so copying their last live runs is mostly wasted
+    /// writes.
+    pub clean_inner_below_live: f64,
     /// Cap on live bytes moved per checkpoint, which bounds the extra work any
     /// one checkpoint does. At least one victim is always taken.
     pub max_moved_bytes: u64,
@@ -37,6 +50,7 @@ impl Default for CleanerConfig {
             // Cleaning at live fraction t adds about t/(1-t) to write
             // amplification and bounds space amplification near 1/t.
             clean_below_live: 0.25,
+            clean_inner_below_live: 0.1,
             max_moved_bytes: 64 << 20,
         }
     }
@@ -46,14 +60,20 @@ impl Default for CleanerConfig {
 /// freed `freed`, plus the segments that just died.
 pub fn account(
     prev: &SegmentTable,
-    new: &[(SegmentId, u64)],
+    new: &[(SegmentId, u64, SegmentKind)],
     freed: &[NodePtr],
 ) -> (SegmentTable, Vec<SegmentId>) {
     let mut table = prev.clone();
-    table.extend(
-        new.iter()
-            .map(|&(id, total)| (id, SegmentUsage { total, live: total })),
-    );
+    table.extend(new.iter().map(|&(id, total, kind)| {
+        (
+            id,
+            SegmentUsage {
+                total,
+                live: total,
+                kind,
+            },
+        )
+    }));
     freed.iter().for_each(|ptr| {
         let usage = table
             .get_mut(&ptr.seg)
@@ -80,7 +100,13 @@ pub fn account(
 pub fn pick_victims(table: &SegmentTable, cfg: &CleanerConfig) -> HashSet<SegmentId> {
     let mut candidates: Vec<(SegmentId, SegmentUsage)> = table
         .iter()
-        .filter(|(_, u)| (u.live as f64) < cfg.clean_below_live * u.total as f64)
+        .filter(|(_, u)| {
+            let threshold = match u.kind {
+                SegmentKind::Inner => cfg.clean_inner_below_live,
+                SegmentKind::Leaf => cfg.clean_below_live,
+            };
+            (u.live as f64) < threshold * u.total as f64
+        })
         .map(|(id, u)| (*id, *u))
         .collect();
     candidates.sort_by(|(_, a), (_, b)| {
@@ -119,9 +145,17 @@ mod tests {
 
     #[test]
     fn freeing_everything_kills_a_segment() {
-        let (t, dead) = account(&SegmentTable::new(), &[(seg(0), 30)], &[]);
+        let (t, dead) = account(
+            &SegmentTable::new(),
+            &[(seg(0), 30, SegmentKind::Leaf)],
+            &[],
+        );
         assert!(dead.is_empty());
-        let (t, dead) = account(&t, &[(seg(1), 10)], &[ptr(0, 0, 10), ptr(0, 10, 20)]);
+        let (t, dead) = account(
+            &t,
+            &[(seg(1), 10, SegmentKind::Leaf)],
+            &[ptr(0, 0, 10), ptr(0, 10, 20)],
+        );
         assert_eq!(dead, vec![seg(0)]);
         assert_eq!(t.keys().copied().collect::<Vec<_>>(), vec![seg(1)]);
     }
@@ -134,6 +168,7 @@ mod tests {
                 SegmentUsage {
                     total: 100,
                     live: 40,
+                    kind: SegmentKind::Leaf,
                 },
             ),
             (
@@ -141,6 +176,7 @@ mod tests {
                 SegmentUsage {
                     total: 100,
                     live: 10,
+                    kind: SegmentKind::Leaf,
                 },
             ),
             (
@@ -148,6 +184,7 @@ mod tests {
                 SegmentUsage {
                     total: 100,
                     live: 90,
+                    kind: SegmentKind::Leaf,
                 },
             ),
             (
@@ -155,12 +192,14 @@ mod tests {
                 SegmentUsage {
                     total: 100,
                     live: 30,
+                    kind: SegmentKind::Leaf,
                 },
             ),
         ]
         .into();
         let cfg = CleanerConfig {
             clean_below_live: 0.5,
+            clean_inner_below_live: 0.5,
             max_moved_bytes: 45,
         };
         assert_eq!(pick_victims(&table, &cfg), [seg(1), seg(3)].into());

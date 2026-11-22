@@ -332,6 +332,7 @@ fn account_tracks_live_bytes() {
         SegmentUsage {
             total: 255,
             live: live0.into(),
+            kind: crate::segments::SegmentKind::Leaf,
         },
     );
     let new_total: u8 = kani::any();
@@ -340,7 +341,11 @@ fn account_tracks_live_bytes() {
     let (f0, f1): (u8, u8) = (kani::any(), kani::any());
     kani::assume(f0 > 0 && f0 <= live0 && f1 > 0 && f1 <= new_total);
     let freed = [ptr(0, f0), ptr(1, f1)];
-    let (table, dead) = account(&prev, &[(seg(1), new_total.into())], &freed);
+    let (table, dead) = account(
+        &prev,
+        &[(seg(1), new_total.into(), crate::segments::SegmentKind::Leaf)],
+        &freed,
+    );
     let check = |s: u64, left: u8| match table.get(&seg(s)) {
         Some(u) => assert!(u.live == u64::from(left) && left > 0 && !dead.contains(&seg(s))),
         None => assert!(left == 0 && dead.contains(&seg(s))),
@@ -368,12 +373,14 @@ fn victims_respect_threshold_and_budget() {
             SegmentUsage {
                 total: 100,
                 live: live.into(),
+                kind: crate::segments::SegmentKind::Leaf,
             },
         );
     }
     let budget: u8 = kani::any();
     let cfg = CleanerConfig {
         clean_below_live: 0.5,
+        clean_inner_below_live: 0.5,
         max_moved_bytes: budget.into(),
     };
     let victims = pick_victims(&table, &cfg);

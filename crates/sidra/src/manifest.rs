@@ -102,7 +102,8 @@ pub async fn load_latest(store: &Store) -> Result<Option<(ManifestId, Manifest)>
 }
 
 pub async fn publish(store: &Store, id: ManifestId, manifest: &Manifest) -> Result<Publish> {
-    let data = codec::encode(codec::MANIFEST, manifest);
+    // Manifests carry the segment table, which compresses well.
+    let data = codec::encode(codec::MANIFEST, manifest, codec::Compression::Lz4);
     match store
         .put_create(&store.manifest_path(id), data.clone())
         .await?

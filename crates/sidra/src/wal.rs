@@ -28,8 +28,13 @@ pub enum WalWrite {
     Taken,
 }
 
-pub async fn write(store: &Store, seq: u64, batch: &WalBatch) -> Result<WalWrite> {
-    let data = codec::encode(codec::WAL, batch);
+pub async fn write(
+    store: &Store,
+    seq: u64,
+    batch: &WalBatch,
+    compression: codec::Compression,
+) -> Result<WalWrite> {
+    let data = codec::encode(codec::WAL, batch, compression);
     match store
         .put_create(&store.wal_path(batch.writer, seq), data.clone())
         .await?
@@ -62,7 +67,7 @@ pub async fn write_lease(store: &Store, lease: &Lease) -> Result<()> {
     store
         .put(
             &store.lease_path(lease.writer),
-            codec::encode(codec::LEASE, lease),
+            codec::encode(codec::LEASE, lease, codec::Compression::None),
         )
         .await
 }

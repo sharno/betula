@@ -12,6 +12,7 @@ figment.workspace = true
 humantime-serde.workspace = true
 futures.workspace = true
 imbl.workspace = true
+lz4_flex.workspace = true
 object_store.workspace = true
 parking_lot.workspace = true
 postcard.workspace = true

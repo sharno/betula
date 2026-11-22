@@ -399,10 +399,12 @@ pub async fn apply(
     msgs: Vec<(Bytes, Version)>,
     victims: &HashSet<SegmentId>,
     drop_tombstones_below: Ts,
+    compression: codec::Compression,
 ) -> Result<Plan> {
     let mut w = Writer {
         nodes,
         cfg,
+        compression,
         victims,
         drop_below: drop_tombstones_below,
         dirty: HashSet::new(),
@@ -427,6 +429,7 @@ pub async fn apply(
 struct Writer<'a> {
     nodes: &'a Nodes,
     cfg: &'a TreeConfig,
+    compression: codec::Compression,
     victims: &'a HashSet<SegmentId>,
     /// Tombstones older than this are dropped when their leaf is rewritten.
     drop_below: Ts,
@@ -728,7 +731,7 @@ impl Writer<'_> {
     }
 
     fn write(&mut self, node: Node) -> NodePtr {
-        let frame = codec::encode(codec::NODE, &node);
+        let frame = codec::encode(codec::NODE, &node, self.compression);
         let region = match node {
             Node::Leaf(_) => &mut self.leaves,
             Node::Internal(_) | Node::Run(_) => &mut self.inner,

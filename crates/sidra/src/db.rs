@@ -37,10 +37,10 @@ use crate::location;
 use crate::manifest::{self, Manifest, Publish};
 use crate::nodes::{CacheStats, Nodes};
 use crate::retry::retry;
-use crate::segments::{self, SegmentTable};
+use crate::segments::{self, SegmentKind, SegmentTable};
 use crate::settings::{ApplierRole, Follow, Gc, Settings};
 use crate::snapshot::DbIterator;
-use crate::store::{RequestStats, Store};
+use crate::store::{Pace, RequestStats, Store};
 use crate::tree::{self, TreeShape};
 use crate::types::{Epoch, KeyRange, ManifestId, Msg, SegmentId, TreeRoot, Version, entry_bytes};
 use crate::wal::{self, Lease, WalBatch, WalWrite};
@@ -439,6 +439,7 @@ impl Shared {
             msgs,
             &victims,
             drop_below,
+            self.cfg.compression,
         )
         .await?;
         futures::future::try_join_all(
@@ -447,10 +448,17 @@ impl Shared {
                 .map(|segment| retry("segment upload", || self.nodes.upload(segment))),
         )
         .await?;
-        let new: Vec<(SegmentId, u64)> = plan
+        let new: Vec<(SegmentId, u64, SegmentKind)> = plan
             .segments
             .iter()
-            .map(|s| (s.id, s.data.len() as u64))
+            .map(|s| {
+                let kind = if s.id == out.inner {
+                    SegmentKind::Inner
+                } else {
+                    SegmentKind::Leaf
+                };
+                (s.id, s.data.len() as u64, kind)
+            })
             .collect();
         let (table, dead) = segments::account(&view.manifest.segments, &new, &plan.freed);
         let next = Manifest {
@@ -476,8 +484,11 @@ impl Shared {
         .await?
         {
             Publish::Published => {
-                let bytes_of =
-                    |id: SegmentId| new.iter().find(|(s, _)| *s == id).map_or(0, |(_, b)| *b);
+                let bytes_of = |id: SegmentId| {
+                    new.iter()
+                        .find(|(s, _, _)| *s == id)
+                        .map_or(0, |(_, b, _)| *b)
+                };
                 tracing::debug!(
                     manifest = next_id.0,
                     msgs = msg_count,
@@ -774,7 +785,13 @@ impl Db {
     }
 
     pub async fn run_gc(&self, retention: Duration) -> Result<GcStats> {
-        gc::run(self.shared.store(), self.shared.now(), retention).await
+        gc::run(
+            self.shared.store(),
+            self.shared.now(),
+            retention,
+            Pace::Unlimited,
+        )
+        .await
     }
 
     /// Walks the current tree, loading every node.
@@ -993,7 +1010,12 @@ impl WalTask {
             ops,
         };
         let seq = self.next_seq;
-        match retry("wal write", || wal::write(shared.store(), seq, &batch)).await {
+        let compression = shared.cfg.compression;
+        match retry("wal write", || {
+            wal::write(shared.store(), seq, &batch, compression)
+        })
+        .await
+        {
             Ok(WalWrite::Written) => {}
             Ok(WalWrite::Taken) => return Err(shared.fail(Error::WriterIdTaken)),
             // The outcome is unknown, so the next batch can't safely reuse
@@ -1084,7 +1106,8 @@ async fn gc_loop(shared: Arc<Shared>, cfg: GcConfig, mut shutdown: watch::Receiv
         if !shared.is_applier.load(Ordering::Acquire) {
             continue;
         }
-        match gc::run(shared.store(), shared.now(), cfg.retention).await {
+        let pace = Pace::PerSecond(cfg.max_deletes_per_sec);
+        match gc::run(shared.store(), shared.now(), cfg.retention, pace).await {
             Ok(stats) => tracing::debug!(?stats, "gc"),
             Err(e) => tracing::warn!(%e, "gc failed"),
         }
