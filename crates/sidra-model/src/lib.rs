@@ -47,6 +47,8 @@ pub struct Config {
     /// Writers renew their leases each clock tick. Off, leases run out and
     /// the applier seals their logs, which also lets the floor rise.
     pub renew_leases: bool,
+    /// Faults allowed per run: lost requests, lost responses, crashes.
+    pub max_faults: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -82,6 +84,9 @@ pub enum Response {
     Created,
     Exists(Vec<u8>),
     Listed(Vec<Path>),
+    /// The request failed after retries (whether it applied is unknown to
+    /// the caller).
+    Failed,
 }
 
 fn encode<T: Serialize>(value: &T) -> Vec<u8> {
@@ -196,6 +201,8 @@ pub struct Proc {
     /// newer versions).
     pub acked: Vec<(Bytes, Version)>,
     stopped: bool,
+    /// Crashed: takes no more steps; requests it sent may still land.
+    crashed: bool,
     /// Clock reading of the last lease written: one renewal per tick.
     leased_at: u64,
     /// Checkpoints started (bounded, so the state space is finite).
@@ -335,6 +342,7 @@ fn start(index: usize) -> Proc {
         pending: BTreeMap::new(),
         acked: Vec::new(),
         stopped: false,
+        crashed: false,
         leased_at: 0,
         attempts: 0,
         applier: (index == 0).then(|| Applier {
@@ -444,6 +452,13 @@ fn fire(p: &mut Proc, cfg: &Config, index: usize, timer: &Timer, o: &mut Out) {
 
 fn on_response(p: &mut Proc, cfg: &Config, purpose: Purpose, resp: Response, o: &mut Out) {
     match (purpose, resp) {
+        // Opening fails: the writer gives up (a new process would get a new
+        // id).
+        (Purpose::Lease | Purpose::ListManifests | Purpose::GetManifest(_), Response::Failed)
+            if p.phase != Phase::Ready =>
+        {
+            p.stopped = true;
+        }
         (Purpose::Lease, _) if p.phase == Phase::Leasing => {
             p.phase = Phase::Observing;
             p.send(o, Purpose::ListManifests, Request::List(Listing::Manifests));
@@ -860,6 +875,7 @@ fn covers(seen: &Tree, expected: &BTreeMap<&Bytes, &Version>) -> bool {
 pub struct Sys {
     pub store: BTreeMap<Path, Vec<u8>>,
     pub procs: Vec<Proc>,
+    pub faults: u8,
 }
 
 /// A step: deliver one of a process's requests (the store applies it and
@@ -870,8 +886,28 @@ pub struct Sys {
 /// magnitude.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
-    Deliver { proc: usize, request: usize },
-    Fire { proc: usize, timer: Timer },
+    Deliver {
+        proc: usize,
+        request: usize,
+        fate: Fate,
+    },
+    Fire {
+        proc: usize,
+        timer: Timer,
+    },
+    Crash {
+        proc: usize,
+    },
+}
+
+/// What happens to a delivered request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fate {
+    Ok,
+    /// Lost before reaching the store.
+    Dropped,
+    /// Applied, but the response is lost.
+    ResponseLost,
 }
 
 pub struct Checked {
@@ -927,12 +963,27 @@ impl Model for Checked {
         vec![Sys {
             store: [(Path::Manifest(1), encode(&initial_manifest()))].into(),
             procs: (0..self.cfg.scripts.len()).map(start).collect(),
+            faults: 0,
         }]
     }
 
     fn actions(&self, s: &Sys, actions: &mut Vec<Action>) {
+        let faulty = s.faults < self.cfg.max_faults;
+        let fates: &[Fate] = match faulty {
+            true => &[Fate::Ok, Fate::Dropped, Fate::ResponseLost],
+            false => &[Fate::Ok],
+        };
         s.procs.iter().enumerate().for_each(|(proc, p)| {
-            actions.extend((0..p.outbox.len()).map(|request| Action::Deliver { proc, request }));
+            actions.extend((0..p.outbox.len()).flat_map(|request| {
+                fates.iter().map(move |&fate| Action::Deliver {
+                    proc,
+                    request,
+                    fate,
+                })
+            }));
+            if p.crashed {
+                return;
+            }
             actions.extend(
                 p.timers
                     .iter()
@@ -942,6 +993,9 @@ impl Model for Checked {
                         timer: t.clone(),
                     }),
             );
+            if faulty {
+                actions.push(Action::Crash { proc });
+            }
         });
     }
 
@@ -949,11 +1003,34 @@ impl Model for Checked {
         let mut s = s.clone();
         let mut o = Out::default();
         match action {
-            Action::Deliver { proc, request } => {
+            Action::Deliver {
+                proc,
+                request,
+                fate,
+            } => {
                 let (purpose, req) = s.procs[proc].outbox.remove(request);
-                let resp = store_step(&mut s.store, req);
-                on_response(&mut s.procs[proc], &self.cfg, purpose, resp, &mut o);
-                s.procs[proc].timers.extend(o.timers);
+                let resp = match fate {
+                    Fate::Ok => store_step(&mut s.store, req),
+                    Fate::Dropped => Response::Failed,
+                    Fate::ResponseLost => {
+                        store_step(&mut s.store, req);
+                        Response::Failed
+                    }
+                };
+                if fate != Fate::Ok {
+                    s.faults += 1;
+                }
+                let p = &mut s.procs[proc];
+                if !p.crashed {
+                    on_response(p, &self.cfg, purpose, resp, &mut o);
+                    p.timers.extend(o.timers);
+                }
+            }
+            Action::Crash { proc } => {
+                s.faults += 1;
+                let p = &mut s.procs[proc];
+                p.crashed = true;
+                p.timers.clear();
             }
             Action::Fire { proc, timer } => {
                 let p = &mut s.procs[proc];
@@ -992,13 +1069,26 @@ impl Checked {
         self.next_state(&s, action).expect("a step")
     }
 
+    /// Delivers `proc`'s oldest request with the given fate.
+    pub fn deliver(&self, s: Sys, proc: usize, fate: Fate) -> Sys {
+        let action = Action::Deliver {
+            proc,
+            request: 0,
+            fate,
+        };
+        self.next_state(&s, action).expect("a step")
+    }
+
+    /// Crashes `proc`.
+    pub fn crash(&self, s: Sys, proc: usize) -> Sys {
+        self.next_state(&s, Action::Crash { proc }).expect("a step")
+    }
+
     /// Delivers `proc`'s requests (and the ones they lead to) until it has
     /// none outstanding.
     pub fn drain(&self, mut s: Sys, proc: usize) -> Sys {
         while !s.procs[proc].outbox.is_empty() {
-            s = self
-                .next_state(&s, Action::Deliver { proc, request: 0 })
-                .expect("a step");
+            s = self.deliver(s, proc, Fate::Ok);
         }
         s
     }
@@ -1031,6 +1121,7 @@ pub fn late_writer(observe_bound: bool) -> Config {
         max_manifest: 4,
         observe_bound,
         renew_leases: true,
+        max_faults: 0,
     }
 }
 
@@ -1044,5 +1135,31 @@ pub fn small() -> Config {
         max_manifest: 3,
         observe_bound: true,
         renew_leases: true,
+        max_faults: 0,
+    }
+}
+
+/// The delayed-write scenario: the applier deletes `k` (then writes more,
+/// so later checkpoints have work); another writer's older put of `k` is
+/// held in flight past its lease.
+pub fn delayed_write() -> Config {
+    Config {
+        scripts: vec![
+            vec![Write::Delete("k"), Write::Put("x", "1")],
+            vec![Write::Put("k", "old")],
+        ],
+        max_clock: 3,
+        lease_ttl: 1,
+        max_manifest: 4,
+        observe_bound: true,
+        renew_leases: true,
+        max_faults: 0,
+    }
+}
+
+impl Sys {
+    /// Writes `proc` had acknowledged.
+    pub fn acked(&self, proc: usize) -> &[(Bytes, Version)] {
+        &self.procs[proc].acked
     }
 }

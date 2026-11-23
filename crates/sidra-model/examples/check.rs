@@ -1,5 +1,5 @@
 //! Runs the model checker with progress reports:
-//!     cargo run --release -p sidra-model --example check            # exhaustive, small scenario
+//!     cargo run --release -p sidra-model --example check [faults]   # exhaustive, small scenario
 //!     cargo run --release -p sidra-model --example check no-bound   # the bug, by random walks
 use sidra_model::{late_writer, model, small};
 use stateright::report::WriteReporter;
@@ -26,12 +26,19 @@ fn main() {
                     .is_some()
             );
         }
-        _ => {
-            let checker = model(small())
-                .checker()
-                .threads(threads)
-                .spawn_bfs()
-                .report(&mut reporter);
+        faults => {
+            let max_faults = match faults {
+                Some("faults") => 1,
+                _ => 0,
+            };
+            let checker = model(sidra_model::Config {
+                max_faults,
+                ..small()
+            })
+            .checker()
+            .threads(threads)
+            .spawn_bfs()
+            .report(&mut reporter);
             checker.assert_properties();
         }
     }
