@@ -26,6 +26,9 @@ use crate::wal::{self, WalBatch};
 pub struct Tails {
     batches: BTreeMap<WriterId, BTreeMap<u64, Arc<WalBatch>>>,
     mem: Memtable,
+    /// Bytes of every batch held, which is what memory holds: `mem` keeps one
+    /// version per key, so repeated overwrites barely grow it.
+    retained: usize,
     /// When the oldest unapplied entry was first seen.
     pub since_ms: Option<u64>,
 }
@@ -39,12 +42,17 @@ impl Tails {
         self.batches.values().all(BTreeMap::is_empty)
     }
 
+    pub fn retained_bytes(&self) -> usize {
+        self.retained
+    }
+
     fn add(&mut self, seq: u64, batch: Arc<WalBatch>, now_ms: u64) {
         let log = self.batches.entry(batch.writer).or_default();
         if log.contains_key(&seq) {
             return;
         }
         self.mem.apply(batch.ops.iter().cloned());
+        self.retained += batch_bytes(&batch);
         log.insert(seq, batch);
         self.since_ms.get_or_insert(now_ms);
     }
@@ -56,6 +64,12 @@ impl Tails {
             log.retain(|seq, _| *seq > upto);
         });
         self.batches.retain(|_, log| !log.is_empty());
+        self.retained = self
+            .batches
+            .values()
+            .flat_map(|log| log.values())
+            .map(|b| batch_bytes(b))
+            .sum();
         self.mem = self.batches.values().flat_map(|log| log.values()).fold(
             Memtable::default(),
             |mut mem, b| {
@@ -87,6 +101,13 @@ impl Tails {
     }
 }
 
+fn batch_bytes(b: &WalBatch) -> usize {
+    b.ops
+        .iter()
+        .map(|(k, v)| crate::types::entry_bytes(k, v.msg.encoded_len()))
+        .sum()
+}
+
 /// What a refresh pulls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -94,6 +115,25 @@ pub enum Scope {
     AllWriters,
     /// New manifests only: other writers' writes appear once applied.
     ManifestOnly,
+}
+
+/// What a refresh brought in.
+#[derive(Debug, Default)]
+pub struct Pulled {
+    pub changed: bool,
+    /// Writers whose logs couldn't be read (their store is down). Their
+    /// entries stay where they were; everyone else's came in.
+    pub unreachable: Vec<(WriterId, Error)>,
+}
+
+impl Pulled {
+    /// Fails if any log was unreachable: for reads that promise every write.
+    pub fn complete(self) -> Result<()> {
+        match self.unreachable.into_iter().next() {
+            Some((_, e)) => Err(e),
+            None => Ok(()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -153,6 +193,10 @@ impl Follower {
         &self.logs
     }
 
+    pub fn manifest(&self) -> Arc<Manifest> {
+        self.view.read().manifest.clone()
+    }
+
     pub fn view(&self) -> View {
         self.view.read().clone()
     }
@@ -165,8 +209,9 @@ impl Follower {
         }
     }
 
+    /// Bytes of unapplied batches held in memory.
     pub fn tails_bytes(&self) -> usize {
-        self.view.read().tails.mem.bytes()
+        self.view.read().tails.retained
     }
 
     /// Adds this process's own durable batch without waiting for a poll.
@@ -196,8 +241,9 @@ impl Follower {
 
     /// Pulls new manifests and, for `Scope::AllWriters`, other writers' log
     /// entries. `discover` also LISTs, to find new writers and to catch up
-    /// when consecutive probing can't. Returns whether anything new arrived.
-    pub async fn refresh(&self, discover: bool, scope: Scope, now_ms: u64) -> Result<bool> {
+    /// when consecutive probing can't. One writer's unreachable log store
+    /// doesn't hold up the others (see `Pulled`).
+    pub async fn refresh(&self, discover: bool, scope: Scope, now_ms: u64) -> Result<Pulled> {
         let _guard = self.refreshing.lock().await;
         let store = self.nodes.store();
         if discover {
@@ -242,12 +288,26 @@ impl Follower {
                 .collect();
             (applied, starts)
         };
-        let fresh = futures::future::try_join_all(
+        let results = futures::future::join_all(
             starts
                 .into_iter()
-                .map(|(w, from)| read_log_from(&self.logs, w, from)),
+                .map(|(w, from)| async move { (w, read_log_from(&self.logs, w, from).await) }),
         )
-        .await?;
+        .await;
+        // Store failures (after retries) mean that store is down; anything
+        // else, such as corruption, fails the refresh.
+        let mut unreachable = Vec::new();
+        let mut fresh = Vec::new();
+        for (w, r) in results {
+            match r {
+                Ok(entries) => fresh.push(entries),
+                Err(e) if e.is_retryable() => {
+                    tracing::warn!(writer = %w, %e, "writer's log unreachable");
+                    unreachable.push((w, e));
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
         let changed = newer.is_some() || fresh.iter().any(|f| !f.is_empty());
         let mut v = self.view.write();
@@ -264,7 +324,10 @@ impl Follower {
         });
         drop(v);
         self.installed.notify_waiters();
-        Ok(changed)
+        Ok(Pulled {
+            changed,
+            unreachable,
+        })
     }
 }
 

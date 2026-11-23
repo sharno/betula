@@ -26,6 +26,12 @@ pub struct Manifest {
     /// above it that exist in storage are orphans of a writer that died
     /// before publishing.
     pub segment_watermark: SegmentId,
+    /// Writers move their clocks past this before writing (after writing
+    /// their lease), and the next checkpoint drops only tombstones below it.
+    /// That keeps a writer whose lease the applier hasn't seen yet, possibly
+    /// with a lagging clock, from writing a version older than a tombstone
+    /// already dropped. Never decreases.
+    pub tombstone_bound: u64,
     /// Every segment this tree references, with its live bytes.
     pub segments: SegmentTable,
     /// Segments the previous tree referenced and this one doesn't. Deleted by
@@ -45,6 +51,7 @@ impl Manifest {
                 epoch: Epoch(0),
                 seq: 0,
             },
+            tombstone_bound: 0,
             segments: SegmentTable::new(),
             dead: Vec::new(),
             created_at_ms: now_ms,

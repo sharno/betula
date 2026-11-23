@@ -38,7 +38,7 @@ impl Ts {
     };
 }
 
-const LOGICAL_BITS: u32 = 16;
+pub(crate) const LOGICAL_BITS: u32 = 16;
 
 #[derive(Debug, Default)]
 pub struct Hlc {

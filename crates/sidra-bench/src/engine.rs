@@ -67,6 +67,7 @@ impl Engine {
                         internal_max_bytes: params.internal_bytes,
                         max_fanout: params.fanout,
                         max_runs_per_child: params.max_runs,
+                        ..defaults.tree
                     },
                     cache: sidra::CacheConfig {
                         inner_bytes: params.inner_cache_bytes,
@@ -142,7 +143,10 @@ impl Engine {
                 pairs.into_iter().for_each(|(k, v)| {
                     batch.put_bytes(k, v);
                 });
-                dbs[slot as usize % dbs.len()].write(batch).await?
+                dbs[slot as usize % dbs.len()]
+                    .write(batch)
+                    .await
+                    .map(drop)?
             }
             Engine::Slatedb(db) => {
                 let batch = pairs
@@ -165,7 +169,10 @@ impl Engine {
                 keys.iter().for_each(|k| {
                     batch.delete(k);
                 });
-                dbs[slot as usize % dbs.len()].write(batch).await?
+                dbs[slot as usize % dbs.len()]
+                    .write(batch)
+                    .await
+                    .map(drop)?
             }
             Engine::Slatedb(db) => {
                 let batch = keys.iter().fold(slatedb::WriteBatch::new(), |mut b, k| {

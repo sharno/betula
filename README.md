@@ -236,8 +236,17 @@ writer C ─► writers/C/wal/{seq} ─┘
 - No compare-and-set or transactions across writers (yet).
 - Readers and snapshots must refresh within the GC retention (default
   10 min).
-- Tombstone safety assumes clock skew between processes stays within the
-  lease margin (a quarter of the lease TTL).
+- Tombstones are dropped only below a bound every new writer moves its clock
+  past before writing, so a writer that starts late with a lagging clock
+  can't undercut one. Writers near lease expiry still rely on clock skew
+  staying within the lease margin (a quarter of the lease TTL): a writer
+  stops acknowledging writes by its own clock, the applier judges expiry by
+  its own.
+- One writer's unreachable log store (a regional outage) doesn't stall the
+  others: their writes keep getting applied, tombstone collection pauses,
+  and `Freshness::Latest` reads fail rather than miss writes.
+- The unapplied backlog limit counts every unapplied batch held, so
+  overwrites of one key apply backpressure too.
 - By default every writer pulls every other writer's log to show unapplied
   writes, which costs about (writers − 1) × log bytes in GETs. With
   `poll.follow = "manifest_only"` a writer sees others' writes once applied

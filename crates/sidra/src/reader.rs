@@ -155,8 +155,8 @@ impl DbReader {
         self.shared
             .follower
             .refresh(true, Scope::AllWriters, self.shared.clock.now_ms())
-            .await
-            .map(|_| ())
+            .await?
+            .complete()
     }
 
     pub fn manifest_id(&self) -> ManifestId {

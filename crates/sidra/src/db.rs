@@ -218,6 +218,13 @@ impl Shared {
         }
     }
 
+    /// Moves the clock past the newest manifest's tombstone bound. Required
+    /// once after the lease is written and before the first write; repeated
+    /// on every poll to keep the clock close to other writers'.
+    fn observe_manifest(&self) {
+        self.hlc.observe(self.follower.manifest().tombstone_bound);
+    }
+
     fn check(&self) -> Result<()> {
         self.fatal.get().map_or(Ok(()), |e| Err(e.clone()))
     }
@@ -437,9 +444,11 @@ impl Shared {
             primary_alive,
         } = self.lease_floor().await?;
         let leased = started.elapsed();
-        self.follower
+        let unreachable = self
+            .follower
             .refresh(false, Scope::AllWriters, self.now())
-            .await?;
+            .await?
+            .unreachable;
         let pulled = started.elapsed();
         let misses_before = self.nodes.cache_stats().misses;
         let view = self.follower.view();
@@ -453,10 +462,20 @@ impl Shared {
         }
         // A tombstone can go once no writer can still produce an older
         // version of its key. (Older versions already in the tree are carried
-        // down to the leaf whenever the leaf is rewritten.)
-        let drop_below = Ts {
-            hlc: floor,
-            writer: WriterId(0),
+        // down to the leaf whenever the leaf is rewritten.) Writers with a
+        // live lease stay above `floor`. A writer whose lease this scan
+        // missed wrote it after the previous manifest was published, then
+        // read a manifest at least that new and moved its clock past its
+        // `tombstone_bound` before writing: so the bound published last time
+        // caps what's safe to drop now. Clock skew doesn't enter into it.
+        // A writer whose log couldn't be pulled may hold entries older than
+        // the floor, so drop no tombstones until it's reachable again.
+        let drop_below = match unreachable.is_empty() {
+            true => Ts {
+                hlc: floor.min(view.manifest.tombstone_bound),
+                writer: WriterId(0),
+            },
+            false => Ts::MIN,
         };
         let out = tree::Outputs {
             inner: app.next_segment,
@@ -509,6 +528,7 @@ impl Shared {
                 .filter(|(w, _)| present.contains(w))
                 .collect(),
             segment_watermark: app.next_segment,
+            tombstone_bound: view.manifest.tombstone_bound.max(floor),
             segments: table,
             dead,
             created_at_ms: self.now(),
@@ -696,10 +716,12 @@ impl Db {
         });
         shared.renew_lease().await?;
         let joined = async {
+            // After the lease: see the note on `Manifest::tombstone_bound`.
             shared
                 .follower
                 .refresh(true, shared.scope(), shared.now())
                 .await?;
+            shared.observe_manifest();
             shared.maybe_claim().await
         };
         if let Err(e) = joined.await {
@@ -745,32 +767,34 @@ impl Db {
     pub async fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<()> {
         let mut batch = WriteBatch::new();
         batch.put(key, value);
-        self.write(batch).await
+        self.write(batch).await.map(drop)
     }
 
     /// Writes one key without copying; returns once durable.
     pub async fn put_bytes(&self, key: Bytes, value: Bytes) -> Result<()> {
         let mut batch = WriteBatch::new();
         batch.put_bytes(key, value);
-        self.write(batch).await
+        self.write(batch).await.map(drop)
     }
 
     pub async fn delete(&self, key: impl AsRef<[u8]>) -> Result<()> {
         let mut batch = WriteBatch::new();
         batch.delete(key);
-        self.write(batch).await
+        self.write(batch).await.map(drop)
     }
 
-    /// Writes the batch atomically; returns once durable.
-    pub async fn write(&self, batch: WriteBatch) -> Result<()> {
+    /// Writes the batch atomically; returns once durable, with the timestamp
+    /// every op in it carries (`None` for an empty batch). Across writers, the
+    /// op with the newest timestamp wins.
+    pub async fn write(&self, batch: WriteBatch) -> Result<Option<Ts>> {
         self.write_with(batch, WriteOptions::default()).await
     }
 
-    pub async fn write_with(&self, batch: WriteBatch, opts: WriteOptions) -> Result<()> {
+    pub async fn write_with(&self, batch: WriteBatch, opts: WriteOptions) -> Result<Option<Ts>> {
         let durability = opts.durability;
         self.shared.check()?;
         if batch.ops.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let hlc = self.shared.hlc.now(self.shared.now());
         *self.shared.inflight.lock().entry(hlc).or_default() += 1;
@@ -794,10 +818,10 @@ impl Db {
             Durability::Queued => (None, None),
         };
         self.send(WalCmd::Write { hlc, ops, done }).await?;
-        match wait {
-            Some(rx) => rx.await.map_err(|_| Error::Closed)?,
-            None => Ok(()),
+        if let Some(rx) = wait {
+            rx.await.map_err(|_| Error::Closed)??;
         }
+        Ok(Some(ts))
     }
 
     pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>> {
@@ -856,8 +880,8 @@ impl Db {
         self.shared
             .follower
             .refresh(true, Scope::AllWriters, self.shared.now())
-            .await
-            .map(|_| ())
+            .await?
+            .complete()
     }
 
     /// Makes every write sent so far durable.
@@ -927,7 +951,7 @@ impl Db {
             manifest_id: v.manifest_id,
             manifest_age: ms(v.manifest.created_at_ms),
             tree: v.manifest.tree,
-            unapplied_bytes: v.tails.mem().bytes(),
+            unapplied_bytes: v.tails.retained_bytes(),
             unapplied_age: v.tails.since_ms.map(ms),
             segments: v.manifest.segments.len(),
             segment_bytes: v.manifest.segments.values().map(|u| u.total).sum(),
@@ -1170,8 +1194,11 @@ async fn follow_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
             .await
         {
             // Poll fast while things arrive, back off while quiet.
-            Ok(true) => period = shared.cfg.poll.interval,
-            Ok(false) => period = (period * 2).min(shared.cfg.poll.max_interval),
+            Ok(p) if p.changed => {
+                shared.observe_manifest();
+                period = shared.cfg.poll.interval
+            }
+            Ok(_) => period = (period * 2).min(shared.cfg.poll.max_interval),
             Err(e) => {
                 tracing::warn!(%e, "refresh failed");
                 continue;

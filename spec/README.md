@@ -35,6 +35,14 @@ for each, so the invariants are strong enough to catch these bugs:
 | `BugDiscovery.cfg` | the checkpoint pulls every writer whose lease it read | violation in 14 steps |
 | `BugCarryDown.cfg` | a leaf rewrite carries the buffered versions above it down | violation in 16 steps |
 | `BugUnfenced.cfg` | manifest publish is put-if-absent | violation in 11 steps |
+| `BugBound.cfg` | tombstones are dropped only below the previous manifest's bound, which new writers move their clocks past | violation in 11 steps |
+
+Clock readings are unconstrained (any skew), which the model gained after a
+review found the `BugBound` bug: until then it had one global clock, so a
+late writer with a lagging clock couldn't happen. With free clock readings,
+`Sidra.cfg` and `TwoAppliers.cfg` no longer finish within 48 GB of memory;
+`check.sh` runs them only with `FULL=1`. The protocol is moving to a
+sans-IO Rust core checked with Stateright, which replaces this model.
 
 `BugDiscovery` reproduced a real bug that randomized testing found once and
 then couldn't reproduce. The applier computed the floor from every writer's
@@ -77,5 +85,7 @@ cd crates/sidra && cargo kani
   (`tests/model.rs`), not by these proofs.
 - Segment GC and the cleaner's relocation are checked only by the accounting
   invariant in the proptest.
-- The model assumes lease expiry is honored. Its safety rests on clock skew
-  between processes staying within the lease margin.
+- The model assumes lease expiry is honored (a writer stops before the
+  applier treats its lease as expired), which in the code rests on clock
+  skew staying within the lease margin. Other clock readings are
+  unconstrained.

@@ -38,6 +38,12 @@ pub struct TreeConfig {
     /// A child with more buffered runs than this is flushed, which bounds
     /// the runs a read checks per level.
     pub max_runs_per_child: usize,
+    /// A subtree is rewritten just to drop its tombstones only once they've
+    /// been droppable this long (by timestamp). Younger ones go whenever
+    /// their leaf is rewritten anyway; purging them at once would rewrite
+    /// every leaf a delete reached a second time, a checkpoint later.
+    #[serde(with = "humantime_serde")]
+    pub purge_tombstones_after: std::time::Duration,
 }
 
 impl Default for TreeConfig {
@@ -47,6 +53,7 @@ impl Default for TreeConfig {
             internal_max_bytes: 4 << 20,
             max_fanout: 64,
             max_runs_per_child: 16,
+            purge_tombstones_after: std::time::Duration::from_secs(60),
         }
     }
 }
@@ -55,6 +62,12 @@ impl TreeConfig {
     fn leaf_split_target(&self) -> usize {
         self.leaf_max_bytes * 3 / 4
     }
+}
+
+/// A duration in hybrid-clock units (milliseconds above the logical bits).
+fn hlc_span(d: std::time::Duration) -> u64 {
+    let bits = crate::hlc::LOGICAL_BITS;
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX >> bits) << bits
 }
 
 fn corrupt(ptr: NodePtr, what: &str) -> Error {
@@ -443,6 +456,12 @@ pub async fn apply(
         compression,
         victims,
         drop_below: drop_tombstones_below,
+        purge_below: Ts {
+            hlc: drop_tombstones_below
+                .hlc
+                .saturating_sub(hlc_span(cfg.purge_tombstones_after)),
+            ..drop_tombstones_below
+        },
         dirty: HashSet::new(),
         inner: Region::new(out.inner),
         leaves: Region::new(out.leaves),
@@ -472,6 +491,8 @@ struct Writer<'a> {
     victims: &'a HashSet<SegmentId>,
     /// Tombstones older than this are dropped when their leaf is rewritten.
     drop_below: Ts,
+    /// Subtrees whose oldest tombstone is below this get rewritten to drop it.
+    purge_below: Ts,
     /// Internal nodes with a victim node or run at or below them.
     dirty: HashSet<NodePtr>,
     inner: Region,
@@ -501,7 +522,7 @@ fn split_by_child(pivots: &[Bytes], msgs: Vec<(Bytes, Version)>) -> Parts {
 
 impl Writer<'_> {
     fn needs_purge(&self, child: &Child) -> bool {
-        child.oldest_tombstone.is_some_and(|t| t < self.drop_below)
+        child.oldest_tombstone.is_some_and(|t| t < self.purge_below)
     }
 
     /// Whether the child or its subtree holds a node that must move out of a
@@ -566,7 +587,7 @@ impl Writer<'_> {
                 if msgs.is_empty()
                     && !self.victims.contains(&r.ptr.seg)
                     && !self.dirty.contains(&r.ptr)
-                    && !r.oldest_tombstone.is_some_and(|t| t < self.drop_below) =>
+                    && !r.oldest_tombstone.is_some_and(|t| t < self.purge_below) =>
             {
                 return Ok(Some(r));
             }
