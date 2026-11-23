@@ -71,8 +71,8 @@ mod wal;
 pub use admin::{Admin, ManifestInfo, WriterInfo};
 pub use codec::Compression;
 pub use db::{
-    Clock, Db, DbBuilder, Durability, Freshness, Metrics, ReadOptions, SystemClock, WriteBatch,
-    WriteOptions,
+    Audit, Clock, Db, DbBuilder, Durability, Freshness, Metrics, ReadOptions, SystemClock,
+    WriteBatch, WriteOptions,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use gc::{GcConfig, GcStats};

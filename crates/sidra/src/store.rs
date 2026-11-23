@@ -6,6 +6,11 @@
 //! - `writers/{writer}/lease`: each writer's liveness and timestamp floor.
 //! - `seg/{epoch:020}-{seq:020}.seg`: one per checkpoint, holding every node
 //!   that checkpoint wrote, back to back. Nodes are read with ranged GETs.
+//!
+//! Every request retries transient failures here, so callers see a store
+//! error only after retries ran out. All requests are idempotent: a
+//! put-if-absent whose response was lost conflicts with itself on retry, and
+//! callers compare the existing object.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,10 +18,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
 use crate::error::{Error, Result};
 use crate::hlc::WriterId;
+use crate::retry::retry;
 use crate::types::{Epoch, ManifestId, SegmentId};
 
 const COALESCE_GAP: u64 = 128 << 10;
@@ -139,15 +145,18 @@ impl Store {
     }
 
     pub async fn get(&self, path: &Path) -> Result<Option<Bytes>> {
-        match self.os.get(path).await {
-            Ok(r) => {
-                let b = r.bytes().await?;
-                self.got(&b);
-                Ok(Some(b))
+        retry("get", || async {
+            match self.os.get(path).await {
+                Ok(r) => {
+                    let b = r.bytes().await?;
+                    self.got(&b);
+                    Ok(Some(b))
+                }
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(e.into()),
             }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        })
+        .await
     }
 
     pub async fn get_range(
@@ -155,14 +164,17 @@ impl Store {
         path: &Path,
         range: std::ops::Range<u64>,
     ) -> Result<Option<Bytes>> {
-        match self.os.get_range(path, range).await {
-            Ok(b) => {
-                self.got(&b);
-                Ok(Some(b))
+        retry("get range", || async {
+            match self.os.get_range(path, range.clone()).await {
+                Ok(b) => {
+                    self.got(&b);
+                    Ok(Some(b))
+                }
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(e.into()),
             }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        })
+        .await
     }
 
     /// Several ranges of one object; nearby ranges are fetched together.
@@ -174,32 +186,42 @@ impl Store {
         // Batched reads target inner segments (inner nodes and runs only;
         // leaves live in their own segments), so merging across gaps of dead
         // nodes costs little and saves requests.
-        let fetched = object_store::coalesce_ranges(
-            ranges,
-            |r| async move {
-                let b = self.os.get_range(path, r).await?;
-                self.got(&b);
-                Ok(b)
-            },
-            COALESCE_GAP,
-        )
-        .await;
-        match fetched {
-            Ok(b) => Ok(Some(b)),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        retry("get ranges", || async {
+            let fetched = object_store::coalesce_ranges(
+                ranges,
+                |r| async move {
+                    let b = self.os.get_range(path, r).await?;
+                    self.got(&b);
+                    Ok(b)
+                },
+                COALESCE_GAP,
+            )
+            .await;
+            match fetched {
+                Ok(b) => Ok(Some(b)),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
     }
 
     pub async fn put(&self, path: &Path, data: Bytes) -> Result<()> {
-        self.put_counted(data.len());
-        self.os.put(path, PutPayload::from(data)).await?;
-        Ok(())
+        retry("put", || async {
+            self.put_counted(data.len());
+            self.os.put(path, PutPayload::from(data.clone())).await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Put-if-absent. On conflict, returns the existing object so callers can
-    /// tell a retried success from a lost race.
+    /// tell a retried success (whose response was lost) from a lost race.
     pub async fn put_create(&self, path: &Path, data: Bytes) -> Result<CreateOutcome> {
+        retry("put if absent", || self.put_create_once(path, data.clone())).await
+    }
+
+    async fn put_create_once(&self, path: &Path, data: Bytes) -> Result<CreateOutcome> {
         let opts = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
@@ -247,15 +269,17 @@ impl Store {
         let mut paths = paths.into_iter().peekable();
         while paths.peek().is_some() {
             let chunk: Vec<Path> = paths.by_ref().take(batch).collect();
-            let input = stream::iter(chunk.into_iter().map(Ok)).boxed();
-            self.os
-                .delete_stream(input)
-                .map(|r| match r {
-                    Ok(_) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-                    Err(e) => Err(Error::from(e)),
-                })
-                .try_collect::<Vec<()>>()
-                .await?;
+            retry("delete", || {
+                let input = stream::iter(chunk.clone().into_iter().map(Ok)).boxed();
+                self.os
+                    .delete_stream(input)
+                    .map(|r| match r {
+                        Ok(_) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                        Err(e) => Err(Error::from(e)),
+                    })
+                    .try_collect::<Vec<()>>()
+            })
+            .await?;
             if let (Some(gap), true) = (gap, paths.peek().is_some()) {
                 tokio::time::sleep(gap).await;
             }
@@ -263,14 +287,20 @@ impl Store {
         Ok(())
     }
 
+    async fn list(&self, prefix: &Path, offset: Option<&Path>) -> Result<Vec<ObjectMeta>> {
+        retry("list", || async {
+            bump(&self.counters.lists, 1);
+            let listing = match offset {
+                Some(o) => self.os.list_with_offset(Some(prefix), o),
+                None => self.os.list(Some(prefix)),
+            };
+            Ok(listing.try_collect().await?)
+        })
+        .await
+    }
+
     async fn list_names(&self, dir: &str, offset: Option<Path>) -> Result<Vec<String>> {
-        bump(&self.counters.lists, 1);
-        let prefix = self.dir(dir);
-        let listing = match &offset {
-            Some(o) => self.os.list_with_offset(Some(&prefix), o),
-            None => self.os.list(Some(&prefix)),
-        };
-        let metas: Vec<_> = listing.try_collect().await?;
+        let metas = self.list(&self.dir(dir), offset.as_ref()).await?;
         Ok(metas
             .into_iter()
             .filter_map(|m| m.location.filename().map(str::to_string))
@@ -289,11 +319,14 @@ impl Store {
     }
 
     pub async fn list_writers(&self) -> Result<Vec<WriterId>> {
-        bump(&self.counters.lists, 1);
-        let listing = self
-            .os
-            .list_with_delimiter(Some(&self.dir("writers")))
-            .await?;
+        let listing = retry("list", || async {
+            bump(&self.counters.lists, 1);
+            Ok(self
+                .os
+                .list_with_delimiter(Some(&self.dir("writers")))
+                .await?)
+        })
+        .await?;
         Ok(listing
             .common_prefixes
             .iter()
@@ -303,8 +336,7 @@ impl Store {
 
     pub async fn list_wals(&self, writer: WriterId) -> Result<Vec<u64>> {
         let prefix = self.writer_dir(writer).join("wal");
-        bump(&self.counters.lists, 1);
-        let metas: Vec<_> = self.os.list(Some(&prefix)).try_collect().await?;
+        let metas = self.list(&prefix, None).await?;
         let mut seqs: Vec<u64> = metas
             .iter()
             .filter_map(|m| m.location.filename().and_then(|n| parse_num(n, ".wal")))

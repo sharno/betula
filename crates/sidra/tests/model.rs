@@ -21,9 +21,13 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use proptest::prelude::*;
 use sidra::{
     ApplierRole, CacheConfig, CheckpointConfig, CleanerConfig, Clock, Db, DbReader, Durability,
-    Error, Gc, KeyRange, LeaseConfig, PollConfig, ReaderSettings, SegmentId, Settings, TreeConfig,
-    WalConfig, Warm, WriteBatch, WriteOptions,
+    Error, ErrorKind, Gc, KeyRange, LeaseConfig, PollConfig, ReaderSettings, SegmentId, Settings,
+    TreeConfig, WalConfig, Warm, WriteBatch, WriteOptions,
 };
+
+#[path = "support/faulty.rs"]
+mod faulty;
+use faulty::{Faults, Faulty};
 
 const ROOT: &str = "db";
 const WRITERS: usize = 3;
@@ -125,18 +129,17 @@ async fn open(os: &Arc<dyn ObjectStore>, clock: &Arc<ManualClock>) -> Db {
 
 /// The manifest's live bytes per segment equal the bytes of reachable nodes.
 async fn assert_accounting(db: &Db) {
-    let reachable = db.tree_shape().await.unwrap().nodes.iter().fold(
-        BTreeMap::<SegmentId, u64>::new(),
-        |mut m, p| {
+    let audit = until_ok("audit", || db.audit()).await;
+    let reachable = audit
+        .shape
+        .nodes
+        .iter()
+        .fold(BTreeMap::<SegmentId, u64>::new(), |mut m, p| {
             *m.entry(p.seg).or_default() += u64::from(p.len);
             m
-        },
-    );
-    let table: BTreeMap<SegmentId, u64> = db
-        .segment_table()
-        .iter()
-        .map(|(id, u)| (*id, u.live))
-        .collect();
+        });
+    let table: BTreeMap<SegmentId, u64> =
+        audit.segments.iter().map(|(id, u)| (*id, u.live)).collect();
     assert_eq!(table, reachable, "segment accounting");
 }
 
@@ -150,6 +153,9 @@ enum Op {
     Checkpoint,
     Claim(usize),
     Reopen(usize),
+    /// The writer dies without closing; an applier dies this many
+    /// microseconds into a checkpoint.
+    Crash(usize, u64),
     ReaderScan,
 }
 
@@ -168,7 +174,8 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (w.clone(), 0u8..60, 0u8..60).prop_map(|(w, a, b)| Op::Scan(w, a, b)),
         2 => Just(Op::Checkpoint),
         1 => w.clone().prop_map(Op::Claim),
-        1 => w.prop_map(Op::Reopen),
+        1 => w.clone().prop_map(Op::Reopen),
+        1 => (w, 0u64..3000).prop_map(|(w, us)| Op::Crash(w, us)),
         1 => Just(Op::ReaderScan),
     ]
 }
@@ -183,70 +190,184 @@ fn model_range(model: &Model, range: &KeyRange) -> Vec<(Bytes, Bytes)> {
 }
 
 /// Makes every writer's queued writes durable and lets `reader` see them.
-async fn sync(dbs: &[Db], reader: usize) {
-    for db in dbs {
-        db.flush_wal().await.unwrap();
+/// Retries an operation that failed only because the store did (injected
+/// faults); any other error fails the test.
+async fn until_ok<T, Fut>(what: &str, mut f: impl FnMut() -> Fut) -> T
+where
+    Fut: std::future::Future<Output = sidra::Result<T>>,
+{
+    let mut last = None;
+    for _ in 0..100 {
+        match f().await {
+            Ok(v) => return v,
+            Err(e) if e.is_retryable() => last = Some(e),
+            Err(e) => panic!("{what}: {e}"),
+        }
     }
-    dbs[reader].refresh().await.unwrap();
+    panic!("{what}: still failing after 100 attempts: {last:?}");
+}
+
+/// Several writers on one store, optionally behind injected faults.
+struct World {
+    os: Arc<dyn ObjectStore>,
+    clock: Arc<ManualClock>,
+    dbs: Vec<Db>,
+    faulty: Option<Arc<Faulty>>,
+}
+
+impl World {
+    async fn new(faults: Option<(Faults, u64)>) -> Self {
+        let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let faulty = faults.map(|(f, seed)| Arc::new(Faulty::new(mem, f, seed)));
+        let os: Arc<dyn ObjectStore> = match &faulty {
+            Some(f) => f.clone(),
+            None => Arc::new(InMemory::new()),
+        };
+        let clock = ManualClock::new();
+        let mut w = Self {
+            os,
+            clock,
+            dbs: Vec::new(),
+            faulty,
+        };
+        for _ in 0..WRITERS {
+            let db = w.open().await;
+            w.dbs.push(db);
+        }
+        w
+    }
+
+    async fn open(&self) -> Db {
+        until_ok("open", || {
+            Db::builder(ROOT, self.os.clone())
+                .with_settings(tiny_config())
+                .with_clock(self.clock.clone())
+                .build()
+        })
+        .await
+    }
+
+    /// Replaces writer `w` with a fresh one.
+    async fn reopen(&mut self, w: usize) {
+        let fresh = self.open().await;
+        let old = std::mem::replace(&mut self.dbs[w], fresh);
+        match (old.close().await, &self.faulty) {
+            (Ok(()), _) => {}
+            // A lost writer, or a store failure while releasing the role.
+            (Err(e), Some(_)) if e.is_retryable() || e.kind() == ErrorKind::WriterLost => {}
+            (Err(e), _) => panic!("close: {e}"),
+        }
+    }
+
+    /// Writes until acknowledged, replacing the writer if it's lost (then
+    /// the write may have landed already; repeating it is harmless).
+    async fn write(&mut self, w: usize, batch: WriteBatch, opts: WriteOptions) {
+        for _ in 0..100 {
+            match self.dbs[w].write_with(batch.clone(), opts).await {
+                Ok(()) => return,
+                Err(e) if e.is_retryable() => {}
+                Err(e) if e.kind() == ErrorKind::WriterLost => self.reopen(w).await,
+                Err(e) => panic!("write: {e}"),
+            }
+        }
+        panic!("write: still failing");
+    }
+
+    /// Kills writer `w` (an applier part-way through a checkpoint) and
+    /// starts a fresh one. Queued writes are flushed first: only
+    /// acknowledged writes must survive a crash.
+    async fn crash(&mut self, w: usize, after: Duration) {
+        match self.dbs[w].flush_wal().await {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::WriterLost => {}
+            Err(e) => panic!("flush: {e}"),
+        }
+        if self.dbs[w].is_applier() {
+            // Cancelling the checkpoint stops it at whatever await it
+            // reached: segments may be uploaded with no manifest.
+            let _ = tokio::time::timeout(after, self.dbs[w].checkpoint()).await;
+        }
+        let fresh = self.open().await;
+        drop(std::mem::replace(&mut self.dbs[w], fresh));
+    }
+
+    /// Makes every durable write visible to writer `reader`.
+    async fn sync(&mut self, reader: usize) {
+        for w in 0..self.dbs.len() {
+            match self.dbs[w].flush_wal().await {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::WriterLost => self.reopen(w).await,
+                Err(e) => panic!("flush: {e}"),
+            }
+        }
+        until_ok("refresh", || self.dbs[reader].refresh()).await;
+    }
 }
 
 /// Runs a checkpoint on whoever holds the applier role, claiming it with
-/// writer 0 if nobody does.
+/// writer 0 if nobody does. A store failure just means no checkpoint.
 async fn checkpoint(dbs: &[Db]) {
     // Released roles are taken by background claims too, so the claim can
     // lose a race; then whoever won is the applier.
     let applier = loop {
         match dbs.iter().position(Db::is_applier) {
             Some(i) => break i,
-            None if dbs[0].claim_applier().await.unwrap() => break 0,
-            None => tokio::task::yield_now().await,
+            None => match dbs[0].claim_applier().await {
+                Ok(true) => break 0,
+                Ok(false) => tokio::task::yield_now().await,
+                Err(e) if e.is_retryable() => return,
+                Err(e) => panic!("claim: {e}"),
+            },
         }
     };
     match dbs[applier].checkpoint().await {
         Ok(()) => assert_accounting(&dbs[applier]).await,
-        // Lost the role to a concurrent claim: fine.
+        // Lost the role to a concurrent claim, or the store failed: fine.
         Err(Error::NotApplier) => {}
+        Err(e) if e.is_retryable() => {}
         Err(e) => panic!("checkpoint: {e}"),
     }
 }
 
-async fn run(ops: Vec<Op>) {
-    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let clock = ManualClock::new();
-    let mut dbs = Vec::new();
-    for _ in 0..WRITERS {
-        dbs.push(open(&os, &clock).await);
-    }
+async fn run(ops: Vec<Op>, faults: Option<(Faults, u64)>) {
+    let mut world = World::new(faults).await;
     let mut model = Model::new();
     for op in ops {
         match op {
             Op::Put(w, k, v) => {
-                clock.tick();
-                dbs[w].put(key(k), v.clone()).await.unwrap();
+                world.clock.tick();
+                let mut batch = WriteBatch::new();
+                batch.put(key(k), &v);
+                world.write(w, batch, WriteOptions::default()).await;
                 model.insert(key(k), Bytes::from(v));
             }
             Op::PutQueued(w, k, v) => {
-                clock.tick();
+                world.clock.tick();
                 let mut batch = WriteBatch::new();
                 batch.put(key(k), &v);
-                let queued = WriteOptions {
-                    durability: Durability::Queued,
+                // A queued write is lost if its writer is lost before the
+                // flush, so under faults only acknowledged writes count.
+                let durability = match world.faulty {
+                    Some(_) => Durability::AwaitDurable,
+                    None => Durability::Queued,
                 };
-                dbs[w].write_with(batch, queued).await.unwrap();
+                world.write(w, batch, WriteOptions { durability }).await;
                 model.insert(key(k), Bytes::from(v));
             }
             Op::Delete(w, k) => {
-                clock.tick();
-                dbs[w].delete(key(k)).await.unwrap();
+                world.clock.tick();
+                let mut batch = WriteBatch::new();
+                batch.delete(key(k));
+                world.write(w, batch, WriteOptions::default()).await;
                 model.remove(&key(k));
             }
             Op::Get(w, k) => {
-                sync(&dbs, w).await;
-                let got = dbs[w].get(&key(k)).await.unwrap();
+                world.sync(w).await;
+                let got = until_ok("get", || world.dbs[w].get(key(k))).await;
                 assert_eq!(got, model.get(&key(k)).cloned(), "get {k} via writer {w}");
             }
             Op::Scan(w, a, b) => {
-                sync(&dbs, w).await;
+                world.sync(w).await;
                 let (lo, hi) = (a.min(b), a.max(b));
                 let ranges = [
                     KeyRange::new(Bound::Included(key(lo)), Bound::Excluded(key(hi))),
@@ -255,34 +376,40 @@ async fn run(ops: Vec<Op>) {
                     KeyRange::new(Bound::Included(key(lo)), Bound::Unbounded),
                 ];
                 for r in ranges {
-                    let got = dbs[w].scan(r.clone()).collect().await.unwrap();
+                    let got = until_ok("scan", || world.dbs[w].scan(r.clone()).collect()).await;
                     assert_eq!(got, model_range(&model, &r), "scan {r:?} via writer {w}");
                 }
             }
-            Op::Checkpoint => checkpoint(&dbs).await,
-            Op::Claim(w) => {
-                dbs[w].claim_applier().await.unwrap();
-            }
-            Op::Reopen(w) => {
-                let old = std::mem::replace(&mut dbs[w], open(&os, &clock).await);
-                old.close().await.unwrap();
-            }
+            Op::Checkpoint => checkpoint(&world.dbs).await,
+            Op::Claim(w) => match world.dbs[w].claim_applier().await {
+                Ok(_) => {}
+                Err(e) if e.is_retryable() => {}
+                Err(e) => panic!("claim: {e}"),
+            },
+            Op::Reopen(w) => world.reopen(w).await,
+            Op::Crash(w, us) => world.crash(w, Duration::from_micros(us)).await,
             Op::ReaderScan => {
-                sync(&dbs, 0).await;
-                let reader = DbReader::builder(ROOT, os.clone())
-                    .with_settings(reader_config())
-                    .build()
-                    .await
-                    .unwrap();
-                let got = reader.scan(KeyRange::all()).collect().await.unwrap();
+                world.sync(0).await;
+                let reader = until_ok("reader open", || {
+                    DbReader::builder(ROOT, world.os.clone())
+                        .with_settings(reader_config())
+                        .build()
+                })
+                .await;
+                let got = until_ok("reader scan", || reader.scan(KeyRange::all()).collect()).await;
                 assert_eq!(got, model_range(&model, &KeyRange::all()), "reader scan");
             }
         }
     }
-    sync(&dbs, 1).await;
-    let all = dbs[1].scan(KeyRange::all()).collect().await.unwrap();
+    // Verify without faults: everything acknowledged survived them.
+    if let Some(f) = &world.faulty {
+        f.set_enabled(false);
+    }
+    world.sync(1).await;
+    let all = world.dbs[1].scan(KeyRange::all()).collect().await.unwrap();
     assert_eq!(all, model_range(&model, &KeyRange::all()));
-    checkpoint(&dbs).await;
+    checkpoint(&world.dbs).await;
+    let World { os, clock, dbs, .. } = world;
     for db in dbs {
         db.close().await.unwrap();
     }
@@ -296,7 +423,25 @@ proptest! {
     #[test]
     fn matches_model(ops in proptest::collection::vec(op(), 1..250)) {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-        rt.block_on(run(ops));
+        rt.block_on(run(ops, None));
+    }
+}
+
+proptest! {
+    // Each retried fault sleeps for the backoff, so cases are slow; raise
+    // with PROPTEST_CASES for stress runs.
+    #![proptest_config(ProptestConfig { cases: 12, ..ProptestConfig::default() })]
+    /// Same, with store requests failing before and after they apply, and
+    /// random delays.
+    #[test]
+    fn matches_model_under_faults(ops in proptest::collection::vec(op(), 1..150), seed in any::<u64>()) {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let faults = Faults {
+            fail_before: 0.05,
+            fail_after: 0.05,
+            max_delay: Duration::from_millis(1),
+        };
+        rt.block_on(run(ops, Some((faults, seed))));
     }
 }
 

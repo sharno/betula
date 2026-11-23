@@ -37,7 +37,6 @@ use crate::location;
 use crate::logs::{Logs, Region, RegionStores};
 use crate::manifest::{self, Manifest, Publish};
 use crate::nodes::{CacheStats, Nodes};
-use crate::retry::retry;
 use crate::segments::{self, SegmentKind, SegmentTable};
 use crate::settings::{ApplierRole, Candidacy, Follow, Gc, Settings};
 use crate::snapshot::DbIterator;
@@ -476,7 +475,7 @@ impl Shared {
         futures::future::try_join_all(
             plan.segments
                 .iter()
-                .map(|segment| retry("segment upload", || self.nodes.upload(segment))),
+                .map(|segment| self.nodes.upload(segment)),
         )
         .await?;
         let new: Vec<(SegmentId, u64, SegmentKind)> = plan
@@ -509,11 +508,7 @@ impl Shared {
             created_at_ms: self.now(),
         };
         let next_id = view.manifest_id.next();
-        match retry("manifest publish", || {
-            manifest::publish(self.store(), next_id, &next)
-        })
-        .await?
-        {
+        match manifest::publish(self.store(), next_id, &next).await? {
             Publish::Published => {
                 let bytes_of = |id: SegmentId| {
                     new.iter()
@@ -551,6 +546,13 @@ impl Shared {
             }
         }
     }
+}
+
+/// See [`Db::audit`].
+#[derive(Clone, Debug)]
+pub struct Audit {
+    pub shape: TreeShape,
+    pub segments: SegmentTable,
 }
 
 struct LeaseScan {
@@ -669,11 +671,22 @@ impl Db {
             cfg,
         });
         shared.renew_lease().await?;
-        shared
-            .follower
-            .refresh(true, shared.scope(), shared.now())
-            .await?;
-        shared.maybe_claim().await?;
+        let joined = async {
+            shared
+                .follower
+                .refresh(true, shared.scope(), shared.now())
+                .await?;
+            shared.maybe_claim().await
+        };
+        if let Err(e) = joined.await {
+            // Otherwise every failed open leaves a lease that others read
+            // (and pull a log for) until it expires.
+            let lease = shared.store().lease_path(writer);
+            if let Err(cleanup) = shared.store().delete_all(vec![lease]).await {
+                tracing::warn!(%cleanup, "deleting the lease of a failed open");
+            }
+            return Err(e);
+        }
 
         let (cmd, rx) = mpsc::channel(CMD_QUEUE);
         let wal_task = WalTask {
@@ -861,6 +874,16 @@ impl Db {
     pub async fn tree_shape(&self) -> Result<TreeShape> {
         let root = self.shared.follower.view().manifest.tree;
         tree::shape(&self.shared.nodes, root).await
+    }
+
+    /// The current tree's shape with its manifest's segment table, both
+    /// from one manifest (separate calls can straddle a checkpoint).
+    pub async fn audit(&self) -> Result<Audit> {
+        let m = self.shared.follower.view().manifest;
+        Ok(Audit {
+            shape: tree::shape(&self.shared.nodes, m.tree).await?,
+            segments: m.segments.clone(),
+        })
     }
 
     /// Live and total bytes of every segment the current tree references.
@@ -1074,16 +1097,12 @@ impl WalTask {
         };
         let seq = self.next_seq;
         let compression = shared.cfg.compression;
-        match retry("wal write", || {
-            wal::write(&shared.own_log, seq, &batch, compression)
-        })
-        .await
-        {
+        match wal::write(&shared.own_log, seq, &batch, compression).await {
             Ok(WalWrite::Written) => {}
             Ok(WalWrite::Taken) => return Err(shared.fail(Error::WriterIdTaken)),
             // The outcome is unknown, so the next batch can't safely reuse
             // this sequence number: stop writing.
-            Err(e) => return Err(shared.fail(e)),
+            Err(e) => return Err(shared.fail(Error::LogWriteFailed(Arc::new(e)))),
         }
         self.next_seq += 1;
         let c = &shared.counters;

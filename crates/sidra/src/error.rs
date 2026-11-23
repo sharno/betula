@@ -15,6 +15,11 @@ pub enum Error {
     /// Another process is writing under this writer id.
     #[error("writer id already in use")]
     WriterIdTaken,
+    /// A log write still failed after retries, so whether it landed is
+    /// unknown and the writer can't continue its log. Open a new writer;
+    /// writes not acknowledged may or may not be durable.
+    #[error("log write failed: {0}")]
+    LogWriteFailed(Arc<Error>),
     #[error("object store: {0}")]
     ObjectStore(Arc<object_store::Error>),
     #[error("corrupt object {path}: {reason}")]
@@ -35,8 +40,8 @@ pub enum ErrorKind {
     /// The object store failed after retries. The operation may succeed if
     /// repeated.
     Unavailable,
-    /// This writer can no longer write (lease expired or writer id taken).
-    /// Open a new one.
+    /// This writer can no longer write (lease expired, writer id taken, or a
+    /// log write failed). Open a new one.
     WriterLost,
     /// The operation needs the applier role, which this process doesn't hold.
     NotApplier,
@@ -55,7 +60,9 @@ impl Error {
     pub fn kind(&self) -> ErrorKind {
         match self {
             Error::ObjectStore(_) => ErrorKind::Unavailable,
-            Error::LeaseExpired | Error::WriterIdTaken => ErrorKind::WriterLost,
+            Error::LeaseExpired | Error::WriterIdTaken | Error::LogWriteFailed(_) => {
+                ErrorKind::WriterLost
+            }
             Error::NotApplier => ErrorKind::NotApplier,
             Error::Closed => ErrorKind::Closed,
             Error::SnapshotExpired(_) => ErrorKind::SnapshotExpired,

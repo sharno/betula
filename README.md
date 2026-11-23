@@ -252,9 +252,12 @@ Done: LZ4 compression (on by default), lighter cleaning of inner segments,
 paced GC deletes, multi-region (regional writer logs, standby appliers,
 replica readers).
 
+Store requests retry transient failures with capped backoff (8 attempts,
+50 ms to 5 s). A log write that still fails ends its writer with
+`WriterLost`, since whether it landed is unknown.
+
 1. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
-2. **Fault-injection and soak tests:** failed, slow and lost store requests;
-   long runs.
+2. **Soak tests:** multi-hour runs against a real store.
 3. **Faster scans and bulk loads:** fewer sources per scan page; bottom-up
    build into an empty tree.
 4. **Optional conditional writes** (compare-and-set) routed through the
@@ -267,7 +270,12 @@ See [`spec/README.md`](spec/README.md):
   rule is shown necessary by a counterexample);
 - Kani bounded proofs of the core functions;
 - a model-based proptest of the whole system with several concurrent writers
-  and late writes.
+  and late writes;
+- the same proptest under injected faults: store requests that fail before
+  applying, responses lost after applying, random delays, writers killed
+  without closing, and appliers killed part-way through a checkpoint.
+  Every acknowledged write must survive, and every read must match the
+  model. (`PROPTEST_CASES=400` for stress runs.)
 
 ## Layout
 
