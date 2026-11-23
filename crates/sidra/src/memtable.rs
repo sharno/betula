@@ -8,7 +8,7 @@ use crate::types::{KeyRange, Version, entry_bytes};
 /// Persistent sorted map holding the newest version per key. Clones are O(1),
 /// so read snapshots don't copy. Inserting is order-independent: a version
 /// only replaces an older one.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Memtable {
     map: OrdMap<Bytes, Version>,
     bytes: usize,

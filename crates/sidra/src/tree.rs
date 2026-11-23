@@ -9,7 +9,7 @@
 //! previous version.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet, binary_heap::PeekMut};
+use std::collections::{BTreeSet, BinaryHeap, HashSet, binary_heap::PeekMut};
 use std::future::Future;
 use std::ops::{Bound, Range};
 use std::pin::Pin;
@@ -525,7 +525,7 @@ pub struct WriteStats {
 pub struct Checkpoint<'a> {
     pub out: Outputs,
     /// Segments whose live nodes and runs are copied out.
-    pub victims: &'a HashSet<SegmentId>,
+    pub victims: &'a BTreeSet<SegmentId>,
     /// Tombstones older than this are dropped when their leaf is rewritten.
     pub drop_tombstones_below: Ts,
     pub compression: codec::Compression,
@@ -582,7 +582,7 @@ struct Writer<'a> {
     nodes: &'a Nodes,
     cfg: &'a TreeConfig,
     compression: codec::Compression,
-    victims: &'a HashSet<SegmentId>,
+    victims: &'a BTreeSet<SegmentId>,
     /// Tombstones older than this are dropped when their leaf is rewritten.
     drop_below: Ts,
     /// Subtrees whose oldest tombstone is below this get rewritten to drop it.

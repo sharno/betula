@@ -15,7 +15,7 @@ pub type Frontier = std::collections::BTreeMap<WriterId, u64>;
 pub type Sealed = std::collections::BTreeSet<WriterId>;
 
 /// One published database version.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Manifest {
     /// Bumped by every process that takes the applier role. Publishing with
     /// put-if-absent fences the previous applier.

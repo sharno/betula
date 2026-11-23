@@ -61,11 +61,23 @@ the bound), states are typestates; where events arrive from many sources
 
 ## Phases (each lands separately, perf-checked against the previous)
 
-1. Extract pure decision functions from `db.rs`/`follow.rs`/`gc.rs` into
-   `protocol` (claim decision, floor and bound, seal targets, frontier,
-   manifest assembly, GC plan). No behavior change.
-2. Log writer and lease as machines; drivers interpret effects. Bench the
-   write path (load/update throughput and p99) against phase 1.
-3. Follower and applier as machines.
-4. Stateright model and properties; CI runs a bounded check.
-5. Retire the TLA+ model.
+1. Done: pure decision functions in `protocol` (claim, floor and bound,
+   seal targets, manifest assembly, GC plan).
+2. Done: the log writer as a machine (`protocol::log`); `WalTask` drives
+   it. Write path benchmarked against phase 1: no regression.
+3. Done: follower state, log reading and sealing (`protocol::follower`),
+   and the applier's checkpoint stages (`protocol::checkpoint`).
+4. In progress: `crates/sidra-model`, a Stateright `Model` driving those
+   machines against an abstract object store, with independent clocks per
+   process, leases, sealing, the tombstone bound, and an abstract tree. A
+   store request and its response run as one step (a sound partial-order
+   reduction: handling a response touches only the requester's state),
+   which shrank two-process scenarios from >200M states to ~25M (20 s).
+   It found one real hazard: the checkpoint read its frontier from a later
+   view than its messages; `Applying` now captures both from one view.
+   Open: it doesn't yet reproduce the tombstone-bound bug. The bug needs
+   three processes, three checkpoints and lease renewals, which exhaustive
+   search can't fit in 48 GB, and random walks haven't hit it. Next: a
+   scenario that pins the interleaving (scripted clock lag) instead of
+   searching for it; then crashes, lost responses, applier handover, GC.
+5. Retire the TLA+ model once the model covers what it does.

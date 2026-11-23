@@ -77,7 +77,7 @@ pub enum Gate {
     Closed,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Event<W> {
     Write {
         hlc: u64,
@@ -100,7 +100,7 @@ pub enum Event<W> {
     Retry,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Effect<W> {
     /// Put-if-absent this batch at `seq`.
     Put { seq: u64, batch: Arc<WalBatch> },
@@ -120,7 +120,7 @@ pub enum Effect<W> {
     Stopped { why: Stopped, stamps: Vec<u64> },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Batch<W> {
     ops: Vec<(Bytes, Version)>,
     stamps: Vec<u64>,
@@ -139,7 +139,7 @@ impl<W> Default for Batch<W> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Putting<W> {
     seq: u64,
     batch: Arc<WalBatch>,
@@ -147,7 +147,7 @@ struct Putting<W> {
     waiters: Vec<W>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum State<W> {
     Open {
         next_seq: u64,
@@ -160,7 +160,7 @@ enum State<W> {
     Stopped(Stopped),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LogWriter<W> {
     writer: WriterId,
     max_bytes: usize,

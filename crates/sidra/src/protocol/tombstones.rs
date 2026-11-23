@@ -42,7 +42,7 @@ pub fn floor(own_floor: u64, leases: &[Lease], is_sealed: impl Fn(WriterId) -> b
 }
 
 /// Whether every log the checkpoint needed was pulled.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Pull {
     Complete,
     /// Some writer's log store couldn't be reached.

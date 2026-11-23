@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/sidra", "crates/sidra-bench", "crates/sidra-cli"]
+members = ["crates/sidra", "crates/sidra-bench", "crates/sidra-cli", "crates/sidra-model"]
 
 [workspace.package]
 edition = "2024"
@@ -26,6 +26,7 @@ proptest = "1.7"
 quick_cache = "0.7"
 serde = { version = "1", features = ["derive", "rc"] }
 slatedb = "0.18.1"
+stateright = "0.31"
 thiserror = "2"
 tokio = { version = "1.47", features = ["full"] }
 tracing = "0.1"

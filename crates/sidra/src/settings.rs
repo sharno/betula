@@ -301,7 +301,7 @@ impl ApplierRole {
 }
 
 /// How a writer competes for the applier role, as its lease advertises.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Candidacy {
     Primary,
     Standby,

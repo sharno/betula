@@ -12,7 +12,7 @@ use crate::types::{ManifestId, entry_bytes};
 use crate::wal::{WalBatch, WalRecord};
 
 /// Writer log entries not yet in the tree, merged newest-wins.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Tails {
     batches: BTreeMap<WriterId, BTreeMap<u64, Arc<WalBatch>>>,
     mem: Memtable,
@@ -109,7 +109,7 @@ impl Tails {
 }
 
 /// What a refresh pulls.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Scope {
     /// New manifests and every other writer's unapplied log entries.
     AllWriters,
@@ -127,7 +127,7 @@ pub enum Scope {
 ///
 /// Frontier writers are pulled too (a new manifest may name a writer newer
 /// than the last LIST), except those the last LIST showed gone.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Tracked {
     /// Writers seen in storage (by a LIST or `track`).
     present: BTreeSet<WriterId>,
@@ -177,7 +177,7 @@ impl Tracked {
 }
 
 /// Where a read of a log stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LogEnd {
     /// Nothing at `next` yet.
     Open { next: u64 },
@@ -186,14 +186,14 @@ pub enum LogEnd {
 }
 
 /// Consecutive entries of one log and where they stopped.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LogRead {
     pub entries: Vec<(u64, Arc<WalBatch>)>,
     pub end: LogEnd,
 }
 
 /// Reading a log forward from a sequence number, one record at a time.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Reading {
     entries: Vec<(u64, Arc<WalBatch>)>,
     next: u64,
@@ -234,7 +234,7 @@ impl Reading {
 
 /// Sealing a log: read to its end, put a seal in the next slot, and if a
 /// batch got there first, take it and try the slot after.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Sealing {
     /// Reading records; feed them with `record`.
     Reading(Reading),
@@ -295,7 +295,7 @@ impl Sealing {
 }
 
 /// A follower's view: the newest manifest it has and the entries beyond it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct View {
     pub manifest_id: ManifestId,
     pub manifest: Arc<Manifest>,

@@ -63,7 +63,7 @@ impl fmt::Display for NodePtr {
 }
 
 /// Root of a non-empty tree. `height` 0 means the root is a leaf.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TreeRoot {
     pub ptr: NodePtr,
     /// Oldest tombstone in the tree's leaves.
@@ -83,7 +83,7 @@ impl ManifestId {
 }
 
 /// A mutation for a key.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Msg {
     Put(Bytes),
     Delete,
@@ -109,7 +109,7 @@ impl Msg {
 /// timestamp wins, so applying writes in any order gives the same result.
 /// Buffers and leaves hold at most one version per key; deletes are kept as
 /// tombstones until no older write can still arrive.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Version {
     pub ts: Ts,
     pub msg: Msg,

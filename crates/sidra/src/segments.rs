@@ -7,13 +7,13 @@
 //! cleaned: the next checkpoint rewrites their live nodes, which drives them to
 //! zero.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::types::{NodePtr, SegmentId};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SegmentUsage {
     pub total: u64,
     pub live: u64,
@@ -22,7 +22,7 @@ pub struct SegmentUsage {
 
 /// What a segment holds. Inner segments (internal nodes and buffered runs)
 /// empty out on their own as runs flush down; leaf segments decay slowly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SegmentKind {
     Inner,
     Leaf,
@@ -97,7 +97,7 @@ pub fn account(
 }
 
 /// The emptiest segments below the live threshold, up to the move budget.
-pub fn pick_victims(table: &SegmentTable, cfg: &CleanerConfig) -> HashSet<SegmentId> {
+pub fn pick_victims(table: &SegmentTable, cfg: &CleanerConfig) -> BTreeSet<SegmentId> {
     let mut candidates: Vec<(SegmentId, SegmentUsage)> = table
         .iter()
         .filter(|(_, u)| {

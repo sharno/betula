@@ -28,14 +28,14 @@ use crate::store::{CreateOutcome, Store};
 use crate::types::Version;
 
 /// Ops in write order. Each op carries its own timestamp.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WalBatch {
     pub writer: WriterId,
     pub ops: Vec<(Bytes, Version)>,
 }
 
 /// One log object.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WalRecord {
     Batch(WalBatch),
     /// The end of the log: nothing exists or can be written after it.
@@ -111,7 +111,7 @@ pub async fn read(store: &Store, writer: WriterId, seq: u64) -> Result<Option<Wa
         .transpose()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Lease {
     pub writer: WriterId,
     /// Where this writer's log lives. Fixed for the writer's lifetime.

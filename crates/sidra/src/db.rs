@@ -488,7 +488,6 @@ impl Shared {
             .collect();
         let (table, dead) = segments::account(&view.manifest.segments, &new, &plan.freed);
         let publishing = applying.applied(
-            &view,
             who,
             checkpoint::Applied {
                 tree: plan.root,

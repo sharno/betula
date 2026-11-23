@@ -12,10 +12,11 @@
 //! durable before its writer's lease is then visible to the pull), and seals
 //! go in before the floor is computed (a sealed writer stops holding it).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use crate::hlc::{Ts, WriterId};
-use crate::manifest::Manifest;
+use crate::manifest::{Frontier, Manifest};
 use crate::protocol::applier::{self, hand_back};
 use crate::protocol::follower::View;
 use crate::protocol::tombstones::{self, Pull};
@@ -36,7 +37,7 @@ pub struct Applier<'a> {
 }
 
 /// Leases read: every writer with a lease, and this writer's own floor.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Scanned {
     pub own_floor: u64,
     pub leases: Vec<Lease>,
@@ -58,7 +59,7 @@ impl Scanned {
 }
 
 /// Seal these logs (pulling their last entries), then call `sealed`.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Sealing {
     pub to_seal: Vec<WriterId>,
     scanned: Scanned,
@@ -66,7 +67,7 @@ pub struct Sealing {
 }
 
 /// What a checkpoint found to do.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Plan {
     /// No entries, seals, or segments to clean.
     Nothing,
@@ -96,24 +97,34 @@ impl Sealing {
             hand_back: hand_back(a.role, &leases, a.me, now_ms, is_sealed),
             floor,
             present,
+            prev: view.manifest.clone(),
+            frontier: view.tails.frontier(&view.manifest.frontier),
+            newly_sealed: view.tails.sealed().collect(),
         })
     }
 }
 
 /// Fold `msgs` into the tree, dropping tombstones below `drop_below` and
 /// moving live data out of `victims`; then call `applied`.
-#[derive(Debug)]
+///
+/// Everything the published manifest records (the frontier, new seals) is
+/// captured here with `msgs`, from one view: entries arriving later aren't
+/// in this tree, so they mustn't count as applied.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Applying {
     pub msgs: Vec<(Bytes, Version)>,
     pub drop_below: Ts,
-    pub victims: HashSet<SegmentId>,
+    pub victims: BTreeSet<SegmentId>,
     floor: u64,
     hand_back: bool,
     present: BTreeSet<WriterId>,
+    prev: Arc<Manifest>,
+    frontier: Frontier,
+    newly_sealed: BTreeSet<WriterId>,
 }
 
 /// What the data plane produced for one checkpoint.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Applied {
     pub tree: Option<TreeRoot>,
     pub segments: SegmentTable,
@@ -123,16 +134,16 @@ pub struct Applied {
 
 impl Applying {
     /// The tree is rewritten and its segments uploaded.
-    pub fn applied(self, view: &View, a: Applier, done: Applied, now_ms: u64) -> Publishing {
-        let prev: &Manifest = &view.manifest;
+    pub fn applied(self, a: Applier, done: Applied, now_ms: u64) -> Publishing {
+        let prev: &Manifest = &self.prev;
         Publishing {
             manifest: applier::next_manifest(applier::Checkpoint {
                 prev,
                 epoch: a.epoch,
                 me: a.me,
                 tree: done.tree,
-                frontier: view.tails.frontier(&prev.frontier),
-                newly_sealed: view.tails.sealed().collect(),
+                frontier: self.frontier,
+                newly_sealed: self.newly_sealed,
                 present: &self.present,
                 segment_watermark: done.segment_watermark,
                 tombstone_bound: tombstones::next_bound(prev.tombstone_bound, self.floor),
@@ -147,7 +158,7 @@ impl Applying {
 
 /// Put-if-absent `manifest` as the next version. If published and
 /// `hand_back`, release the role (a standby giving it back to a primary).
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Publishing {
     pub manifest: Manifest,
     pub hand_back: bool,

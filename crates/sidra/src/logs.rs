@@ -43,7 +43,7 @@ impl fmt::Display for Region {
 }
 
 /// Where one writer's log lives.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogHome {
     /// With everything else, in the home store.

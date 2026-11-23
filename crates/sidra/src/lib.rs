@@ -58,7 +58,10 @@ mod node;
 mod nodes;
 #[cfg(kani)]
 mod proofs;
-mod protocol;
+/// The protocol's state machines and decisions, for model checking
+/// (`sidra-model`). Not a stable API.
+#[doc(hidden)]
+pub mod protocol;
 mod reader;
 mod retry;
 mod segments;
