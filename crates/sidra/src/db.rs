@@ -17,7 +17,7 @@
 //! dead has its log sealed first (see `wal`), so none can arrive after the
 //! applier stopped waiting for it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -39,14 +39,15 @@ use crate::location;
 use crate::logs::{Logs, Region, RegionStores};
 use crate::manifest::{self, Manifest, Publish};
 use crate::nodes::{CacheStats, Nodes};
-use crate::protocol::{applier, tombstones};
+use crate::protocol::log::{self, Gate, Inflight, LogWriter, PutOutcome, Stopped};
+use crate::protocol::{applier, checkpoint, tombstones};
 use crate::segments::{self, SegmentKind, SegmentTable};
 use crate::settings::{Follow, Gc, Settings};
 use crate::snapshot::DbIterator;
 use crate::store::{RequestStats, Store};
 use crate::tree::{self, TreeShape};
-use crate::types::{Epoch, KeyRange, ManifestId, Msg, SegmentId, TreeRoot, Version, entry_bytes};
-use crate::wal::{self, Lease, WalBatch, WalWrite};
+use crate::types::{Epoch, KeyRange, ManifestId, Msg, SegmentId, TreeRoot, Version};
+use crate::wal::{self, Lease, WalWrite};
 use std::ops::RangeBounds;
 
 const CMD_QUEUE: usize = 1024;
@@ -191,13 +192,11 @@ struct Shared {
     writer: WriterId,
     hlc: Hlc,
     /// Timestamps handed out but not yet durable (multiset).
-    inflight: Mutex<BTreeMap<u64, usize>>,
+    inflight: Mutex<Inflight>,
     applier: tokio::sync::Mutex<Option<Applier>>,
     is_applier: AtomicBool,
     /// Set once this writer can no longer write.
     fatal: OnceLock<Error>,
-    /// Set by `close()`: the log task's last flushes skip backpressure.
-    closing: AtomicBool,
     shutdown: watch::Sender<bool>,
     wake_applier: Notify,
     counters: Counters,
@@ -241,12 +240,8 @@ impl Shared {
     /// A lower bound on every timestamp this writer may still make durable.
     /// Takes a fresh clock reading so an idle writer's floor keeps moving.
     fn floor_hlc(&self) -> u64 {
-        let floor = self.hlc.now(self.now());
-        self.inflight
-            .lock()
-            .keys()
-            .next()
-            .map_or(floor, |&oldest| oldest.min(floor))
+        let now = self.hlc.now(self.now());
+        self.inflight.lock().floor(now)
     }
 
     async fn write_lease(&self, expires_at_ms: u64) -> Result<()> {
@@ -372,7 +367,7 @@ impl Shared {
     /// already visible to the pull. (Pulling only previously known writers
     /// let a new writer's older entry arrive after a newer tombstone for the
     /// same key had been dropped, resurrecting the key.)
-    async fn scan_leases(&self) -> Result<LeaseScan> {
+    async fn scan_leases(&self) -> Result<checkpoint::Scanned> {
         let store = self.store();
         let writers = store.list_writers().await?;
         self.follower.track(writers.iter().copied());
@@ -384,7 +379,7 @@ impl Shared {
                 .collect();
         let logs = self.follower.logs();
         leases.iter().for_each(|l| logs.learn(l));
-        Ok(LeaseScan {
+        Ok(checkpoint::Scanned {
             own_floor: self.floor_hlc(),
             leases,
             present: writers.into_iter().collect(),
@@ -394,12 +389,9 @@ impl Shared {
     /// Seals the logs of other writers whose lease ran out, pulling their
     /// last entries. A log that can't be reached stays unsealed, so its
     /// writer keeps holding tombstones back.
-    async fn seal_expired(&self, leases: &[Lease]) -> Result<()> {
+    async fn seal_writers(&self, writers: &[WriterId]) -> Result<()> {
         let now = self.now();
-        let view = self.follower.view();
-        let expired: Vec<WriterId> =
-            tombstones::to_seal(leases, self.writer, now, |w| view.is_sealed(w)).collect();
-        let sealed = futures::future::join_all(expired.into_iter().map(|w| async move {
+        let sealed = futures::future::join_all(writers.iter().map(|&w| async move {
             let r = self.follower.seal(w, now).await;
             if r.is_ok() {
                 tracing::info!(writer = %w, "sealed the log of an expired writer");
@@ -423,18 +415,21 @@ impl Shared {
             return Err(Error::NotApplier);
         };
         let started = Instant::now();
-        let LeaseScan {
-            own_floor,
-            leases,
-            present,
-        } = self.scan_leases().await?;
+        // The stages and why they're ordered so: `protocol::checkpoint`.
+        let scanned = self.scan_leases().await?;
         let leased = started.elapsed();
-        let unreachable = self
+        let pull = match self
             .follower
             .refresh(false, Scope::AllWriters, self.now())
             .await?
-            .unreachable;
-        self.seal_expired(&leases).await?;
+            .unreachable
+            .is_empty()
+        {
+            true => tombstones::Pull::Complete,
+            false => tombstones::Pull::Partial,
+        };
+        let sealing = scanned.pulled(&self.follower.view(), self.writer, self.now(), pull);
+        self.seal_writers(&sealing.to_seal).await?;
         let pulled = started.elapsed();
         let misses_before = self.nodes.cache_stats().misses;
         let view = self.follower.view();
@@ -442,25 +437,16 @@ impl Shared {
             self.set_role(&mut guard, None);
             return Err(Error::NotApplier);
         }
-        let victims = segments::pick_victims(&view.manifest.segments, &self.cfg.cleaner);
-        if view.tails.is_empty() && view.tails.sealed().next().is_none() && victims.is_empty() {
-            return Ok(());
-        }
-        // See `protocol::tombstones` for why this is safe.
-        let is_sealed = |w| view.is_sealed(w);
-        let floor = tombstones::floor(own_floor, &leases, is_sealed);
-        let hand_back = applier::hand_back(
-            self.cfg.applier,
-            &leases,
-            self.writer,
-            self.now(),
-            is_sealed,
-        );
-        let pull = match unreachable.is_empty() {
-            true => tombstones::Pull::Complete,
-            false => tombstones::Pull::Partial,
+        let who = checkpoint::Applier {
+            me: self.writer,
+            epoch: app.epoch,
+            role: self.cfg.applier,
+            cleaner: &self.cfg.cleaner,
         };
-        let drop_below = tombstones::drop_below(floor, view.manifest.tombstone_bound, pull);
+        let mut applying = match sealing.sealed(&view, who, self.now()) {
+            checkpoint::Plan::Nothing => return Ok(()),
+            checkpoint::Plan::Apply(applying) => applying,
+        };
         let out = tree::Outputs {
             inner: app.next_segment,
             leaves: app.next_segment.next(),
@@ -468,13 +454,14 @@ impl Shared {
         // Fresh segments per attempt: a failed attempt may still have
         // uploaded its segments, which then show up as orphans.
         app.next_segment = out.leaves.next();
-        let msgs = view.tails.mem().to_sorted_vec();
+        let msgs = std::mem::take(&mut applying.msgs);
         let msg_count = msgs.len();
         let msg_bytes = view.tails.mem().bytes();
+        let victims = applying.victims.clone();
         let ck = tree::Checkpoint {
             out,
             victims: &victims,
-            drop_tombstones_below: drop_below,
+            drop_tombstones_below: applying.drop_below,
             compression: self.cfg.compression,
         };
         let plan = tree::apply(&self.nodes, &self.cfg.tree, ck, view.manifest.tree, msgs).await?;
@@ -500,20 +487,18 @@ impl Shared {
             })
             .collect();
         let (table, dead) = segments::account(&view.manifest.segments, &new, &plan.freed);
-        let next = applier::next_manifest(applier::Checkpoint {
-            prev: &view.manifest,
-            epoch: app.epoch,
-            me: self.writer,
-            tree: plan.root,
-            frontier: view.tails.frontier(&view.manifest.frontier),
-            newly_sealed: view.tails.sealed().collect(),
-            present: &present,
-            segment_watermark: app.next_segment,
-            tombstone_bound: tombstones::next_bound(view.manifest.tombstone_bound, floor),
-            segments: table,
-            dead,
-            now_ms: self.now(),
-        });
+        let publishing = applying.applied(
+            &view,
+            who,
+            checkpoint::Applied {
+                tree: plan.root,
+                segments: table,
+                dead,
+                segment_watermark: app.next_segment,
+            },
+            self.now(),
+        );
+        let (next, hand_back) = (publishing.manifest, publishing.hand_back);
         let next_id = view.manifest_id.next();
         match manifest::publish(self.store(), next_id, &next).await? {
             Publish::Published => {
@@ -578,13 +563,6 @@ impl Shared {
 pub struct Audit {
     pub shape: TreeShape,
     pub segments: SegmentTable,
-}
-
-struct LeaseScan {
-    own_floor: u64,
-    leases: Vec<Lease>,
-    /// Every writer with a lease in storage.
-    present: BTreeSet<WriterId>,
 }
 
 pub struct Db {
@@ -685,11 +663,10 @@ impl Db {
             own_log,
             writer,
             hlc: Hlc::default(),
-            inflight: Mutex::new(BTreeMap::new()),
+            inflight: Mutex::new(Inflight::default()),
             applier: tokio::sync::Mutex::new(None),
             is_applier: AtomicBool::new(false),
             fatal: OnceLock::new(),
-            closing: AtomicBool::new(false),
             shutdown,
             wake_applier: Notify::new(),
             counters: Counters::default(),
@@ -718,12 +695,8 @@ impl Db {
 
         let (cmd, rx) = mpsc::channel(CMD_QUEUE);
         let wal_task = WalTask {
+            log: LogWriter::new(writer, shared.cfg.wal.max_bytes),
             shared: shared.clone(),
-            next_seq: 1,
-            ops: Vec::new(),
-            stamps: Vec::new(),
-            waiters: Vec::new(),
-            bytes: 0,
         };
         let mut tasks = vec![
             tokio::spawn(wal_task.run(rx)),
@@ -779,7 +752,7 @@ impl Db {
             return Ok(None);
         }
         let hlc = self.shared.hlc.now(self.shared.now());
-        *self.shared.inflight.lock().entry(hlc).or_default() += 1;
+        self.shared.inflight.lock().register(hlc);
         let ts = Ts {
             hlc,
             writer: self.shared.writer,
@@ -956,11 +929,9 @@ impl Db {
     /// work. Entries not yet applied are applied later by whoever holds the
     /// role.
     pub async fn close(mut self) -> Result<()> {
-        // Dropping the sender makes the log task flush and exit. Waking
-        // `installed` unblocks a flush stuck in backpressure (see `persist`).
+        // Dropping the sender makes the log task write out what's pending,
+        // past backpressure (`log::Event::Close`), and exit.
         self.cmd.take();
-        self.shared.closing.store(true, Ordering::Release);
-        self.shared.follower.installed.notify_waiters();
         let mut tasks = std::mem::take(&mut self.tasks).into_iter();
         if let Some(wal) = tasks.next() {
             let _ = wal.await;
@@ -1050,118 +1021,115 @@ enum WalCmd {
     },
 }
 
+type Waiter = oneshot::Sender<Result<()>>;
+
+/// Drives the log state machine (`protocol::log`): feeds it writes, ticks,
+/// put outcomes, and backpressure changes, and carries out its effects.
 struct WalTask {
     shared: Arc<Shared>,
-    next_seq: u64,
-    ops: Vec<(Bytes, Version)>,
-    /// Timestamps of the pending ops, released from `inflight` once durable.
-    stamps: Vec<u64>,
-    waiters: Vec<oneshot::Sender<Result<()>>>,
-    bytes: usize,
+    log: LogWriter<Waiter>,
 }
 
+type PutFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = (u64, Result<WalWrite>)> + Send>>;
+
 impl WalTask {
+    fn gate(&self) -> Gate {
+        let s = &self.shared;
+        match s.follower.tails_bytes() < s.cfg.checkpoint.max_unapplied_bytes {
+            true => Gate::Open,
+            false => Gate::Closed,
+        }
+    }
+
     async fn run(mut self, mut rx: mpsc::Receiver<WalCmd>) {
         let mut tick = tokio::time::interval(self.shared.cfg.wal.flush_interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut putting: Option<PutFuture> = None;
+        let mut open = true;
+        // Why a put failed, for the error callers get.
+        let mut failure: Option<Error> = None;
         loop {
-            tokio::select! {
-                cmd = rx.recv() => match cmd {
-                    Some(WalCmd::Write { hlc, ops, done }) => {
-                        self.bytes += ops.iter().map(|(k, v)| entry_bytes(k, v.msg.encoded_len())).sum::<usize>();
-                        self.ops.extend(ops);
-                        self.stamps.push(hlc);
-                        self.waiters.extend(done);
-                        if self.bytes >= self.shared.cfg.wal.max_bytes {
-                            let _ = self.flush().await;
-                        }
-                    }
-                    Some(WalCmd::Flush { done }) => {
-                        let _ = done.send(self.flush().await);
-                    }
+            if !open && self.log.idle() {
+                return;
+            }
+            let installed = self.shared.follower.installed.notified();
+            let event = tokio::select! {
+                cmd = rx.recv(), if open => match cmd {
+                    Some(WalCmd::Write { hlc, ops, done }) => log::Event::Write { hlc, ops, waiter: done },
+                    Some(WalCmd::Flush { done }) => log::Event::Flush { waiter: done },
                     None => {
-                        let _ = self.flush().await;
-                        return;
+                        open = false;
+                        log::Event::Close
                     }
                 },
-                _ = tick.tick() => {
-                    if !self.ops.is_empty() {
-                        let _ = self.flush().await;
+                _ = tick.tick() => log::Event::Tick,
+                (seq, result) = async { putting.as_mut().expect("guarded").await }, if putting.is_some() => {
+                    putting = None;
+                    let outcome = match result {
+                        Ok(WalWrite::Written) => PutOutcome::Written,
+                        Ok(WalWrite::Sealed) => PutOutcome::Sealed,
+                        Ok(WalWrite::Taken) => PutOutcome::Taken,
+                        Err(e) => {
+                            failure = Some(e);
+                            PutOutcome::Failed
+                        }
+                    };
+                    log::Event::PutDone { seq, outcome }
+                },
+                _ = installed, if self.log.held_back() => log::Event::Retry,
+            };
+            let gate = self.gate();
+            for effect in self.log.step(event, gate) {
+                match effect {
+                    log::Effect::Put { seq, batch } => {
+                        let (store, compression) =
+                            (self.shared.own_log.clone(), self.shared.cfg.compression);
+                        putting = Some(Box::pin(async move {
+                            (seq, wal::write(&store, seq, &batch, compression).await)
+                        }));
+                    }
+                    log::Effect::Durable {
+                        seq,
+                        batch,
+                        stamps,
+                        writes,
+                    } => {
+                        let s = &self.shared;
+                        s.inflight.lock().release(&stamps);
+                        let c = &s.counters;
+                        c.flushes.fetch_add(1, Ordering::Relaxed);
+                        c.batches.fetch_add(writes, Ordering::Relaxed);
+                        s.follower.add_own(seq, batch, s.now());
+                        s.wake_applier.notify_one();
+                    }
+                    log::Effect::Ack { waiters, result } => {
+                        let result = result.map_err(|why| self.stopped_error(why, &failure));
+                        waiters.into_iter().for_each(|w| {
+                            let _ = w.send(result.clone());
+                        });
+                    }
+                    log::Effect::Stopped { why, stamps } => {
+                        self.shared.inflight.lock().release(&stamps);
+                        let e = self.stopped_error(why, &failure);
+                        self.shared.fail(e);
                     }
                 }
             }
         }
     }
 
-    async fn flush(&mut self) -> Result<()> {
-        let ops = std::mem::take(&mut self.ops);
-        let stamps = std::mem::take(&mut self.stamps);
-        let waiters = std::mem::take(&mut self.waiters);
-        self.bytes = 0;
-        let result = self.persist(ops, stamps.len() as u64).await;
-        {
-            let mut inflight = self.shared.inflight.lock();
-            stamps.iter().for_each(|t| {
-                if let Some(n) = inflight.get_mut(t) {
-                    *n -= 1;
-                    if *n == 0 {
-                        inflight.remove(t);
-                    }
-                }
-            });
+    /// The error for a stopped log: the writer's fatal error once set.
+    fn stopped_error(&self, why: Stopped, failure: &Option<Error>) -> Error {
+        if let Err(e) = self.shared.check() {
+            return e;
         }
-        waiters.into_iter().for_each(|w| {
-            let _ = w.send(result.clone());
-        });
-        result
-    }
-
-    /// Writes `ops` (from `batches` write calls) as one log object.
-    async fn persist(&mut self, ops: Vec<(Bytes, Version)>, batches: u64) -> Result<()> {
-        let shared = &self.shared;
-        shared.check()?;
-        if ops.is_empty() {
-            return Ok(());
+        match (why, failure) {
+            (Stopped::Sealed, _) => Error::LogSealed,
+            (Stopped::Taken, _) => Error::WriterIdTaken,
+            (Stopped::Unknown, Some(e)) => Error::LogWriteFailed(Arc::new(e.clone())),
+            (Stopped::Unknown, None) => Error::Closed,
         }
-        // Backpressure: wait while the applier is far behind. Closing skips
-        // it: no new writes can arrive, so what's left is bounded (the
-        // channel plus one pending batch), and making it durable beats
-        // failing it, since another process's applier applies it later.
-        // Waiting could hang `close()` forever when no applier runs
-        // (`ApplierRole::Never`, or the role held elsewhere and stuck).
-        loop {
-            let installed = shared.follower.installed.notified();
-            shared.check()?;
-            if shared.closing.load(Ordering::Acquire)
-                || shared.follower.tails_bytes() < shared.cfg.checkpoint.max_unapplied_bytes
-            {
-                break;
-            }
-            installed.await;
-        }
-        let batch = WalBatch {
-            writer: shared.writer,
-            ops,
-        };
-        let seq = self.next_seq;
-        let compression = shared.cfg.compression;
-        match wal::write(&shared.own_log, seq, &batch, compression).await {
-            Ok(WalWrite::Written) => {}
-            // Presumed dead: this batch is not in the log, and no later one
-            // can be.
-            Ok(WalWrite::Sealed) => return Err(shared.fail(Error::LogSealed)),
-            Ok(WalWrite::Taken) => return Err(shared.fail(Error::WriterIdTaken)),
-            // The outcome is unknown, so the next batch can't safely reuse
-            // this sequence number: stop writing.
-            Err(e) => return Err(shared.fail(Error::LogWriteFailed(Arc::new(e)))),
-        }
-        self.next_seq += 1;
-        let c = &shared.counters;
-        c.flushes.fetch_add(1, Ordering::Relaxed);
-        c.batches.fetch_add(batches, Ordering::Relaxed);
-        shared.follower.add_own(seq, Arc::new(batch), shared.now());
-        shared.wake_applier.notify_one();
-        Ok(())
     }
 }
 

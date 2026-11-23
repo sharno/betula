@@ -6,7 +6,6 @@
 //! discovery, to find new writers and to catch up after GC. A sealed log
 //! (see `wal`) ends at its seal; once applied, it isn't polled again.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -15,119 +14,15 @@ use tokio::sync::Notify;
 use crate::error::{Error, Result};
 use crate::hlc::WriterId;
 use crate::logs::Logs;
-use crate::manifest::{self, Frontier, Manifest};
-use crate::memtable::Memtable;
+use crate::manifest::{self, Manifest};
+
 use crate::nodes::{Nodes, Warm};
+use crate::protocol::follower::{LogEnd, LogRead, Reading, Sealing, Tracked};
+pub use crate::protocol::follower::{Scope, Tails, View};
 use crate::snapshot::Snapshot;
 use crate::store::Store;
 use crate::types::ManifestId;
-use crate::wal::{self, SealAt, WalBatch, WalRecord};
-
-/// Writer log entries not yet in the tree, merged newest-wins.
-#[derive(Clone, Debug, Default)]
-pub struct Tails {
-    batches: BTreeMap<WriterId, BTreeMap<u64, Arc<WalBatch>>>,
-    mem: Memtable,
-    /// Bytes of every batch held, which is what memory holds: `mem` keeps one
-    /// version per key, so repeated overwrites barely grow it.
-    retained: usize,
-    /// When the oldest unapplied entry was first seen.
-    pub since_ms: Option<u64>,
-    /// Seals no manifest records yet, by sequence number. Every entry of the
-    /// writer between the manifest's frontier and its seal is held here.
-    sealed: BTreeMap<WriterId, u64>,
-}
-
-impl Tails {
-    pub fn mem(&self) -> &Memtable {
-        &self.mem
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.batches.values().all(BTreeMap::is_empty)
-    }
-
-    pub fn retained_bytes(&self) -> usize {
-        self.retained
-    }
-
-    /// Writers whose seal was found since the last manifest.
-    pub fn sealed(&self) -> impl Iterator<Item = WriterId> + '_ {
-        self.sealed.keys().copied()
-    }
-
-    fn add(&mut self, seq: u64, batch: Arc<WalBatch>, now_ms: u64) {
-        let log = self.batches.entry(batch.writer).or_default();
-        if log.contains_key(&seq) {
-            return;
-        }
-        self.mem.apply(batch.ops.iter().cloned());
-        self.retained += batch_bytes(&batch);
-        log.insert(seq, batch);
-        self.since_ms.get_or_insert(now_ms);
-    }
-
-    /// Drops entries (and seals) the manifest holds.
-    fn prune(&mut self, m: &Manifest, now_ms: u64) {
-        self.batches.iter_mut().for_each(|(w, log)| {
-            let upto = m.frontier.get(w).copied().unwrap_or(0);
-            log.retain(|seq, _| *seq > upto);
-        });
-        self.batches.retain(|_, log| !log.is_empty());
-        self.sealed.retain(|w, _| !m.sealed.contains(w));
-        self.retained = self
-            .batches
-            .values()
-            .flat_map(|log| log.values())
-            .map(|b| batch_bytes(b))
-            .sum();
-        self.mem = self.batches.values().flat_map(|log| log.values()).fold(
-            Memtable::default(),
-            |mut mem, b| {
-                mem.apply(b.ops.iter().cloned());
-                mem
-            },
-        );
-        self.since_ms = (!self.is_empty()).then_some(now_ms);
-    }
-
-    /// The first sequence number of `writer` neither held nor applied.
-    fn next_seq(&self, writer: WriterId, applied: &Frontier) -> u64 {
-        let known = self
-            .batches
-            .get(&writer)
-            .and_then(|log| log.last_key_value())
-            .map_or(0, |(seq, _)| *seq);
-        known.max(applied.get(&writer).copied().unwrap_or(0)) + 1
-    }
-
-    /// `applied` advanced past every entry held here.
-    pub fn frontier(&self, applied: &Frontier) -> Frontier {
-        let mut f = applied.clone();
-        self.batches.iter().for_each(|(w, log)| {
-            if let Some((seq, _)) = log.last_key_value() {
-                f.insert(*w, *seq);
-            }
-        });
-        f
-    }
-}
-
-fn batch_bytes(b: &WalBatch) -> usize {
-    b.ops
-        .iter()
-        .map(|(k, v)| crate::types::entry_bytes(k, v.msg.encoded_len()))
-        .sum()
-}
-
-/// What a refresh pulls.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Scope {
-    /// New manifests and every other writer's unapplied log entries.
-    AllWriters,
-    /// New manifests only: other writers' writes appear once applied.
-    ManifestOnly,
-}
+use crate::wal::{self, SealAt, WalBatch};
 
 /// What a refresh brought in.
 #[derive(Debug, Default)]
@@ -144,91 +39,6 @@ impl Pulled {
         match self.unreachable.into_iter().next() {
             Some((_, e)) => Err(e),
             None => Ok(()),
-        }
-    }
-}
-
-/// Writers whose logs a refresh pulls.
-///
-/// Every writer that can still write has a lease (written before its first
-/// log entry), and GC deletes a lease only once the writer expired long ago
-/// and its log is empty. So a writer missing from a `writers/` LIST has
-/// nothing left to pull, even while the manifest frontier still names it,
-/// and polling it would only fail once its log store goes down.
-///
-/// Frontier writers are pulled too (a new manifest may name a writer newer
-/// than the last LIST), except those the last LIST showed gone.
-#[derive(Debug, Default)]
-struct Tracked {
-    /// Writers seen in storage (by a LIST or `track`).
-    present: BTreeSet<WriterId>,
-    /// Frontier writers the last LIST didn't find.
-    gone: BTreeSet<WriterId>,
-}
-
-impl Tracked {
-    /// Writers to pull, given the frontier being applied against.
-    fn pulled(&self, applied: &Frontier) -> BTreeSet<WriterId> {
-        applied
-            .keys()
-            .filter(|w| !self.gone.contains(w))
-            .chain(&self.present)
-            .copied()
-            .collect()
-    }
-
-    /// Applies a LIST that started when `before` was pulled under `frontier`,
-    /// returning the writers it found gone. Only writers pulled before the
-    /// LIST can be gone: one tracked meanwhile (from a newer LIST) may be too
-    /// new for it.
-    fn listed(
-        &mut self,
-        before: &BTreeSet<WriterId>,
-        frontier: &Frontier,
-        found: BTreeSet<WriterId>,
-    ) -> BTreeSet<WriterId> {
-        let forgotten: BTreeSet<WriterId> = before.difference(&found).copied().collect();
-        self.gone = frontier
-            .keys()
-            .filter(|w| !found.contains(w))
-            .copied()
-            .collect();
-        self.present = self
-            .present
-            .difference(&forgotten)
-            .copied()
-            .chain(found)
-            .collect();
-        forgotten
-    }
-}
-
-#[derive(Clone)]
-pub struct View {
-    pub manifest_id: ManifestId,
-    pub manifest: Arc<Manifest>,
-    pub tails: Tails,
-}
-
-impl View {
-    /// Whether `writer`'s log is sealed with every entry before the seal
-    /// either applied or held in `tails`.
-    pub fn is_sealed(&self, writer: WriterId) -> bool {
-        self.manifest.sealed.contains(&writer) || self.tails.sealed.contains_key(&writer)
-    }
-
-    /// Adds what was read from `writer`'s log, skipping applied entries.
-    fn absorb(&mut self, writer: WriterId, read: LogRead, now_ms: u64) {
-        let upto = self.manifest.frontier.get(&writer).copied().unwrap_or(0);
-        read.entries
-            .into_iter()
-            .filter(|(seq, _)| *seq > upto)
-            .for_each(|(seq, batch)| self.tails.add(seq, batch, now_ms));
-        match read.end {
-            LogEnd::Sealed { at } if !self.manifest.sealed.contains(&writer) => {
-                self.tails.sealed.insert(writer, at);
-            }
-            LogEnd::Sealed { .. } | LogEnd::Open { .. } => {}
         }
     }
 }
@@ -294,39 +104,30 @@ impl Follower {
     pub fn snapshot(&self) -> Snapshot {
         let v = self.view.read();
         Snapshot {
-            tails: v.tails.mem.clone(),
+            tails: v.tails.mem().clone(),
             tree: v.manifest.tree,
         }
     }
 
     /// Bytes of unapplied batches held in memory.
     pub fn tails_bytes(&self) -> usize {
-        self.view.read().tails.retained
+        self.view.read().tails.retained_bytes()
     }
 
     /// Adds this process's own durable batch without waiting for a poll.
     pub fn add_own(&self, seq: u64, batch: Arc<WalBatch>, now_ms: u64) {
-        let mut v = self.view.write();
-        if seq > v.manifest.frontier.get(&batch.writer).copied().unwrap_or(0) {
-            v.tails.add(seq, batch, now_ms);
-        }
+        self.view.write().add_own(seq, batch, now_ms);
     }
 
     /// Installs a manifest this process published.
     pub fn install(&self, id: ManifestId, manifest: Arc<Manifest>, now_ms: u64) {
-        let mut v = self.view.write();
-        if id > v.manifest_id {
-            v.tails.prune(&manifest, now_ms);
-            v.manifest_id = id;
-            v.manifest = manifest;
-        }
-        drop(v);
+        self.view.write().install(id, manifest, now_ms);
         self.installed.notify_waiters();
     }
 
     /// Makes later refreshes pull these writers' logs.
     pub fn track(&self, writers: impl IntoIterator<Item = WriterId>) {
-        self.writers.lock().present.extend(writers);
+        self.writers.lock().track(writers);
     }
 
     /// Pulls new manifests and, for `Scope::AllWriters`, other writers' log
@@ -360,14 +161,7 @@ impl Follower {
         let starts: Vec<(WriterId, u64)> = {
             let v = self.view.read();
             let m = newer.as_ref().map_or(v.manifest.as_ref(), |(_, m)| m);
-            self.writers
-                .lock()
-                .pulled(&m.frontier)
-                .into_iter()
-                .filter(|w| scope == Scope::AllWriters && Some(*w) != self.own)
-                .filter(|w| !m.sealed.contains(w) && !v.tails.sealed.contains_key(w))
-                .map(|w| (w, v.tails.next_seq(w, &m.frontier)))
-                .collect()
+            v.reads(m, &self.writers.lock(), self.own, scope)
         };
         let results = futures::future::join_all(starts.into_iter().map(|(w, from)| async move {
             let read = async { read_log_from(self.logs.of(w).await?, w, from).await };
@@ -394,10 +188,8 @@ impl Follower {
                 .iter()
                 .any(|(_, r)| !r.entries.is_empty() || matches!(r.end, LogEnd::Sealed { .. }));
         let mut v = self.view.write();
-        if let Some((id, m)) = newer.filter(|(id, _)| *id > v.manifest_id) {
-            v.tails.prune(&m, now_ms);
-            v.manifest_id = id;
-            v.manifest = Arc::new(m);
+        if let Some((id, m)) = newer {
+            v.install(id, Arc::new(m), now_ms);
         }
         fresh
             .into_iter()
@@ -423,18 +215,20 @@ impl Follower {
             v.tails.next_seq(writer, &v.manifest.frontier)
         };
         let store = self.logs.of(writer).await?;
-        let mut read = read_log_from(store, writer, from).await?;
-        while let LogEnd::Open { next } = read.end {
-            read.end = match wal::seal(store, writer, next).await? {
-                SealAt::Sealed => LogEnd::Sealed { at: next },
-                SealAt::Batch(b) => {
-                    read.entries.push((next, Arc::new(b)));
-                    let more = read_log_from(store, writer, next + 1).await?;
-                    read.entries.extend(more.entries);
-                    more.end
+        let mut sealing = Sealing::from(from);
+        let read = loop {
+            sealing = match sealing {
+                Sealing::Reading(r) => {
+                    let record = wal::read(store, writer, r.next()).await?;
+                    Sealing::Reading(r).record(record)
                 }
+                Sealing::Placing { at, .. } => match wal::seal(store, writer, at).await? {
+                    SealAt::Sealed => sealing.sealed(),
+                    SealAt::Batch(b) => sealing.lost(b),
+                },
+                Sealing::Done(read) => break read,
             };
-        }
+        };
         self.view.write().absorb(writer, read, now_ms);
         Ok(())
     }
@@ -464,32 +258,15 @@ async fn probe_manifests(
     Ok(newest)
 }
 
-/// Where a read of a log stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LogEnd {
-    /// Nothing at `next` yet.
-    Open { next: u64 },
-    /// The log is sealed at `at`.
-    Sealed { at: u64 },
-}
-
-struct LogRead {
-    entries: Vec<(u64, Arc<WalBatch>)>,
-    end: LogEnd,
-}
-
 /// Consecutive log entries of `writer` from `from`, up to the first gap or
 /// the seal.
 async fn read_log_from(store: &Store, writer: WriterId, from: u64) -> Result<LogRead> {
-    let mut entries = Vec::new();
-    let mut seq = from;
-    let end = loop {
-        match wal::read(store, writer, seq).await? {
-            Some(WalRecord::Batch(batch)) => entries.push((seq, Arc::new(batch))),
-            Some(WalRecord::Seal) => break LogEnd::Sealed { at: seq },
-            None => break LogEnd::Open { next: seq },
-        }
-        seq += 1;
-    };
-    Ok(LogRead { entries, end })
+    let mut reading = Reading::from(from);
+    loop {
+        let record = wal::read(store, writer, reading.next()).await?;
+        reading = match reading.record(record) {
+            Ok(read) => return Ok(read),
+            Err(more) => more,
+        };
+    }
 }

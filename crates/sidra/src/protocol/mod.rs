@@ -3,5 +3,8 @@
 //! call these, and carry out the result. See `docs/sans-io.md`.
 
 pub mod applier;
+pub mod checkpoint;
+pub mod follower;
 pub mod gc;
+pub mod log;
 pub mod tombstones;
