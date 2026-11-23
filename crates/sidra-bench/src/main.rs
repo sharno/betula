@@ -102,6 +102,10 @@ struct Args {
     /// cold after a reopen). Shows the cost of sparse leaves.
     #[arg(long, default_value_t = 0)]
     delete_pct: u64,
+    /// Keep each run's database in the bucket (deleted after the run by
+    /// default: runs add up to hundreds of GB).
+    #[arg(long)]
+    keep_data: bool,
     /// Percentage of the mixed phase's clients that only read; the rest only
     /// write batches (separate clients, so slow durable writes don't throttle
     /// reads).
@@ -547,6 +551,24 @@ fn unique() -> u128 {
         .as_millis()
 }
 
+/// Deletes everything under `path` (a finished run's database), in small
+/// bulk requests: one huge request times out on RustFS.
+async fn remove_all(os: &Arc<dyn ObjectStore>, path: &str) -> Result<()> {
+    let paths: Vec<Path> = os
+        .list(Some(&Path::from(path)))
+        .map_ok(|m| m.location)
+        .try_collect()
+        .await?;
+    for chunk in paths.chunks(128) {
+        let owned: Vec<Path> = chunk.to_vec();
+        let batch = futures::stream::iter(owned.into_iter().map(Ok));
+        os.delete_stream(futures::StreamExt::boxed(batch))
+            .try_collect::<Vec<_>>()
+            .await?;
+    }
+    Ok(())
+}
+
 async fn footprint(os: &Arc<dyn ObjectStore>, path: &str) -> Result<(usize, u64)> {
     let metas: Vec<_> = os.list(Some(&Path::from(path))).try_collect().await?;
     Ok((metas.len(), metas.iter().map(|m| m.size).sum()))
@@ -750,6 +772,11 @@ async fn bench_engine(
         bytes as f64 / (1 << 20) as f64,
         (wl.keys as usize * (wl.value_size + 15)) as f64 / (1 << 20) as f64
     );
+    if !args.keep_data
+        && let Err(e) = remove_all(&raw, &path).await
+    {
+        eprintln!("[{}] cleanup of {path} failed: {e:#}", kind.name());
+    }
     Ok(phases)
 }
 

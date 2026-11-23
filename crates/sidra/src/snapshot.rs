@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -31,8 +30,7 @@ impl Snapshot {
         DbIterator {
             tails: MemCursor::new(self.tails, &range),
             tree: TreeIter::new(nodes, self.tree, range),
-            tree_buf: VecDeque::new(),
-            tree_done: false,
+            tree_head: None,
         }
     }
 }
@@ -41,8 +39,8 @@ impl Snapshot {
 pub struct DbIterator {
     tails: MemCursor,
     tree: TreeIter,
-    tree_buf: VecDeque<(Bytes, Version)>,
-    tree_done: bool,
+    /// The tree's next entry, read ahead to compare with the tails'.
+    tree_head: Option<(Bytes, Version)>,
 }
 
 impl DbIterator {
@@ -50,13 +48,10 @@ impl DbIterator {
     pub async fn next_versioned(&mut self) -> Result<Option<(Bytes, Version)>> {
         loop {
             tokio::task::consume_budget().await;
-            if self.tree_buf.is_empty() && !self.tree_done {
-                match self.tree.next_chunk().await? {
-                    Some(chunk) => self.tree_buf = chunk.into(),
-                    None => self.tree_done = true,
-                }
+            if self.tree_head.is_none() {
+                self.tree_head = self.tree.next().await?;
             }
-            let order = match (self.tails.peek(), self.tree_buf.front()) {
+            let order = match (self.tails.peek(), self.tree_head.as_ref()) {
                 (None, None) => return Ok(None),
                 (Some(_), None) => Ordering::Less,
                 (None, Some(_)) => Ordering::Greater,
@@ -64,10 +59,10 @@ impl DbIterator {
             };
             let (key, version) = match order {
                 Ordering::Less => self.tails.pop(),
-                Ordering::Greater => self.tree_buf.pop_front(),
+                Ordering::Greater => self.tree_head.take(),
                 Ordering::Equal => {
                     let (k, a) = self.tails.pop().expect("peeked");
-                    let (_, b) = self.tree_buf.pop_front().expect("peeked");
+                    let (_, b) = self.tree_head.take().expect("peeked");
                     Some((k, if b.ts > a.ts { b } else { a }))
                 }
             }

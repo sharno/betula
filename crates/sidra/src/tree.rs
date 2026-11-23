@@ -8,8 +8,10 @@
 //! touched gets a new pointer; untouched subtrees and runs are shared with the
 //! previous version.
 
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashSet, binary_heap::PeekMut};
 use std::future::Future;
+use std::ops::{Bound, Range};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
@@ -184,22 +186,18 @@ struct Frame {
 
 enum IterState {
     Start(Option<TreeRoot>),
-    /// Inside a leaf, resuming after `after` (from its start if `None`).
+    /// Merging one leaf with the runs above it.
     InLeaf {
         stack: Vec<Frame>,
-        leaf: Arc<Leaf>,
-        after: Option<Bytes>,
+        scan: LeafScan,
     },
     Done,
 }
 
-/// Keys built per chunk. Short scans then clone about what they return:
-/// cloning `Bytes` is an atomic increment, contended when many readers scan
-/// the same leaves.
-const PAGE: usize = 64;
-
 /// Visits leaves in key order. Each leaf's view is its entries overlaid with
 /// the runs buffered above it on its path, newest version per key winning.
+/// Yields one entry at a time, cloning only what the caller takes, and loads
+/// the next leaf only when the caller gets that far.
 pub struct TreeIter {
     nodes: Arc<Nodes>,
     range: KeyRange,
@@ -215,39 +213,31 @@ impl TreeIter {
         }
     }
 
-    /// The next non-empty run of versions (tombstones included, so they can
-    /// shadow log tails), in key order.
-    pub async fn next_chunk(&mut self) -> Result<Option<Vec<(Bytes, Version)>>> {
+    /// The next version in key order (tombstones included, so they can
+    /// shadow log tails).
+    pub async fn next(&mut self) -> Result<Option<(Bytes, Version)>> {
         loop {
-            let (mut stack, leaf, after) = match std::mem::replace(&mut self.state, IterState::Done)
+            if let IterState::InLeaf { scan, .. } = &mut self.state
+                && let Some(entry) = scan.next()
             {
+                return Ok(Some(entry));
+            }
+            self.state = match std::mem::replace(&mut self.state, IterState::Done) {
                 IterState::Done | IterState::Start(None) => return Ok(None),
                 IterState::Start(Some(root)) => {
                     let mut stack = Vec::new();
                     let leaf = self.descend(root.ptr, &mut stack).await?;
-                    (stack, leaf, None)
+                    let scan = self.scan_leaf(&stack, leaf).await?;
+                    IterState::InLeaf { stack, scan }
                 }
-                IterState::InLeaf { stack, leaf, after } => (stack, leaf, after),
-            };
-            let (chunk, more) = self.materialize(&stack, &leaf, after.as_ref()).await?;
-            self.state = match (more, chunk.last()) {
-                (true, Some((last, _))) => IterState::InLeaf {
-                    after: Some(last.clone()),
-                    stack,
-                    leaf,
-                },
-                _ => match self.advance(&mut stack).await? {
-                    Some(leaf) => IterState::InLeaf {
-                        stack,
-                        leaf,
-                        after: None,
-                    },
+                IterState::InLeaf { mut stack, .. } => match self.advance(&mut stack).await? {
+                    Some(leaf) => {
+                        let scan = self.scan_leaf(&stack, leaf).await?;
+                        IterState::InLeaf { stack, scan }
+                    }
                     None => IterState::Done,
                 },
             };
-            if !chunk.is_empty() {
-                return Ok(Some(chunk));
-            }
         }
     }
 
@@ -278,67 +268,171 @@ impl TreeIter {
         Ok(None)
     }
 
-    /// Up to `PAGE` keys of the leaf's view after `after`, and whether the
-    /// leaf has more. The view is the leaf overlaid with the runs above it on
-    /// its path, newest version per key.
-    async fn materialize(
-        &self,
-        stack: &[Frame],
-        leaf: &Leaf,
-        after: Option<&Bytes>,
-    ) -> Result<(Vec<(Bytes, Version)>, bool)> {
+    /// Positions a cursor in the leaf and in every run on its path, each
+    /// with one binary search per bound.
+    async fn scan_leaf(&self, stack: &[Frame], leaf: Arc<Leaf>) -> Result<LeafScan> {
+        // The leaf only holds keys within its path's bounds.
+        let mut scan = LeafScan::Single(ScanSource::new(
+            ScanEntries::Leaf(leaf),
+            self.range.start.as_ref(),
+            self.range.end.as_ref(),
+        ));
         // The leaf's key range is the intersection of every ancestor's child
-        // bounds; a frame's own bound is `None` where it inherits its parent's.
+        // bounds (a frame's bound is `None` where it inherits its parent's).
+        // An ancestor's runs cover more than this leaf, so clip them to it.
         let (lo, hi) = stack.iter().fold((None, None), |(lo, hi), f| {
             let (flo, fhi) = f.node.child_bounds(f.idx);
             (flo.or(lo), fhi.or(hi))
         });
-        let wanted = |k: &Bytes| after.is_none_or(|a| k > a) && self.range.contains(k);
-        // Each source is sorted: take at most PAGE wanted entries from each.
-        // The first PAGE keys of the union are complete up to the smallest
-        // last key among truncated sources.
-        let mut candidates: Vec<(Bytes, Version)> = Vec::new();
-        let mut cutoff: Option<Bytes> = None;
-        let mut take = |entries: &[(Bytes, Version)], candidates: &mut Vec<(Bytes, Version)>| {
-            let start = match (after, lo) {
-                (Some(a), _) => entries.partition_point(|(k, _)| k <= a),
-                (None, Some(lo)) => entries.partition_point(|(k, _)| k < lo),
-                (None, None) => 0,
-            };
-            let end = hi.map_or(entries.len(), |hi: &Bytes| {
-                entries.partition_point(|(k, _)| k < hi)
-            });
-            let mut wanted_entries = entries[start..end.max(start)]
-                .iter()
-                .filter(|(k, _)| wanted(k));
-            candidates.extend(wanted_entries.by_ref().take(PAGE).cloned());
-            if wanted_entries.next().is_some() {
-                let last = &candidates[candidates.len() - 1].0;
-                if cutoff.as_ref().is_none_or(|c| last < c) {
-                    cutoff = Some(last.clone());
-                }
-            }
+        let start = match lo {
+            Some(lo) if self.range.after_start(lo) => Bound::Included(lo),
+            _ => self.range.start.as_ref(),
         };
-        take(&leaf.entries, &mut candidates);
-        let from_leaf = candidates.len();
+        let end = match hi {
+            Some(hi) if self.range.before_end(hi) => Bound::Excluded(hi),
+            _ => self.range.end.as_ref(),
+        };
         for f in stack {
             for run in &f.node.children[f.idx].runs {
                 let r = load_run(&self.nodes, run).await?;
-                take(&r.entries, &mut candidates);
+                if let Some(source) = ScanSource::new(ScanEntries::Run(r), start, end) {
+                    scan.push(source);
+                }
             }
         }
-        if candidates.len() > from_leaf {
-            candidates.sort_unstable_by(|(ka, va), (kb, vb)| ka.cmp(kb).then(vb.ts.cmp(&va.ts)));
-            candidates.dedup_by(|later, first| later.0 == first.0);
+        Ok(scan)
+    }
+}
+
+enum ScanEntries {
+    Leaf(Arc<Leaf>),
+    Run(Arc<Run>),
+}
+
+impl ScanEntries {
+    fn entries(&self) -> &[(Bytes, Version)] {
+        match self {
+            Self::Leaf(leaf) => &leaf.entries,
+            Self::Run(run) => &run.entries,
         }
-        let more = match &cutoff {
-            Some(c) => {
-                candidates.retain(|(k, _)| k <= c);
-                true
-            }
-            None => false,
+    }
+}
+
+/// A sorted source (a leaf or a run) and its unread part within the range.
+/// Never empty: a source is dropped once read.
+struct ScanSource {
+    entries: ScanEntries,
+    remaining: Range<usize>,
+}
+
+impl ScanSource {
+    fn new(entries: ScanEntries, start: Bound<&Bytes>, end: Bound<&Bytes>) -> Option<Self> {
+        let rows = entries.entries();
+        let first = match start {
+            Bound::Included(start) => rows.partition_point(|(key, _)| key < start),
+            Bound::Excluded(start) => rows.partition_point(|(key, _)| key <= start),
+            Bound::Unbounded => 0,
         };
-        Ok((candidates, more))
+        let last = match end {
+            Bound::Included(end) => rows.partition_point(|(key, _)| key <= end),
+            Bound::Excluded(end) => rows.partition_point(|(key, _)| key < end),
+            Bound::Unbounded => rows.len(),
+        };
+        (first < last).then_some(Self {
+            entries,
+            remaining: first..last,
+        })
+    }
+
+    fn head(&self) -> &(Bytes, Version) {
+        &self.entries.entries()[self.remaining.start]
+    }
+
+    /// Steps past the head; `false` once the source is used up.
+    fn step(&mut self) -> bool {
+        self.remaining.start += 1;
+        !self.remaining.is_empty()
+    }
+}
+
+impl Ord for ScanSource {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let (key, version) = self.head();
+        let (other_key, other_version) = other.head();
+        // Max-heap order: the lowest key first, the newest version on ties.
+        other_key
+            .cmp(key)
+            .then_with(|| version.ts.cmp(&other_version.ts))
+    }
+}
+
+impl PartialOrd for ScanSource {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ScanSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for ScanSource {}
+
+/// A leaf merged with the runs above it. With one source left (the common
+/// case: no runs, or the runs are past), entries are read straight off it;
+/// otherwise a heap picks the newest version of the lowest key.
+enum LeafScan {
+    Single(Option<ScanSource>),
+    Merge(BinaryHeap<ScanSource>),
+}
+
+impl LeafScan {
+    fn push(&mut self, source: ScanSource) {
+        match self {
+            Self::Single(prior) => match prior.take() {
+                Some(prior) => *self = Self::Merge(BinaryHeap::from([prior, source])),
+                None => *prior = Some(source),
+            },
+            Self::Merge(sources) => sources.push(source),
+        }
+    }
+
+    fn next(&mut self) -> Option<(Bytes, Version)> {
+        match self {
+            Self::Single(slot) => {
+                let source = slot.as_mut()?;
+                let entry = source.head().clone();
+                if !source.step() {
+                    *slot = None;
+                }
+                Some(entry)
+            }
+            Self::Merge(sources) => {
+                let entry = {
+                    let mut top = sources.peek_mut()?;
+                    let entry = top.head().clone();
+                    if !top.step() {
+                        PeekMut::pop(top);
+                    }
+                    entry
+                };
+                // Skip older versions of the same key in other sources.
+                while let Some(mut top) = sources.peek_mut() {
+                    if top.head().0 != entry.0 {
+                        break;
+                    }
+                    if !top.step() {
+                        PeekMut::pop(top);
+                    }
+                }
+                if sources.len() <= 1 {
+                    *self = Self::Single(sources.pop());
+                }
+                Some(entry)
+            }
+        }
     }
 }
 
