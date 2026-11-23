@@ -254,7 +254,8 @@ writer C ─► wal/C/{seq} ─┘
   others: their writes keep getting applied, tombstone collection pauses,
   and `Freshness::Latest` reads fail rather than miss writes.
 - The unapplied backlog limit counts every unapplied batch held, so
-  overwrites of one key apply backpressure too.
+  overwrites of one key apply backpressure too. `close()` skips it to make
+  queued writes durable, so it can't hang waiting for an applier.
 - By default every writer pulls every other writer's log to show unapplied
   writes, which costs about (writers − 1) × log bytes in GETs. With
   `poll.follow = "manifest_only"` a writer sees others' writes once applied
