@@ -101,6 +101,9 @@ pub struct Nodes {
     inner: NodeCache,
     leaves: NodeCache,
     loading: Mutex<HashMap<NodePtr, Loading>>,
+    /// Nodes of a planned checkpoint not uploaded yet, which the next plan
+    /// builds on. Pinned here because the cache may evict them.
+    staged: parking_lot::RwLock<HashMap<NodePtr, Node>>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -135,6 +138,7 @@ impl Nodes {
             inner: new_cache(cfg.inner_bytes, INNER_NODE_ESTIMATE),
             leaves: new_cache(cfg.leaf_bytes, LEAF_ESTIMATE),
             loading: Mutex::new(HashMap::new()),
+            staged: parking_lot::RwLock::new(HashMap::new()),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -166,7 +170,12 @@ impl Nodes {
     }
 
     pub async fn load(&self, ptr: NodePtr) -> Result<Node> {
-        if let Some(n) = self.inner.get(&ptr).or_else(|| self.leaves.get(&ptr)) {
+        let cached = self
+            .inner
+            .get(&ptr)
+            .or_else(|| self.leaves.get(&ptr))
+            .or_else(|| self.staged.read().get(&ptr).cloned());
+        if let Some(n) = cached {
             self.hits.fetch_add(1, Ordering::Relaxed);
             // See `Snapshot::get`: reads served from memory must yield.
             tokio::task::consume_budget().await;
@@ -201,6 +210,26 @@ impl Nodes {
         });
     }
 
+    /// Makes a planned segment's nodes loadable before it's uploaded.
+    pub fn stage(&self, segments: &[Segment]) {
+        self.staged.write().extend(
+            segments
+                .iter()
+                .flat_map(|s| s.nodes.iter().map(|(p, n)| (*p, n.clone()))),
+        );
+    }
+
+    /// Drops staged nodes of a plan that won't be published.
+    pub fn unstage(&self, segments: &[Segment]) {
+        let mut staged = self.staged.write();
+        segments
+            .iter()
+            .flat_map(|s| s.nodes.iter())
+            .for_each(|(p, _)| {
+                staged.remove(p);
+            });
+    }
+
     /// Uploads a checkpoint's segment and caches its nodes, so the writer
     /// never re-reads its own writes.
     pub async fn upload(&self, segment: &Segment) -> Result<()> {
@@ -211,6 +240,7 @@ impl Nodes {
             .nodes
             .iter()
             .for_each(|(ptr, node)| self.insert(*ptr, node.clone()));
+        self.unstage(std::slice::from_ref(segment));
         Ok(())
     }
 }

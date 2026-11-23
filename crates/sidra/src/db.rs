@@ -36,13 +36,15 @@ use crate::hlc::{Hlc, Ts, WriterId};
 use crate::location;
 use crate::logs::{Logs, Region, RegionStores};
 use crate::manifest::{self, Manifest, Publish};
-use crate::nodes::{CacheStats, Nodes};
+use crate::nodes::{CacheStats, Nodes, Segment};
 use crate::segments::{self, SegmentKind, SegmentTable};
 use crate::settings::{ApplierRole, Candidacy, Follow, Gc, Settings};
 use crate::snapshot::DbIterator;
 use crate::store::{RequestStats, Store};
 use crate::tree::{self, TreeShape};
-use crate::types::{Epoch, KeyRange, ManifestId, Msg, SegmentId, TreeRoot, Version, entry_bytes};
+use crate::types::{
+    Epoch, KeyRange, ManifestId, Msg, NodePtr, SegmentId, TreeRoot, Version, entry_bytes,
+};
 use crate::wal::{self, Lease, WalBatch, WalWrite};
 use std::ops::RangeBounds;
 
@@ -424,29 +426,105 @@ impl Shared {
         })
     }
 
-    /// Folds every pulled log entry into the tree and publishes a manifest.
+    /// Folds every pulled log entry into the tree and publishes a manifest,
+    /// continuing (pipelined) while enough work for another has arrived.
     async fn checkpoint(&self) -> Result<()> {
+        self.checkpoints(|| self.should_checkpoint()).await
+    }
+
+    /// Checkpoints while `more()` says there's work, pipelined: while one
+    /// checkpoint uploads its segments and publishes, the next pulls logs and
+    /// rewrites the tree on top of it. Upload and publish dominate a
+    /// checkpoint, so overlapping them with the rest raises throughput.
+    async fn checkpoints(&self, more: impl Fn() -> bool) -> Result<()> {
         let mut guard = self.applier.lock().await;
-        let Some(app) = guard.as_mut() else {
-            return Err(Error::NotApplier);
+        let app = guard.as_mut().ok_or(Error::NotApplier)?;
+        let mut next = match self.prepare(app, None).await {
+            Err(Error::NotApplier) => {
+                self.set_role(&mut guard, None);
+                return Err(Error::NotApplier);
+            }
+            other => other?,
         };
+        while let Some(current) = next {
+            let app = guard.as_mut().ok_or(Error::NotApplier)?;
+            let following = async {
+                match more() {
+                    true => self.prepare(app, Some(&current)).await,
+                    false => Ok(None),
+                }
+            };
+            let (committed, following) = futures::join!(self.commit(&current), following);
+            let discard = |p: &Result<Option<Prepared>>| {
+                if let Ok(Some(p)) = p {
+                    self.nodes.unstage(&p.segments);
+                }
+            };
+            match committed {
+                Ok(Publish::Published) => {}
+                Ok(Publish::Conflict) => {
+                    tracing::info!(writer = %self.writer, "lost the applier role");
+                    discard(&following);
+                    self.set_role(&mut guard, None);
+                    return Err(Error::NotApplier);
+                }
+                Err(e) => {
+                    self.nodes.unstage(&current.segments);
+                    discard(&following);
+                    return Err(e);
+                }
+            }
+            if current.primary_alive && matches!(self.cfg.applier, ApplierRole::Standby { .. }) {
+                tracing::info!(writer = %self.writer, "handing the applier role back");
+                discard(&following);
+                return self.release_locked(&mut guard).await;
+            }
+            next = match following {
+                Err(Error::NotApplier) => {
+                    self.set_role(&mut guard, None);
+                    return Err(Error::NotApplier);
+                }
+                other => other?,
+            };
+        }
+        Ok(())
+    }
+
+    /// Plans the next checkpoint on top of `base` (one not yet published) or
+    /// else the current manifest. Its new nodes are staged, so a following
+    /// plan can read them before they're uploaded. `None` if there's nothing
+    /// to do.
+    async fn prepare(
+        &self,
+        app: &mut Applier,
+        base: Option<&Prepared>,
+    ) -> Result<Option<Prepared>> {
         let started = Instant::now();
         let LeaseScan {
             floor,
             present,
             primary_alive,
         } = self.lease_floor().await?;
+        let leased = started.elapsed();
         self.follower
             .refresh(false, Scope::AllWriters, self.now())
             .await?;
+        let pulled = started.elapsed();
+        let misses_before = self.nodes.cache_stats().misses;
         let view = self.follower.view();
         if view.manifest.applier_epoch > app.epoch {
-            self.set_role(&mut guard, None);
             return Err(Error::NotApplier);
         }
-        let victims = segments::pick_victims(&view.manifest.segments, &self.cfg.cleaner);
-        if view.tails.is_empty() && victims.is_empty() {
-            return Ok(());
+        let (base_id, base) = match base {
+            Some(p) => (p.id, p.manifest.clone()),
+            None => (view.manifest_id, view.manifest.clone()),
+        };
+        let victims = segments::pick_victims(&base.segments, &self.cfg.cleaner);
+        // Entries the base doesn't hold yet (a base not yet published hasn't
+        // pruned the tails).
+        let mem = view.tails.mem_after(&base.frontier);
+        if mem.is_empty() && victims.is_empty() {
+            return Ok(None);
         }
         // A tombstone can go once no writer can still produce an older
         // version of its key. (Older versions already in the tree are carried
@@ -462,22 +540,16 @@ impl Shared {
         // Fresh segments per attempt: a failed attempt may still have
         // uploaded its segments, which then show up as orphans.
         app.next_segment = out.leaves.next();
-        let msgs = view.tails.mem().to_sorted_vec();
-        let msg_count = msgs.len();
-        let msg_bytes = view.tails.mem().bytes();
+        let msgs = mem.to_sorted_vec();
         let ck = tree::Checkpoint {
             out,
             victims: &victims,
             drop_tombstones_below: drop_below,
             compression: self.cfg.compression,
         };
-        let plan = tree::apply(&self.nodes, &self.cfg.tree, ck, view.manifest.tree, msgs).await?;
-        futures::future::try_join_all(
-            plan.segments
-                .iter()
-                .map(|segment| self.nodes.upload(segment)),
-        )
-        .await?;
+        let plan = tree::apply(&self.nodes, &self.cfg.tree, ck, base.tree, msgs).await?;
+        let planned = started.elapsed();
+        self.nodes.stage(&plan.segments);
         let new: Vec<(SegmentId, u64, SegmentKind)> = plan
             .segments
             .iter()
@@ -490,15 +562,36 @@ impl Shared {
                 (s.id, s.data.len() as u64, kind)
             })
             .collect();
-        let (table, dead) = segments::account(&view.manifest.segments, &new, &plan.freed);
-        let next = Manifest {
+        let bytes_of = |id: SegmentId| {
+            new.iter()
+                .find(|(s, _, _)| *s == id)
+                .map_or(0, |(_, b, _)| *b)
+        };
+        let report = Report {
+            msgs: mem.len(),
+            msg_bytes: mem.bytes(),
+            inner_bytes: bytes_of(out.inner),
+            leaf_bytes: bytes_of(out.leaves),
+            moved_bytes: victims
+                .iter()
+                .map(|v| base.segments.get(v).map_or(0, |u| u.live))
+                .sum(),
+            victims: victims.len(),
+            freed: plan.freed.len(),
+            node_loads: self.nodes.cache_stats().misses - misses_before,
+            lease: leased,
+            pull: pulled - leased,
+            plan: planned - pulled,
+        };
+        let (table, dead) = segments::account(&base.segments, &new, &plan.freed);
+        let manifest = Manifest {
             applier_epoch: app.epoch,
             applier: Some(self.writer),
             tree: plan.root,
             // Writers GC forgot (no lease, no logs) can never write again.
             frontier: view
                 .tails
-                .frontier(&view.manifest.frontier)
+                .frontier(&base.frontier)
                 .into_iter()
                 .filter(|(w, _)| present.contains(w))
                 .collect(),
@@ -507,44 +600,53 @@ impl Shared {
             dead,
             created_at_ms: self.now(),
         };
-        let next_id = view.manifest_id.next();
-        match manifest::publish(self.store(), next_id, &next).await? {
-            Publish::Published => {
-                let bytes_of = |id: SegmentId| {
-                    new.iter()
-                        .find(|(s, _, _)| *s == id)
-                        .map_or(0, |(_, b, _)| *b)
-                };
-                tracing::debug!(
-                    manifest = next_id.0,
-                    msgs = msg_count,
-                    msg_bytes,
-                    inner_bytes = bytes_of(out.inner),
-                    leaf_bytes = bytes_of(out.leaves),
-                    moved_bytes = victims.iter().map(|v| view.manifest.segments.get(v).map_or(0, |u| u.live)).sum::<u64>(),
-                    freed = plan.freed.len(),
-                    victims = victims.len(),
-                    elapsed = ?started.elapsed(),
-                    "checkpoint published"
-                );
-                self.nodes.evict(&plan.freed);
-                self.follower.install(next_id, Arc::new(next), self.now());
-                let c = &self.counters;
-                c.checkpoints.fetch_add(1, Ordering::Relaxed);
-                let us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX - 1);
-                c.last_checkpoint_us.store(us + 1, Ordering::Relaxed);
-                if primary_alive && matches!(self.cfg.applier, ApplierRole::Standby { .. }) {
-                    tracing::info!(writer = %self.writer, "handing the applier role back");
-                    self.release_locked(&mut guard).await?;
-                }
-                Ok(())
-            }
-            Publish::Conflict => {
-                tracing::info!(writer = %self.writer, "lost the applier role");
-                self.set_role(&mut guard, None);
-                Err(Error::NotApplier)
-            }
+        Ok(Some(Prepared {
+            id: base_id.next(),
+            manifest: Arc::new(manifest),
+            segments: plan.segments,
+            freed: plan.freed,
+            primary_alive,
+            report,
+        }))
+    }
+
+    /// Uploads a prepared checkpoint's segments and publishes its manifest.
+    async fn commit(&self, p: &Prepared) -> Result<Publish> {
+        let started = Instant::now();
+        futures::future::try_join_all(p.segments.iter().map(|s| self.nodes.upload(s))).await?;
+        let uploaded = started.elapsed();
+        let outcome = manifest::publish(self.store(), p.id, &p.manifest).await?;
+        if outcome == Publish::Published {
+            let r = &p.report;
+            tracing::debug!(
+                manifest = p.id.0,
+                msgs = r.msgs,
+                msg_bytes = r.msg_bytes,
+                inner_bytes = r.inner_bytes,
+                leaf_bytes = r.leaf_bytes,
+                moved_bytes = r.moved_bytes,
+                freed = r.freed,
+                victims = r.victims,
+                node_loads = r.node_loads,
+                // Phase durations in ms. Planning (leases, log pull, tree
+                // rewrite) overlaps the previous checkpoint's commit
+                // (upload, publish).
+                lease_ms = r.lease.as_millis(),
+                pull_ms = r.pull.as_millis(),
+                plan_ms = r.plan.as_millis(),
+                upload_ms = uploaded.as_millis(),
+                publish_ms = (started.elapsed() - uploaded).as_millis(),
+                "checkpoint published"
+            );
+            self.nodes.evict(&p.freed);
+            self.follower.install(p.id, p.manifest.clone(), self.now());
+            let c = &self.counters;
+            c.checkpoints.fetch_add(1, Ordering::Relaxed);
+            let total = r.lease + r.pull + r.plan + started.elapsed();
+            let us = u64::try_from(total.as_micros()).unwrap_or(u64::MAX - 1);
+            c.last_checkpoint_us.store(us + 1, Ordering::Relaxed);
         }
+        Ok(outcome)
     }
 }
 
@@ -553,6 +655,32 @@ impl Shared {
 pub struct Audit {
     pub shape: TreeShape,
     pub segments: SegmentTable,
+}
+
+/// A checkpoint planned but not yet uploaded and published.
+struct Prepared {
+    id: ManifestId,
+    manifest: Arc<Manifest>,
+    segments: Vec<Segment>,
+    freed: Vec<NodePtr>,
+    /// For a standby applier: a primary is alive, so hand the role back.
+    primary_alive: bool,
+    report: Report,
+}
+
+/// What a checkpoint did, for the log.
+struct Report {
+    msgs: usize,
+    msg_bytes: usize,
+    inner_bytes: u64,
+    leaf_bytes: u64,
+    moved_bytes: u64,
+    victims: usize,
+    freed: usize,
+    node_loads: u64,
+    lease: Duration,
+    pull: Duration,
+    plan: Duration,
 }
 
 struct LeaseScan {
@@ -1173,7 +1301,7 @@ async fn applier_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) 
         if !shared.is_applier.load(Ordering::Acquire) || !shared.should_checkpoint() {
             continue;
         }
-        match shared.checkpoint().await {
+        match shared.checkpoints(|| shared.should_checkpoint()).await {
             Ok(()) | Err(Error::NotApplier) => {}
             Err(e) => {
                 tracing::warn!(%e, "checkpoint failed, retrying");

@@ -75,6 +75,20 @@ impl Tails {
         known.or(applied.get(&writer).copied()).unwrap_or(0) + 1
     }
 
+    /// The entries after `applied`, merged.
+    pub fn mem_after(&self, applied: &Frontier) -> Memtable {
+        self.batches
+            .iter()
+            .flat_map(|(w, log)| {
+                let upto = applied.get(w).copied().unwrap_or(0);
+                log.range(upto + 1..).map(|(_, b)| b)
+            })
+            .fold(Memtable::default(), |mut mem, b| {
+                mem.apply(b.ops.iter().cloned());
+                mem
+            })
+    }
+
     /// `applied` advanced past every entry held here.
     pub fn frontier(&self, applied: &Frontier) -> Frontier {
         let mut f = applied.clone();
