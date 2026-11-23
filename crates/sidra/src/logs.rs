@@ -6,7 +6,7 @@
 //! every process that pulls logs (the applier, readers, GC) needs a store
 //! configured under that region name.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -119,6 +119,12 @@ impl Logs {
             .write()
             .entry(lease.writer)
             .or_insert_with(|| lease.log.clone());
+    }
+
+    /// Drops placements of writers GC forgot, so nothing keeps resolving
+    /// (and polling) their store.
+    pub fn forget(&self, writers: &BTreeSet<WriterId>) {
+        self.placed.write().retain(|w, _| !writers.contains(w));
     }
 
     /// The store holding `writer`'s log. A writer writes its lease before

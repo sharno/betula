@@ -148,6 +148,61 @@ impl Pulled {
     }
 }
 
+/// Writers whose logs a refresh pulls.
+///
+/// Every writer that can still write has a lease (written before its first
+/// log entry), and GC deletes a lease only once the writer expired long ago
+/// and its log is empty. So a writer missing from a `writers/` LIST has
+/// nothing left to pull, even while the manifest frontier still names it,
+/// and polling it would only fail once its log store goes down.
+///
+/// Frontier writers are pulled too (a new manifest may name a writer newer
+/// than the last LIST), except those the last LIST showed gone.
+#[derive(Debug, Default)]
+struct Tracked {
+    /// Writers seen in storage (by a LIST or `track`).
+    present: BTreeSet<WriterId>,
+    /// Frontier writers the last LIST didn't find.
+    gone: BTreeSet<WriterId>,
+}
+
+impl Tracked {
+    /// Writers to pull, given the frontier being applied against.
+    fn pulled(&self, applied: &Frontier) -> BTreeSet<WriterId> {
+        applied
+            .keys()
+            .filter(|w| !self.gone.contains(w))
+            .chain(&self.present)
+            .copied()
+            .collect()
+    }
+
+    /// Applies a LIST that started when `before` was pulled under `frontier`,
+    /// returning the writers it found gone. Only writers pulled before the
+    /// LIST can be gone: one tracked meanwhile (from a newer LIST) may be too
+    /// new for it.
+    fn listed(
+        &mut self,
+        before: &BTreeSet<WriterId>,
+        frontier: &Frontier,
+        found: BTreeSet<WriterId>,
+    ) -> BTreeSet<WriterId> {
+        let forgotten: BTreeSet<WriterId> = before.difference(&found).copied().collect();
+        self.gone = frontier
+            .keys()
+            .filter(|w| !found.contains(w))
+            .copied()
+            .collect();
+        self.present = self
+            .present
+            .difference(&forgotten)
+            .copied()
+            .chain(found)
+            .collect();
+        forgotten
+    }
+}
+
 #[derive(Clone)]
 pub struct View {
     pub manifest_id: ManifestId,
@@ -183,7 +238,7 @@ pub struct Follower {
     logs: Arc<Logs>,
     rewarm: Warm,
     view: RwLock<View>,
-    writers: Mutex<BTreeSet<WriterId>>,
+    writers: Mutex<Tracked>,
     /// This process's own writer, whose batches arrive via `add_own`.
     own: Option<WriterId>,
     refreshing: tokio::sync::Mutex<()>,
@@ -217,7 +272,7 @@ impl Follower {
                 manifest: Arc::new(manifest),
                 tails: Tails::default(),
             }),
-            writers: Mutex::new(BTreeSet::new()),
+            writers: Mutex::new(Tracked::default()),
             own,
             refreshing: tokio::sync::Mutex::new(()),
             installed: Notify::new(),
@@ -271,7 +326,7 @@ impl Follower {
 
     /// Makes later refreshes pull these writers' logs.
     pub fn track(&self, writers: impl IntoIterator<Item = WriterId>) {
-        self.writers.lock().extend(writers);
+        self.writers.lock().present.extend(writers);
     }
 
     /// Pulls new manifests and, for `Scope::AllWriters`, other writers' log
@@ -282,8 +337,11 @@ impl Follower {
         let _guard = self.refreshing.lock().await;
         let store = self.nodes.store();
         if discover {
-            let found = store.list_writers().await?;
-            self.writers.lock().extend(found);
+            let frontier = self.view.read().manifest.frontier.clone();
+            let before = self.writers.lock().pulled(&frontier);
+            let found = store.list_writers().await?.into_iter().collect();
+            let forgotten = self.writers.lock().listed(&before, &frontier, found);
+            self.logs.forget(&forgotten);
         }
 
         let current = self.view.read().manifest_id;
@@ -304,13 +362,11 @@ impl Follower {
             let m = newer.as_ref().map_or(v.manifest.as_ref(), |(_, m)| m);
             self.writers
                 .lock()
-                .iter()
-                .chain(m.frontier.keys())
-                .filter(|w| scope == Scope::AllWriters && Some(**w) != self.own)
-                .filter(|w| !m.sealed.contains(w) && !v.tails.sealed.contains_key(w))
-                .collect::<BTreeSet<_>>()
+                .pulled(&m.frontier)
                 .into_iter()
-                .map(|w| (*w, v.tails.next_seq(*w, &m.frontier)))
+                .filter(|w| scope == Scope::AllWriters && Some(*w) != self.own)
+                .filter(|w| !m.sealed.contains(w) && !v.tails.sealed.contains_key(w))
+                .map(|w| (w, v.tails.next_seq(w, &m.frontier)))
                 .collect()
         };
         let results = futures::future::join_all(starts.into_iter().map(|(w, from)| async move {
