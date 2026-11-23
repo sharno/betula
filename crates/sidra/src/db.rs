@@ -39,8 +39,9 @@ use crate::location;
 use crate::logs::{Logs, Region, RegionStores};
 use crate::manifest::{self, Manifest, Publish};
 use crate::nodes::{CacheStats, Nodes};
+use crate::protocol::{applier, tombstones};
 use crate::segments::{self, SegmentKind, SegmentTable};
-use crate::settings::{ApplierRole, Candidacy, Follow, Gc, Settings};
+use crate::settings::{Follow, Gc, Settings};
 use crate::snapshot::DbIterator;
 use crate::store::{RequestStats, Store};
 use crate::tree::{self, TreeShape};
@@ -317,44 +318,20 @@ impl Shared {
         }
         let view = self.follower.view();
         let now = self.now();
-        let waiting_for = |d: Duration| {
-            let d = d.as_millis() as u64;
-            view.tails.since_ms.is_some_and(|t| now >= t + d)
+        let situation = applier::Situation {
+            me: self.writer,
+            now_ms: now,
+            manifest_id: view.manifest_id,
+            manifest: &view.manifest,
+            waiting_since_ms: view.tails.since_ms,
+            checkpoint_interval: self.cfg.checkpoint.interval,
         };
-        let steal_after = match self.cfg.applier {
-            ApplierRole::Auto { steal_after } => steal_after,
-            ApplierRole::Standby { after } => {
-                // Whatever the reason nobody applied (no applier, stuck,
-                // dead), the home region had `after` to do it.
-                let idle = now >= view.manifest.created_at_ms + after.as_millis() as u64;
-                if waiting_for(after) && idle && view.manifest.applier != Some(self.writer) {
-                    self.claim().await?;
-                }
-                return Ok(());
+        let take = match applier::claim(self.cfg.applier, &situation) {
+            applier::Claim::No => false,
+            applier::Claim::Yes => true,
+            applier::Claim::IfLeaseExpired(w) => {
+                applier::lease_expired(wal::read_lease(self.store(), w).await?.as_ref(), now)
             }
-            ApplierRole::Never => return Ok(()),
-        };
-        let take = match view.manifest.applier {
-            _ if view.manifest_id == ManifestId(0) => true,
-            // Released on close: take it as soon as there is work.
-            None => !view.tails.is_empty(),
-            Some(w) if w == self.writer => false,
-            // Alive but stuck: work waited past `steal_after` and the
-            // applier published nothing meanwhile.
-            Some(_)
-                if waiting_for(steal_after)
-                    && now >= view.manifest.created_at_ms + steal_after.as_millis() as u64 =>
-            {
-                true
-            }
-            // Work waited a couple of checkpoint intervals: take over at once
-            // if the applier's lease ran out (it crashed or lost the store).
-            Some(w) if waiting_for(self.cfg.checkpoint.interval * 2) => {
-                wal::read_lease(self.store(), w)
-                    .await?
-                    .is_none_or(|l| l.expires_at_ms <= now)
-            }
-            Some(_) => false,
         };
         if take {
             self.claim().await?;
@@ -381,12 +358,12 @@ impl Shared {
 
     fn should_checkpoint(&self) -> bool {
         let view = self.follower.view();
-        let interval = self.cfg.checkpoint.interval.as_millis() as u64;
-        view.tails.mem().bytes() >= self.cfg.checkpoint.bytes
-            || view
-                .tails
-                .since_ms
-                .is_some_and(|t| self.now() >= t + interval)
+        applier::due(
+            &self.cfg.checkpoint,
+            view.tails.mem().bytes(),
+            view.tails.since_ms,
+            self.now(),
+        )
     }
 
     /// Every writer's lease, and this writer's floor. Must be read *before*
@@ -420,13 +397,12 @@ impl Shared {
     async fn seal_expired(&self, leases: &[Lease]) -> Result<()> {
         let now = self.now();
         let view = self.follower.view();
-        let expired = leases.iter().filter(|l| {
-            l.expires_at_ms <= now && l.writer != self.writer && !view.is_sealed(l.writer)
-        });
-        let sealed = futures::future::join_all(expired.map(|l| async move {
-            let r = self.follower.seal(l.writer, now).await;
+        let expired: Vec<WriterId> =
+            tombstones::to_seal(leases, self.writer, now, |w| view.is_sealed(w)).collect();
+        let sealed = futures::future::join_all(expired.into_iter().map(|w| async move {
+            let r = self.follower.seal(w, now).await;
             if r.is_ok() {
-                tracing::info!(writer = %l.writer, "sealed the log of an expired writer");
+                tracing::info!(writer = %w, "sealed the log of an expired writer");
             }
             r
         }))
@@ -470,39 +446,21 @@ impl Shared {
         if view.tails.is_empty() && view.tails.sealed().next().is_none() && victims.is_empty() {
             return Ok(());
         }
-        // A tombstone can go once no writer can still produce an older
-        // version of its key. (Older versions already in the tree are carried
-        // down to the leaf whenever the leaf is rewritten, and so are this
-        // checkpoint's entries.) Every leased writer stays above its lease's
-        // floor until its log is sealed: then all its entries are in this
-        // checkpoint or applied, and it can write no more. Expiry alone
-        // proves nothing (a write may still be in flight), so a writer with a
-        // stale lease holds the floor back until sealed.
-        let floor = leases
-            .iter()
-            .filter(|l| !view.is_sealed(l.writer))
-            .map(|l| l.floor_hlc)
-            .fold(own_floor, u64::min);
-        let primary_alive = leases.iter().any(|l| {
-            l.candidacy == Candidacy::Primary
-                && l.writer != self.writer
-                && !view.is_sealed(l.writer)
-                && l.expires_at_ms > self.now()
-        });
-        // A writer whose lease this scan missed wrote it after the previous
-        // manifest was published, then read a manifest at least that new and
-        // moved its clock past its `tombstone_bound` before writing: so the
-        // bound published last time caps what's safe to drop now. Clock skew
-        // doesn't enter into it. A writer whose log couldn't be pulled may
-        // hold entries older than the floor, so drop no tombstones until
-        // it's reachable again.
-        let drop_below = match unreachable.is_empty() {
-            true => Ts {
-                hlc: floor.min(view.manifest.tombstone_bound),
-                writer: WriterId(0),
-            },
-            false => Ts::MIN,
+        // See `protocol::tombstones` for why this is safe.
+        let is_sealed = |w| view.is_sealed(w);
+        let floor = tombstones::floor(own_floor, &leases, is_sealed);
+        let hand_back = applier::hand_back(
+            self.cfg.applier,
+            &leases,
+            self.writer,
+            self.now(),
+            is_sealed,
+        );
+        let pull = match unreachable.is_empty() {
+            true => tombstones::Pull::Complete,
+            false => tombstones::Pull::Partial,
         };
+        let drop_below = tombstones::drop_below(floor, view.manifest.tombstone_bound, pull);
         let out = tree::Outputs {
             inner: app.next_segment,
             leaves: app.next_segment.next(),
@@ -542,32 +500,20 @@ impl Shared {
             })
             .collect();
         let (table, dead) = segments::account(&view.manifest.segments, &new, &plan.freed);
-        let next = Manifest {
-            applier_epoch: app.epoch,
-            applier: Some(self.writer),
+        let next = applier::next_manifest(applier::Checkpoint {
+            prev: &view.manifest,
+            epoch: app.epoch,
+            me: self.writer,
             tree: plan.root,
-            // Writers GC forgot (sealed, lease deleted) can never write again.
-            frontier: view
-                .tails
-                .frontier(&view.manifest.frontier)
-                .into_iter()
-                .filter(|(w, _)| present.contains(w))
-                .collect(),
-            // Every entry before these seals is in this checkpoint.
-            sealed: view
-                .manifest
-                .sealed
-                .iter()
-                .copied()
-                .chain(view.tails.sealed())
-                .filter(|w| present.contains(w))
-                .collect(),
+            frontier: view.tails.frontier(&view.manifest.frontier),
+            newly_sealed: view.tails.sealed().collect(),
+            present: &present,
             segment_watermark: app.next_segment,
-            tombstone_bound: view.manifest.tombstone_bound.max(floor),
+            tombstone_bound: tombstones::next_bound(view.manifest.tombstone_bound, floor),
             segments: table,
             dead,
-            created_at_ms: self.now(),
-        };
+            now_ms: self.now(),
+        });
         let next_id = view.manifest_id.next();
         match manifest::publish(self.store(), next_id, &next).await? {
             Publish::Published => {
@@ -612,7 +558,7 @@ impl Shared {
                 c.checkpoints.fetch_add(1, Ordering::Relaxed);
                 let us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX - 1);
                 c.last_checkpoint_us.store(us + 1, Ordering::Relaxed);
-                if primary_alive && matches!(self.cfg.applier, ApplierRole::Standby { .. }) {
+                if hand_back {
                     tracing::info!(writer = %self.writer, "handing the applier role back");
                     self.release_locked(&mut guard).await?;
                 }

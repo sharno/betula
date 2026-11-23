@@ -16,6 +16,7 @@ use std::time::Duration;
 use crate::error::Result;
 use crate::logs::Logs;
 use crate::manifest::{self, Frontier, Manifest};
+use crate::protocol;
 use crate::store::{Pace, Store};
 use object_store::path::Path;
 
@@ -66,7 +67,6 @@ pub enum Speed {
 
 pub async fn run(logs: &Logs, now_ms: u64, retention: Duration, speed: Speed) -> Result<GcStats> {
     let store = logs.home();
-    let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
     let ids = store.list_manifests().await?;
     let mut stats = GcStats::default();
     let mut applied = Frontier::new();
@@ -77,7 +77,7 @@ pub async fn run(logs: &Logs, now_ms: u64, retention: Duration, speed: Speed) ->
         let Some(m) = manifest::load(store, cur).await? else {
             break;
         };
-        if now_ms.saturating_sub(m.created_at_ms) < retention_ms {
+        if !protocol::gc::supersedes_collectably(&m, now_ms, retention) {
             break;
         }
         segments.extend(m.dead.iter().map(|id| store.segment_path(*id)));
@@ -123,14 +123,14 @@ pub async fn run(logs: &Logs, now_ms: u64, retention: Duration, speed: Speed) ->
         None => None,
     };
     stats.writers = match latest {
-        Some(m) => forget_writers(logs, &m, now_ms, retention_ms).await?,
+        Some(m) => forget_writers(logs, &m, now_ms, retention).await?,
         None => 0,
     };
     Ok(stats)
 }
 
 /// Deletes the leases of writers whose log `latest` records as sealed (so
-/// fully applied), once the lease expired more than `retention_ms` ago
+/// fully applied), once the lease expired more than `retention` ago
 /// (readers of older manifests may still look up where the log lives) and
 /// only the seal is left of the log (nothing deletes applied entries once
 /// the writer leaves the manifest). The applier then drops the writer from
@@ -139,20 +139,21 @@ async fn forget_writers(
     logs: &Logs,
     latest: &Manifest,
     now_ms: u64,
-    retention_ms: u64,
+    retention: Duration,
 ) -> Result<usize> {
     let store = logs.home();
     let gone: Vec<_> = futures::future::try_join_all(latest.sealed.iter().map(|&w| async move {
         let applied = latest.frontier.get(&w).copied().unwrap_or(0);
-        let forget = match wal::read_lease(store, w).await? {
-            Some(l) if now_ms.saturating_sub(l.expires_at_ms) > retention_ms => logs
-                .at(&l.log)?
-                .list_wals(w)
-                .await?
-                .iter()
-                .all(|seq| *seq > applied),
-            Some(_) | None => false,
+        let lease = wal::read_lease(store, w).await?;
+        // Listing the log only matters once the lease is old enough.
+        let remaining = match &lease {
+            Some(l) if protocol::gc::forgettable(Some(l), applied, &[], now_ms, retention) => {
+                logs.at(&l.log)?.list_wals(w).await?
+            }
+            Some(_) | None => return Ok(None),
         };
+        let forget =
+            protocol::gc::forgettable(lease.as_ref(), applied, &remaining, now_ms, retention);
         Ok::<_, crate::error::Error>(forget.then(|| store.lease_path(w)))
     }))
     .await?

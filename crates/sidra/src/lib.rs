@@ -58,6 +58,7 @@ mod node;
 mod nodes;
 #[cfg(kani)]
 mod proofs;
+mod protocol;
 mod reader;
 mod retry;
 mod segments;
