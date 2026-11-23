@@ -245,16 +245,15 @@ writer C ─► writers/C/wal/{seq} ─┘
 - GC deletes the leases of writers that expired long ago and have no logs
   left, and the applier then drops them from the manifest.
 - No merging of underfull leaves (only empty ones are removed).
+- Store requests retry transient failures with capped backoff (8 attempts,
+  50 ms to 5 s). A log write that still fails ends its writer with
+  `WriterLost`, since whether it landed is unknown.
 
 ## Roadmap
 
 Done: LZ4 compression (on by default), lighter cleaning of inner segments,
 paced GC deletes, multi-region (regional writer logs, standby appliers,
 replica readers).
-
-Store requests retry transient failures with capped backoff (8 attempts,
-50 ms to 5 s). A log write that still fails ends its writer with
-`WriterLost`, since whether it landed is unknown.
 
 1. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
 2. **Soak tests:** multi-hour runs against a real store.
