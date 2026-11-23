@@ -1315,3 +1315,84 @@ async fn regional_outage_does_not_stall_other_writers() {
     remote.close().await.unwrap();
     applier.close().await.unwrap();
 }
+
+/// Once GC forgets a regional writer (lease and log gone), handles that
+/// followed it stop polling its region: an outage there no longer fails
+/// reads that promise every write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forgotten_regional_writer_is_no_longer_polled() {
+    let home: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let outage = Faults {
+        fail_before: 1.0,
+        fail_after: 0.0,
+        max_delay: Duration::ZERO,
+    };
+    let eu_faulty = Arc::new(Faulty::new(Arc::new(InMemory::new()), outage, 1));
+    eu_faulty.set_enabled(false);
+    let eu_store: Arc<dyn ObjectStore> = eu_faulty.clone();
+    let eu = sidra::Region::new("eu");
+    let clock = ManualClock::new();
+    let build = |settings: Settings| {
+        Db::builder(ROOT, home.clone())
+            .with_settings(settings)
+            .with_region(eu.clone(), eu_store.clone(), ROOT)
+            .with_clock(clock.clone())
+            .build()
+    };
+    let applier = build(tiny_config()).await.unwrap();
+    let reader = DbReader::builder(ROOT, home.clone())
+        .with_settings(reader_config())
+        .with_region(eu.clone(), eu_store.clone(), ROOT)
+        .build()
+        .await
+        .unwrap();
+    let remote = build(Settings {
+        log: sidra::LogHome::Region(eu.clone()),
+        applier: ApplierRole::Never,
+        ..tiny_config()
+    })
+    .await
+    .unwrap();
+    let wid = remote.writer_id();
+    clock.tick();
+    remote.put("from-eu", "1").await.unwrap();
+    remote.close().await.unwrap();
+
+    // Both handles follow the regional writer.
+    applier.refresh().await.unwrap();
+    reader.refresh().await.unwrap();
+    assert_eq!(
+        reader.get("from-eu").await.unwrap().as_deref(),
+        Some(&b"1"[..])
+    );
+    applier.checkpoint().await.unwrap();
+
+    // Past retention, GC deletes its log, then its lease.
+    clock.advance(Duration::from_secs(120));
+    applier.put("later", "2").await.unwrap();
+    applier.checkpoint().await.unwrap();
+    clock.advance(Duration::from_secs(120));
+    let stats = applier.run_gc(Duration::from_secs(60)).await.unwrap();
+    assert_eq!(stats.writers, 1, "{stats:?}");
+    assert_eq!(objects(&eu_store, &format!("writers/{wid}")).await, 0);
+    assert_eq!(objects(&home, &format!("writers/{wid}")).await, 0);
+
+    // Its region goes down, before and after the frontier drops it.
+    eu_faulty.set_enabled(true);
+    applier.refresh().await.unwrap();
+    reader.refresh().await.unwrap();
+    clock.tick();
+    applier.put("after", "3").await.unwrap();
+    applier.checkpoint().await.unwrap();
+    applier.refresh().await.unwrap();
+    reader.refresh().await.unwrap();
+    assert_eq!(
+        reader.get("after").await.unwrap().as_deref(),
+        Some(&b"3"[..])
+    );
+    assert_eq!(
+        reader.get("from-eu").await.unwrap().as_deref(),
+        Some(&b"1"[..])
+    );
+    applier.close().await.unwrap();
+}
