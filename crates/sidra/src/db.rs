@@ -436,9 +436,12 @@ impl Shared {
             present,
             primary_alive,
         } = self.lease_floor().await?;
+        let leased = started.elapsed();
         self.follower
             .refresh(false, Scope::AllWriters, self.now())
             .await?;
+        let pulled = started.elapsed();
+        let misses_before = self.nodes.cache_stats().misses;
         let view = self.follower.view();
         if view.manifest.applier_epoch > app.epoch {
             self.set_role(&mut guard, None);
@@ -472,12 +475,15 @@ impl Shared {
             compression: self.cfg.compression,
         };
         let plan = tree::apply(&self.nodes, &self.cfg.tree, ck, view.manifest.tree, msgs).await?;
+        let planned = started.elapsed();
+        let node_loads = self.nodes.cache_stats().misses - misses_before;
         futures::future::try_join_all(
             plan.segments
                 .iter()
                 .map(|segment| self.nodes.upload(segment)),
         )
         .await?;
+        let uploaded = started.elapsed();
         let new: Vec<(SegmentId, u64, SegmentKind)> = plan
             .segments
             .iter()
@@ -524,6 +530,14 @@ impl Shared {
                     moved_bytes = victims.iter().map(|v| view.manifest.segments.get(v).map_or(0, |u| u.live)).sum::<u64>(),
                     freed = plan.freed.len(),
                     victims = victims.len(),
+                    node_loads,
+                    // Phase durations in ms: leases, log pull, tree rewrite
+                    // (including node loads), segment upload, publish.
+                    lease_ms = leased.as_millis(),
+                    pull_ms = (pulled - leased).as_millis(),
+                    plan_ms = (planned - pulled).as_millis(),
+                    upload_ms = (uploaded - planned).as_millis(),
+                    publish_ms = (started.elapsed() - uploaded).as_millis(),
                     elapsed = ?started.elapsed(),
                     "checkpoint published"
                 );
