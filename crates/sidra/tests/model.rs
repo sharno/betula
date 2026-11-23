@@ -1315,3 +1315,47 @@ async fn regional_outage_does_not_stall_other_writers() {
     remote.close().await.unwrap();
     applier.close().await.unwrap();
 }
+
+/// `close()` terminates under backpressure with no applier to relieve it,
+/// and still makes the queued write durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_flushes_queued_writes_past_backpressure() {
+    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = ManualClock::new();
+    let mut cfg = tiny_config();
+    cfg.applier = ApplierRole::Never;
+    cfg.checkpoint.max_unapplied_bytes = 2_000;
+    let db = Db::builder(ROOT, os.clone())
+        .with_settings(cfg)
+        .with_clock(clock.clone())
+        .build()
+        .await
+        .unwrap();
+    let value = vec![1u8; 100];
+    for i in 0u32.. {
+        if db.metrics().unapplied_bytes >= 2_000 {
+            break;
+        }
+        clock.tick();
+        db.put(i.to_be_bytes(), &value).await.unwrap();
+    }
+    clock.tick();
+    let mut batch = WriteBatch::new();
+    batch.put("queued", "q");
+    let queued = WriteOptions {
+        durability: Durability::Queued,
+    };
+    db.write_with(batch, queued).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), db.close())
+        .await
+        .expect("close hung under backpressure")
+        .unwrap();
+
+    let applier = open(&os, &clock).await;
+    applier.checkpoint().await.unwrap();
+    assert_eq!(
+        applier.get("queued").await.unwrap().as_deref(),
+        Some(&b"q"[..])
+    );
+    applier.close().await.unwrap();
+}

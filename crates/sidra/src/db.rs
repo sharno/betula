@@ -195,6 +195,8 @@ struct Shared {
     is_applier: AtomicBool,
     /// Set once this writer can no longer write.
     fatal: OnceLock<Error>,
+    /// Set by `close()`: the log task's last flushes skip backpressure.
+    closing: AtomicBool,
     shutdown: watch::Sender<bool>,
     wake_applier: Notify,
     counters: Counters,
@@ -708,6 +710,7 @@ impl Db {
             applier: tokio::sync::Mutex::new(None),
             is_applier: AtomicBool::new(false),
             fatal: OnceLock::new(),
+            closing: AtomicBool::new(false),
             shutdown,
             wake_applier: Notify::new(),
             counters: Counters::default(),
@@ -973,8 +976,11 @@ impl Db {
     /// marks the lease expired, and stops background work. Entries not yet
     /// applied are applied later by whoever holds the role.
     pub async fn close(mut self) -> Result<()> {
-        // Dropping the sender makes the log task flush and exit.
+        // Dropping the sender makes the log task flush and exit. Waking
+        // `installed` unblocks a flush stuck in backpressure (see `persist`).
         self.cmd.take();
+        self.shared.closing.store(true, Ordering::Release);
+        self.shared.follower.installed.notify_waiters();
         let mut tasks = std::mem::take(&mut self.tasks).into_iter();
         if let Some(wal) = tasks.next() {
             let _ = wal.await;
@@ -1127,11 +1133,18 @@ impl WalTask {
         if ops.is_empty() {
             return Ok(());
         }
-        // Backpressure: wait while the applier is far behind.
+        // Backpressure: wait while the applier is far behind. Closing skips
+        // it: no new writes can arrive, so what's left is bounded (the
+        // channel plus one pending batch), and making it durable beats
+        // failing it, since another process's applier applies it later.
+        // Waiting could hang `close()` forever when no applier runs
+        // (`ApplierRole::Never`, or the role held elsewhere and stuck).
         loop {
             let installed = shared.follower.installed.notified();
             shared.check()?;
-            if shared.follower.tails_bytes() < shared.cfg.checkpoint.max_unapplied_bytes {
+            if shared.closing.load(Ordering::Acquire)
+                || shared.follower.tails_bytes() < shared.cfg.checkpoint.max_unapplied_bytes
+            {
                 break;
             }
             installed.await;
