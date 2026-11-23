@@ -386,6 +386,28 @@ pub struct Plan {
     /// Nodes and runs of the previous version that the new version no longer
     /// uses.
     pub freed: Vec<NodePtr>,
+    pub stats: WriteStats,
+}
+
+/// Where a checkpoint's bytes went.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WriteStats {
+    /// Encoded bytes by node kind.
+    pub run_bytes: u64,
+    pub internal_bytes: u64,
+    pub leaf_bytes: u64,
+    /// Runs copied in place out of victim segments (part of `run_bytes`).
+    pub relocated_run_bytes: u64,
+    /// Run bytes by the depth of the node holding them (0: root; the last
+    /// slot collects deeper ones).
+    pub run_bytes_by_depth: [u64; 4],
+    /// Leaves rewritten, and the messages applied to them: few messages per
+    /// leaf means leaf rewrites dominate write amplification.
+    pub leaves_rewritten: u64,
+    pub leaf_msgs: u64,
+    /// Leaves rewritten with no messages: moved by the cleaner or purged of
+    /// tombstones.
+    pub leaves_moved: u64,
 }
 
 /// Applies sorted, key-unique `msgs` to the tree at `root`, writing new nodes
@@ -425,6 +447,8 @@ pub async fn apply(
         inner: Region::new(out.inner),
         leaves: Region::new(out.leaves),
         freed: Vec::new(),
+        stats: WriteStats::default(),
+        depth: 0,
     };
     if let Some(r) = root.filter(|_| !victims.is_empty()) {
         w.mark_dirty(r.ptr, r.height).await?;
@@ -437,6 +461,7 @@ pub async fn apply(
             .filter_map(Region::into_segment)
             .collect(),
         freed: w.freed,
+        stats: w.stats,
     })
 }
 
@@ -452,6 +477,9 @@ struct Writer<'a> {
     inner: Region,
     leaves: Region,
     freed: Vec<NodePtr>,
+    stats: WriteStats,
+    /// Depth of the node being rewritten (0: root).
+    depth: usize,
 }
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -494,6 +522,7 @@ impl Writer<'_> {
                 let r = load_run(self.nodes, run).await?;
                 self.freed.push(run.ptr);
                 *run = self.write_run(r.entries.clone());
+                self.stats.relocated_run_bytes += u64::from(run.ptr.len);
             }
         }
         Ok(())
@@ -591,11 +620,16 @@ impl Writer<'_> {
             self.freed.push(ptr);
             match node {
                 Node::Run(_) => Err(corrupt(ptr, "a tree node")),
-                Node::Leaf(leaf) => Ok(self.write_leaves(apply_to_leaf(
-                    leaf.entries.clone(),
-                    msgs,
-                    self.drop_below,
-                ))),
+                Node::Leaf(leaf) => {
+                    self.stats.leaves_rewritten += 1;
+                    self.stats.leaf_msgs += msgs.len() as u64;
+                    self.stats.leaves_moved += u64::from(msgs.is_empty());
+                    Ok(self.write_leaves(apply_to_leaf(
+                        leaf.entries.clone(),
+                        msgs,
+                        self.drop_below,
+                    )))
+                }
                 Node::Internal(old) => {
                     let mut node = old.as_ref().clone();
                     let mut parts = split_by_child(&node.pivots, msgs);
@@ -696,7 +730,10 @@ impl Writer<'_> {
             msgs = merge_versions(msgs, run.entries.clone());
         }
         self.freed.extend(run_ptrs);
-        let rewrite = self.rewrite(child.ptr, msgs).await?;
+        self.depth += 1;
+        let rewrite = self.rewrite(child.ptr, msgs).await;
+        self.depth -= 1;
+        let rewrite = rewrite?;
         let replacement = match rewrite {
             Rewrite::Removed => None,
             Rewrite::Nodes { first, rest } => Some((first, rest)),
@@ -746,9 +783,21 @@ impl Writer<'_> {
 
     fn write(&mut self, node: Node) -> NodePtr {
         let frame = codec::encode(codec::NODE, &node, self.compression);
+        let n = frame.len() as u64;
         let region = match node {
-            Node::Leaf(_) => &mut self.leaves,
-            Node::Internal(_) | Node::Run(_) => &mut self.inner,
+            Node::Leaf(_) => {
+                self.stats.leaf_bytes += n;
+                &mut self.leaves
+            }
+            Node::Internal(_) => {
+                self.stats.internal_bytes += n;
+                &mut self.inner
+            }
+            Node::Run(_) => {
+                self.stats.run_bytes += n;
+                self.stats.run_bytes_by_depth[self.depth.min(3)] += n;
+                &mut self.inner
+            }
         };
         let ptr = NodePtr {
             seg: region.id,

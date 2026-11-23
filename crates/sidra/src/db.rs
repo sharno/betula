@@ -531,6 +531,16 @@ impl Shared {
                     freed = plan.freed.len(),
                     victims = victims.len(),
                     node_loads,
+                    run_bytes = plan.stats.run_bytes,
+                    run_bytes_d0 = plan.stats.run_bytes_by_depth[0],
+                    run_bytes_d1 = plan.stats.run_bytes_by_depth[1],
+                    run_bytes_d2 = plan.stats.run_bytes_by_depth[2],
+                    run_bytes_d3 = plan.stats.run_bytes_by_depth[3],
+                    internal_bytes = plan.stats.internal_bytes,
+                    relocated_run_bytes = plan.stats.relocated_run_bytes,
+                    leaves_rewritten = plan.stats.leaves_rewritten,
+                    leaf_msgs = plan.stats.leaf_msgs,
+                    leaves_moved = plan.stats.leaves_moved,
                     // Phase durations in ms: leases, log pull, tree rewrite
                     // (including node loads), segment upload, publish.
                     lease_ms = leased.as_millis(),

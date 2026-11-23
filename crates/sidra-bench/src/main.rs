@@ -505,6 +505,20 @@ async fn bench_engine(
     let mut io_mark = counters.snapshot();
     let mut record = |name, ops, elapsed, hist, phases: &mut Vec<Phase>| {
         let now = counters.snapshot();
+        let by = (now - io_mark).put_bytes_by;
+        if by.iter().sum::<u64>() > 1 << 20 {
+            let parts: Vec<String> = metered::KIND_NAMES
+                .iter()
+                .zip(by)
+                .filter(|(_, b)| *b > 0)
+                .map(|(n, b)| format!("{n} {:.1}", b as f64 / (1 << 20) as f64))
+                .collect();
+            eprintln!(
+                "[{}] {name} PUT MiB by kind: {}",
+                kind.name(),
+                parts.join(", ")
+            );
+        }
         phases.push(Phase {
             name,
             ops,

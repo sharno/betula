@@ -27,6 +27,20 @@ pub struct Counters {
     pub lists: AtomicU64,
     pub deletes: AtomicU64,
     pub copies: AtomicU64,
+    /// PUT bytes by object kind (see `Kind`).
+    pub put_bytes_by: [AtomicU64; KINDS],
+}
+
+/// Object kinds by path, for write-amplification breakdowns.
+pub const KINDS: usize = 5;
+pub const KIND_NAMES: [&str; KINDS] = ["log", "segment", "manifest", "lease", "other"];
+
+fn kind_of(path: &Path) -> usize {
+    let p = path.as_ref();
+    [("/wal/", 0), ("/seg/", 1), ("/manifest/", 2), ("/lease", 3)]
+        .iter()
+        .find(|(pat, _)| p.contains(pat))
+        .map_or(4, |(_, k)| *k)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -39,6 +53,7 @@ pub struct Snapshot {
     pub lists: u64,
     pub deletes: u64,
     pub copies: u64,
+    pub put_bytes_by: [u64; KINDS],
 }
 
 impl Counters {
@@ -53,6 +68,7 @@ impl Counters {
             lists: l(&self.lists),
             deletes: l(&self.deletes),
             copies: l(&self.copies),
+            put_bytes_by: std::array::from_fn(|i| l(&self.put_bytes_by[i])),
         }
     }
 }
@@ -69,6 +85,7 @@ impl std::ops::Sub for Snapshot {
             lists: self.lists - o.lists,
             deletes: self.deletes - o.deletes,
             copies: self.copies - o.copies,
+            put_bytes_by: std::array::from_fn(|i| self.put_bytes_by[i] - o.put_bytes_by[i]),
         }
     }
 }
@@ -117,6 +134,10 @@ impl ObjectStore for Metered {
         self.pause().await;
         Self::add(&self.counters.puts, 1);
         Self::add(&self.counters.put_bytes, payload.content_length() as u64);
+        Self::add(
+            &self.counters.put_bytes_by[kind_of(location)],
+            payload.content_length() as u64,
+        );
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -132,6 +153,7 @@ impl ObjectStore for Metered {
         Ok(Box::new(MeteredUpload {
             inner,
             counters: self.counters.clone(),
+            kind: kind_of(location),
         }))
     }
 
@@ -210,6 +232,7 @@ impl ObjectStore for Metered {
 struct MeteredUpload {
     inner: Box<dyn MultipartUpload>,
     counters: Arc<Counters>,
+    kind: usize,
 }
 
 #[async_trait]
@@ -217,6 +240,10 @@ impl MultipartUpload for MeteredUpload {
     fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
         Metered::add(&self.counters.puts, 1);
         Metered::add(&self.counters.put_bytes, data.content_length() as u64);
+        Metered::add(
+            &self.counters.put_bytes_by[self.kind],
+            data.content_length() as u64,
+        );
         self.inner.put_part(data)
     }
 
