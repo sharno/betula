@@ -10,6 +10,10 @@ use crate::types::{Epoch, ManifestId, SegmentId, TreeRoot};
 /// Last applied log sequence number per writer.
 pub type Frontier = std::collections::BTreeMap<WriterId, u64>;
 
+/// Writers whose log is sealed right after their `frontier` entry: fully
+/// applied, so they hold no tombstone back and need no more polling.
+pub type Sealed = std::collections::BTreeSet<WriterId>;
+
 /// One published database version.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -22,6 +26,7 @@ pub struct Manifest {
     pub tree: Option<TreeRoot>,
     /// Writer log entries at or below these sequence numbers are in `tree`.
     pub frontier: Frontier,
+    pub sealed: Sealed,
     /// First segment id the publishing writer had not used. Segments at or
     /// above it that exist in storage are orphans of a writer that died
     /// before publishing.
@@ -47,6 +52,7 @@ impl Manifest {
             applier: None,
             tree: None,
             frontier: Frontier::new(),
+            sealed: Sealed::new(),
             segment_watermark: SegmentId {
                 epoch: Epoch(0),
                 seq: 0,

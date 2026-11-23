@@ -122,8 +122,9 @@ impl Logs {
     }
 
     /// The store holding `writer`'s log. A writer writes its lease before
-    /// its first log entry, so a writer without a lease has no log entries,
-    /// and its home store reads as empty.
+    /// its first log entry, and GC deletes it only once the log is sealed and
+    /// applied, so a writer without a lease has no entries to read: its home
+    /// store reads as empty.
     pub async fn of(&self, writer: WriterId) -> Result<&Store> {
         let known = self.placed.read().get(&writer).cloned();
         let at = match known {

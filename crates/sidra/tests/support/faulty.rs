@@ -5,9 +5,11 @@
 
 use std::fmt;
 use std::ops::Range;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::sync::watch;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -29,12 +31,64 @@ pub struct Faults {
     pub max_delay: Duration,
 }
 
+impl Faults {
+    pub const NONE: Faults = Faults {
+        fail_before: 0.0,
+        fail_after: 0.0,
+        max_delay: Duration::ZERO,
+    };
+}
+
+/// Holds PUTs to matching paths in flight until released, like a request
+/// stuck in the network. Independent of `Faults`.
+pub struct Hold {
+    matches: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    /// How many PUTs to hold; later ones pass.
+    max: usize,
+    arrived: AtomicUsize,
+    released: watch::Sender<bool>,
+}
+
+impl Hold {
+    /// PUTs held so far.
+    pub fn arrived(&self) -> usize {
+        self.arrived.load(Ordering::SeqCst)
+    }
+
+    pub fn release(&self) {
+        self.released.send_replace(true);
+    }
+
+    fn take(&self, path: &str) -> bool {
+        (self.matches)(path)
+            && !*self.released.borrow()
+            && self
+                .arrived
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    (n < self.max).then_some(n + 1)
+                })
+                .is_ok()
+    }
+
+    async fn wait(&self) {
+        let mut rx = self.released.subscribe();
+        let _ = rx.wait_for(|r| *r).await;
+    }
+}
+
+impl fmt::Debug for Hold {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Hold(arrived: {})", self.arrived())
+    }
+}
+
 #[derive(Debug)]
 pub struct Faulty {
     inner: Arc<dyn ObjectStore>,
     faults: Faults,
     rng: Arc<AtomicU64>,
     enabled: Arc<AtomicBool>,
+    holds: Mutex<Vec<Arc<Hold>>>,
     pub injected: Arc<AtomicU64>,
 }
 
@@ -59,8 +113,25 @@ impl Faulty {
             faults,
             rng: Arc::new(AtomicU64::new(seed)),
             enabled: Arc::new(AtomicBool::new(true)),
+            holds: Mutex::new(Vec::new()),
             injected: Arc::default(),
         }
+    }
+
+    /// Holds up to `max` PUTs whose path matches until the hold is released.
+    pub fn hold_puts(
+        &self,
+        matches: impl Fn(&str) -> bool + Send + Sync + 'static,
+        max: usize,
+    ) -> Arc<Hold> {
+        let hold = Arc::new(Hold {
+            matches: Box::new(matches),
+            max,
+            arrived: AtomicUsize::new(0),
+            released: watch::channel(false).0,
+        });
+        self.holds.lock().unwrap().push(hold.clone());
+        hold
     }
 
     /// Turns faults on or off (for fault-free verification at the end).
@@ -113,6 +184,16 @@ impl ObjectStore for Faulty {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
+        let hold = self
+            .holds
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|h| h.take(location.as_ref()))
+            .cloned();
+        if let Some(h) = hold {
+            h.wait().await;
+        }
         self.before("put").await?;
         let r = self.inner.put_opts(location, payload, opts).await;
         self.after("put response", r)

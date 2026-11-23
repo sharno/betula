@@ -972,8 +972,8 @@ async fn regional_logs_are_followed_applied_and_collected() {
 
     // The remote writer's log is in its own store, not the home one.
     let wid = remote.writer_id();
-    assert!(objects(&eu_store, &format!("writers/{wid}/wal")).await > 0);
-    assert_eq!(objects(&home, &format!("writers/{wid}/wal")).await, 0);
+    assert!(objects(&eu_store, &format!("wal/{wid}")).await > 0);
+    assert_eq!(objects(&home, &format!("wal/{wid}")).await, 0);
 
     // The applier needs the region to pull it.
     let blind = Db::builder(ROOT, home.clone())
@@ -1029,7 +1029,7 @@ async fn regional_logs_are_followed_applied_and_collected() {
     clock.advance(Duration::from_secs(120));
     let stats = applier.run_gc(Duration::from_secs(60)).await.unwrap();
     assert!(stats.wals > 0, "{stats:?}");
-    assert_eq!(objects(&eu_store, &format!("writers/{wid}/wal")).await, 0);
+    assert_eq!(objects(&eu_store, &format!("wal/{wid}")).await, 0);
     remote.close().await.unwrap();
     applier.close().await.unwrap();
 }
@@ -1207,6 +1207,178 @@ async fn lagging_new_writer_cannot_undercut_a_dropped_tombstone() {
     assert_eq!(a.get("k").await.unwrap().as_deref(), Some(&b"late"[..]));
     a.checkpoint().await.unwrap();
     assert_eq!(a.get("k").await.unwrap().as_deref(), Some(&b"late"[..]));
+}
+
+/// Two writers on a store whose PUTs can be held in flight: `b` the applier,
+/// `a` a plain writer, both on one clock (so nothing here is clock skew).
+async fn held_pair() -> (Arc<Faulty>, Arc<ManualClock>, Db, Db) {
+    let faulty = Arc::new(Faulty::new(Arc::new(InMemory::new()), Faults::NONE, 0));
+    let os: Arc<dyn ObjectStore> = faulty.clone();
+    let clock = ManualClock::new();
+    let mut cfg = tiny_config();
+    cfg.lease.ttl = Duration::from_secs(5);
+    let build = |cfg: Settings| {
+        Db::builder(ROOT, os.clone())
+            .with_settings(cfg)
+            .with_clock(clock.clone())
+            .build()
+    };
+    let b = build(cfg.clone()).await.unwrap();
+    let a = build(Settings {
+        applier: ApplierRole::Never,
+        ..cfg
+    })
+    .await
+    .unwrap();
+    assert!(b.is_applier());
+    (faulty, clock, a, b)
+}
+
+/// Lets unheld leases renew after the clock jumped (a lease interval is 5 ms).
+async fn renewed() {
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+fn is_lease_of(w: sidra::WriterId) -> impl Fn(&str) -> bool + Send + Sync + 'static {
+    let w = w.to_string();
+    move |p| p.contains(&w) && p.ends_with("/lease")
+}
+
+fn is_log_of(w: sidra::WriterId) -> impl Fn(&str) -> bool + Send + Sync + 'static {
+    let w = w.to_string();
+    move |p| p.contains(&w) && p.ends_with(".wal")
+}
+
+/// A log write held in flight while its writer's lease runs out must not
+/// land once the applier stopped counting that writer: a newer tombstone for
+/// the key may already be gone, and the late write would resurrect the key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_log_write_cannot_resurrect_a_dropped_tombstone() {
+    let (faulty, clock, a, b) = held_pair().await;
+    let leases = faulty.hold_puts(is_lease_of(a.writer_id()), usize::MAX);
+    let log = faulty.hold_puts(is_log_of(a.writer_id()), 1);
+    clock.tick();
+    let a = Arc::new(a);
+    let pending = tokio::spawn({
+        let a = a.clone();
+        async move { a.put("k", "old").await }
+    });
+    wait_until("log write in flight", || log.arrived() == 1).await;
+    clock.tick();
+    b.delete("k").await.unwrap();
+    // `a`'s lease runs out; checkpoint until the tombstone is gone.
+    clock.advance(Duration::from_secs(10));
+    for round in 0..5u32 {
+        clock.advance(Duration::from_secs(1));
+        renewed().await;
+        clock.tick();
+        b.put(format!("z{round}"), "v").await.unwrap();
+        b.checkpoint().await.unwrap();
+    }
+    assert_eq!(b.tree_shape().await.unwrap().tombstones, 0);
+
+    log.release();
+    let acked = pending.await.unwrap();
+    let fresh = sidra::ReadOptions {
+        freshness: sidra::Freshness::Latest,
+    };
+    let got = b.get_with("k", fresh).await.unwrap();
+    assert_eq!(
+        got, None,
+        "deleted key resurrected; the late write returned {acked:?}"
+    );
+    assert_eq!(acked.unwrap_err().kind(), ErrorKind::WriterLost);
+    leases.release();
+}
+
+/// A writer whose lease lapsed long enough for GC to forget it must not
+/// acknowledge writes on its return: fresh readers would never see them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forgotten_writer_cannot_acknowledge_unreadable_writes() {
+    let (faulty, clock, a, b) = held_pair().await;
+    clock.tick();
+    a.put("first", "1").await.unwrap();
+    b.checkpoint().await.unwrap();
+    let leases = faulty.hold_puts(is_lease_of(a.writer_id()), usize::MAX);
+    // `a`'s lease runs out, then everything ages past the GC retention.
+    for step in [10, 120, 120] {
+        clock.advance(Duration::from_secs(step));
+        renewed().await;
+        clock.tick();
+        b.put(format!("z{step}"), "v").await.unwrap();
+        b.checkpoint().await.unwrap();
+    }
+    clock.advance(Duration::from_secs(120));
+    renewed().await;
+    let stats = b.run_gc(Duration::from_secs(60)).await.unwrap();
+    assert!(stats.writers == 1 && stats.wals > 0, "{stats:?}");
+    renewed().await;
+    clock.tick();
+    b.put("z", "v").await.unwrap();
+    b.checkpoint().await.unwrap();
+
+    // Renewal resumes under the same writer id.
+    leases.release();
+    renewed().await;
+    clock.tick();
+    let acked = a.put("second", "2").await;
+    let reader = DbReader::builder(ROOT, faulty.clone() as Arc<dyn ObjectStore>)
+        .with_settings(reader_config())
+        .build()
+        .await
+        .unwrap();
+    let seen = reader.get("second").await.unwrap();
+    match acked {
+        Ok(()) => assert_eq!(
+            seen.as_deref(),
+            Some(&b"2"[..]),
+            "acknowledged but unreadable"
+        ),
+        Err(e) => assert_eq!(e.kind(), ErrorKind::WriterLost, "{e}"),
+    }
+}
+
+/// A closing writer seals its own log. Once applied and past retention, GC
+/// forgets the writer but keeps the seal, and its writes stay readable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_writer_is_sealed_then_forgotten() {
+    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = ManualClock::new();
+    let a = open(&os, &clock).await;
+    let c = open(&os, &clock).await;
+    let cid = c.writer_id();
+    clock.tick();
+    c.put("x", "1").await.unwrap();
+    c.close().await.unwrap();
+    a.checkpoint().await.unwrap();
+    let admin = sidra::Admin::new(ROOT, os.clone());
+    let info = |ws: Vec<sidra::WriterInfo>| ws.into_iter().find(|w| w.id == cid);
+    let sealed = info(admin.writers().await.unwrap()).unwrap();
+    assert!(sealed.sealed && sealed.unapplied == 0, "{sealed:?}");
+
+    for _ in 0..2 {
+        clock.advance(Duration::from_secs(120));
+        clock.tick();
+        a.put("z", "v").await.unwrap();
+        a.checkpoint().await.unwrap();
+    }
+    let stats = a.run_gc(Duration::from_secs(60)).await.unwrap();
+    assert_eq!(stats.writers, 1, "{stats:?}");
+    clock.tick();
+    a.put("z", "w").await.unwrap();
+    a.checkpoint().await.unwrap();
+    assert!(info(admin.writers().await.unwrap()).is_none());
+    assert_eq!(
+        objects(&os, &format!("wal/{cid}")).await,
+        1,
+        "the seal stays"
+    );
+    let reader = DbReader::builder(ROOT, os.clone())
+        .with_settings(reader_config())
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(reader.get("x").await.unwrap().as_deref(), Some(&b"1"[..]));
 }
 
 /// Backpressure counts what memory holds: every unapplied batch, even when

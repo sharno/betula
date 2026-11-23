@@ -1,6 +1,6 @@
 //! Inspection and maintenance of a database without opening a writer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +36,8 @@ pub struct ManifestInfo {
     pub live_bytes: u64,
     /// Last applied log sequence number per writer.
     pub applied: BTreeMap<WriterId, u64>,
+    /// Writers whose log is sealed right after their applied entries.
+    pub sealed: BTreeSet<WriterId>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,7 +48,10 @@ pub struct WriterInfo {
     /// Lease expiry by the writer's clock; `None` if it never wrote one.
     pub lease_expires_at_ms: Option<u64>,
     pub live: bool,
-    /// Log objects still in storage, and how many of them aren't applied.
+    /// Its log is sealed and fully applied: it can't write anymore.
+    pub sealed: bool,
+    /// Log objects still in storage (a seal included), and how many entries
+    /// aren't applied.
     pub log_objects: usize,
     pub unapplied: usize,
 }
@@ -123,20 +128,22 @@ impl Admin {
                 segment_bytes: m.segments.values().map(|u| u.total).sum(),
                 live_bytes: m.segments.values().map(|u| u.live).sum(),
                 applied: m.frontier,
+                sealed: m.sealed,
             }))
     }
 
     pub async fn writers(&self) -> Result<Vec<WriterInfo>> {
         let store = self.store();
-        let applied = self
+        let (applied, sealed) = self
             .manifest()
             .await?
-            .map(|m| m.applied)
+            .map(|m| (m.applied, m.sealed))
             .unwrap_or_default();
         let now = self.clock.now_ms();
         let ids = store.list_writers().await?;
         try_join_all(ids.into_iter().map(|id| {
             let upto = applied.get(&id).copied().unwrap_or(0);
+            let sealed = sealed.contains(&id);
             async move {
                 let (lease, seqs) = futures::try_join!(wal::read_lease(store, id), async {
                     self.logs.of(id).await?.list_wals(id).await
@@ -145,9 +152,14 @@ impl Admin {
                     id,
                     log: lease.as_ref().map(|l| l.log.clone()),
                     lease_expires_at_ms: lease.as_ref().map(|l| l.expires_at_ms),
-                    live: lease.is_some_and(|l| l.expires_at_ms > now),
+                    live: !sealed && lease.is_some_and(|l| l.expires_at_ms > now),
+                    sealed,
                     log_objects: seqs.len(),
-                    unapplied: seqs.iter().filter(|s| **s > upto).count(),
+                    // A sealed log's only object past `upto` is the seal.
+                    unapplied: seqs
+                        .iter()
+                        .filter(|s| **s > upto + u64::from(sealed))
+                        .count(),
                 })
             }
         }))

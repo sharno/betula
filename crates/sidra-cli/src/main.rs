@@ -149,13 +149,12 @@ async fn main() -> Result<()> {
                 "writer", "live", "log in", "logs", "unapplied"
             );
             for w in writers {
-                let lease = w.lease_expires_at_ms.map_or("none".into(), |t| {
-                    if w.live {
-                        "valid".into()
-                    } else {
-                        format!("expired {}", ago(t))
-                    }
-                });
+                let lease = match (w.sealed, w.lease_expires_at_ms) {
+                    (true, _) => "sealed".into(),
+                    (false, None) => "none".into(),
+                    (false, Some(_)) if w.live => "valid".into(),
+                    (false, Some(t)) => format!("expired {}", ago(t)),
+                };
                 let at = match &w.log {
                     Some(sidra::LogHome::Region(r)) => r.to_string(),
                     Some(sidra::LogHome::Home) | None => "home".into(),

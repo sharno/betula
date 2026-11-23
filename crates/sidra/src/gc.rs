@@ -6,13 +6,16 @@
 //! `m[i-1]` (readers must refresh within the retention), so `m[i]`'s dead
 //! segments, `m[i-1]` itself, and writer log entries already folded into
 //! `m[i]` can go. The latest manifest is never deleted.
+//!
+//! Log seals are never deleted: a writer id's seal is what keeps it from
+//! writing again (see `wal`). They live apart from leases, so the writers
+//! everyone lists and polls are only the ones that still matter.
 
 use std::time::Duration;
 
 use crate::error::Result;
 use crate::logs::Logs;
-use crate::manifest;
-use crate::manifest::Frontier;
+use crate::manifest::{self, Frontier, Manifest};
 use crate::store::{Pace, Store};
 use object_store::path::Path;
 
@@ -115,23 +118,40 @@ pub async fn run(logs: &Logs, now_ms: u64, retention: Duration, speed: Speed) ->
     for (at, paths) in groups {
         at.delete_paced(paths, pace).await?;
     }
-    stats.writers = forget_writers(logs, now_ms, retention_ms).await?;
+    let latest = match ids.last() {
+        Some(id) => manifest::load(store, *id).await?,
+        None => None,
+    };
+    stats.writers = match latest {
+        Some(m) => forget_writers(logs, &m, now_ms, retention_ms).await?,
+        None => 0,
+    };
     Ok(stats)
 }
 
-/// Deletes the leases of writers that expired more than `retention_ms` ago
-/// and have no log objects left. Such a writer stopped writing long ago (an
-/// expired writer never writes again), so nothing can need its lease; once
-/// it's gone the applier also drops the writer from the manifest.
-async fn forget_writers(logs: &Logs, now_ms: u64, retention_ms: u64) -> Result<usize> {
+/// Deletes the leases of writers whose log `latest` records as sealed (so
+/// fully applied), once the lease expired more than `retention_ms` ago
+/// (readers of older manifests may still look up where the log lives) and
+/// only the seal is left of the log (nothing deletes applied entries once
+/// the writer leaves the manifest). The applier then drops the writer from
+/// the manifest; its seal stays.
+async fn forget_writers(
+    logs: &Logs,
+    latest: &Manifest,
+    now_ms: u64,
+    retention_ms: u64,
+) -> Result<usize> {
     let store = logs.home();
-    let writers = store.list_writers().await?;
-    let gone: Vec<_> = futures::future::try_join_all(writers.into_iter().map(|w| async move {
+    let gone: Vec<_> = futures::future::try_join_all(latest.sealed.iter().map(|&w| async move {
+        let applied = latest.frontier.get(&w).copied().unwrap_or(0);
         let forget = match wal::read_lease(store, w).await? {
-            Some(l) if now_ms.saturating_sub(l.expires_at_ms) > retention_ms => {
-                logs.at(&l.log)?.list_wals(w).await?.is_empty()
-            }
-            _ => false,
+            Some(l) if now_ms.saturating_sub(l.expires_at_ms) > retention_ms => logs
+                .at(&l.log)?
+                .list_wals(w)
+                .await?
+                .iter()
+                .all(|seq| *seq > applied),
+            Some(_) | None => false,
         };
         Ok::<_, crate::error::Error>(forget.then(|| store.lease_path(w)))
     }))

@@ -85,7 +85,9 @@ cd crates/sidra && cargo kani
   (`tests/model.rs`), not by these proofs.
 - Segment GC and the cleaner's relocation are checked only by the accounting
   invariant in the proptest.
-- The model assumes lease expiry is honored (a writer stops before the
-  applier treats its lease as expired), which in the code rests on clock
-  skew staying within the lease margin. Other clock readings are
-  unconstrained.
+- The model treats a writer's end as atomic (`Expire`: it stops flushing
+  and appliers stop counting it in one step). The code gets this from log
+  seals rather than clocks: an applier stops counting a writer only after a
+  put-if-absent seal at its next log slot, after which no flush can land,
+  and the entries before the seal go into the same checkpoint. Seals
+  themselves aren't modeled. Clock readings are unconstrained.

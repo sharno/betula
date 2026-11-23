@@ -123,14 +123,14 @@ RustFS or MinIO).
 | Kind | Meaning |
 |---|---|
 | `Unavailable` | The store failed after retries. Safe to retry (`err.is_retryable()`) |
-| `WriterLost` | Lease expired or writer id taken. Open a new writer |
+| `WriterLost` | Log sealed (presumed dead after its lease lapsed), writer id taken, or a log write's outcome unknown. Open a new writer |
 | `NotApplier` | An applier-only call on a process without the role |
 | `Closed` | The handle was closed |
 | `SnapshotExpired` | A snapshot was held past the GC retention |
 | `Corrupt` | Stored data failed validation |
 | `InvalidConfig` | Bad settings or URL |
 
-`db.status()` reports a background failure (such as a lost lease) without
+`db.status()` reports a background failure (such as a sealed log) without
 having to write. Call `db.close().await` before exit: dropping a writer warns
 and may lose writes that were only queued.
 
@@ -164,9 +164,9 @@ The same operations are available as a library: `sidra::Admin`.
 ## Design
 
 ```
-writer A ─► writers/A/wal/{seq} ─┐
-writer B ─► writers/B/wal/{seq} ─┼─► applier: fold into tree COW ─► one segment + manifest (put-if-absent)
-writer C ─► writers/C/wal/{seq} ─┘
+writer A ─► wal/A/{seq} ─┐
+writer B ─► wal/B/{seq} ─┼─► applier: fold into tree COW ─► one segment + manifest (put-if-absent)
+writer C ─► wal/C/{seq} ─┘
 ```
 
 - **Writers never coordinate.** Each write gets a hybrid logical clock
@@ -206,10 +206,18 @@ writer C ─► writers/C/wal/{seq} ─┘
 - **Tombstones.** Deletes stay as tombstones until no writer can still
   produce an older version of the key. Each writer's lease
   (`writers/{id}/lease`) carries a floor under every timestamp it may still
-  make durable, and the applier drops tombstones below the lowest live
-  floor. Two rules make this safe:
+  make durable, and the applier drops tombstones below the lowest floor of
+  every writer whose log isn't sealed. Three rules make this safe:
   - The applier pulls logs from every writer whose lease it read, after
     reading the leases.
+  - A writer stops counting only once its log is **sealed**: a seal record
+    put-if-absent at its next sequence number. Log slots are consecutive and
+    a writer never skips one, so nothing can land after a seal, and a write
+    still in flight either lands first (and is pulled into the same
+    checkpoint) or finds the seal and fails unacknowledged. The applier
+    seals writers whose lease lapsed; a closing writer seals its own log.
+    Lease expiry only says when to seal, so a delayed request or a skewed
+    clock can't bring back a deleted key.
   - A rewrite carries the parent's buffered versions for that range down
     with it, so a rewritten leaf has no older version of its keys above it.
 
@@ -236,12 +244,12 @@ writer C ─► writers/C/wal/{seq} ─┘
 - No compare-and-set or transactions across writers (yet).
 - Readers and snapshots must refresh within the GC retention (default
   10 min).
-- Tombstones are dropped only below a bound every new writer moves its clock
-  past before writing, so a writer that starts late with a lagging clock
-  can't undercut one. Writers near lease expiry still rely on clock skew
-  staying within the lease margin (a quarter of the lease TTL): a writer
-  stops acknowledging writes by its own clock, the applier judges expiry by
-  its own.
+- Dropping tombstones doesn't depend on clocks. A writer counts until its
+  log is sealed, however late its requests arrive; a writer that starts late
+  with a lagging clock first moves its clock past a bound below which
+  tombstones may already be gone. Clock skew only affects liveness: a
+  writer whose lease looks expired to the applier gets sealed and fails with
+  `WriterLost`, and a live writer with a stale lease holds tombstones back.
 - One writer's unreachable log store (a regional outage) doesn't stall the
   others: their writes keep getting applied, tombstone collection pauses,
   and `Freshness::Latest` reads fail rather than miss writes.
@@ -251,8 +259,10 @@ writer C ─► writers/C/wal/{seq} ─┘
   writes, which costs about (writers − 1) × log bytes in GETs. With
   `poll.follow = "manifest_only"` a writer sees others' writes once applied
   (about a checkpoint interval), unless it reads with `Freshness::Latest`.
-- GC deletes the leases of writers that expired long ago and have no logs
-  left, and the applier then drops them from the manifest.
+- GC deletes the leases of sealed, fully applied writers whose lease expired
+  over a retention ago, and the applier then drops them from the manifest.
+  The seal object stays forever (a few bytes per writer id ever opened),
+  so a forgotten writer id can never write again.
 - No merging of underfull leaves (only empty ones are removed), so heavy
   deletes leave sparse leaves until rewritten (see the roadmap).
 - Store requests retry transient failures with capped backoff (8 attempts,

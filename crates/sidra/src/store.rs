@@ -2,7 +2,9 @@
 //!
 //! - `manifest/{id:020}.mf`: immutable manifests; the highest id is current.
 //!   Writers publish with put-if-absent, which is the only coordination point.
-//! - `writers/{writer}/wal/{seq:020}.wal`: each writer's log, put-if-absent.
+//! - `wal/{writer}/{seq:020}.wal`: each writer's log, put-if-absent. A sealed
+//!   log keeps its seal forever, so it stays apart from `writers/`, which
+//!   lists only writers that still matter.
 //! - `writers/{writer}/lease`: each writer's liveness and timestamp floor.
 //! - `seg/{epoch:020}-{seq:020}.seg`: one per checkpoint, holding every node
 //!   that checkpoint wrote, back to back. Nodes are read with ranged GETs.
@@ -129,10 +131,12 @@ impl Store {
         self.dir("writers").join(writer.to_string())
     }
 
+    fn wal_dir(&self, writer: WriterId) -> Path {
+        self.dir("wal").join(writer.to_string())
+    }
+
     pub fn wal_path(&self, writer: WriterId, seq: u64) -> Path {
-        self.writer_dir(writer)
-            .join("wal")
-            .join(format!("{seq:020}.wal"))
+        self.wal_dir(writer).join(format!("{seq:020}.wal"))
     }
 
     pub fn lease_path(&self, writer: WriterId) -> Path {
@@ -335,7 +339,7 @@ impl Store {
     }
 
     pub async fn list_wals(&self, writer: WriterId) -> Result<Vec<u64>> {
-        let prefix = self.writer_dir(writer).join("wal");
+        let prefix = self.wal_dir(writer);
         let metas = self.list(&prefix, None).await?;
         let mut seqs: Vec<u64> = metas
             .iter()

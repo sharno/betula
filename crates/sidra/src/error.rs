@@ -8,10 +8,11 @@ pub enum Error {
     /// (or just lost to another process).
     #[error("this process is not the applier")]
     NotApplier,
-    /// The writer couldn't renew its lease in time, so the applier may already
-    /// treat it as gone. Open a new writer.
-    #[error("writer lease expired")]
-    LeaseExpired,
+    /// This writer's log was sealed: the applier presumed it dead (its lease
+    /// lapsed), or it closed. The write that found the seal is not durable.
+    /// Open a new writer.
+    #[error("writer log sealed")]
+    LogSealed,
     /// Another process is writing under this writer id.
     #[error("writer id already in use")]
     WriterIdTaken,
@@ -40,7 +41,7 @@ pub enum ErrorKind {
     /// The object store failed after retries. The operation may succeed if
     /// repeated.
     Unavailable,
-    /// This writer can no longer write (lease expired, writer id taken, or a
+    /// This writer can no longer write (log sealed, writer id taken, or a
     /// log write failed). Open a new one.
     WriterLost,
     /// The operation needs the applier role, which this process doesn't hold.
@@ -60,7 +61,7 @@ impl Error {
     pub fn kind(&self) -> ErrorKind {
         match self {
             Error::ObjectStore(_) => ErrorKind::Unavailable,
-            Error::LeaseExpired | Error::WriterIdTaken | Error::LogWriteFailed(_) => {
+            Error::LogSealed | Error::WriterIdTaken | Error::LogWriteFailed(_) => {
                 ErrorKind::WriterLost
             }
             Error::NotApplier => ErrorKind::NotApplier,

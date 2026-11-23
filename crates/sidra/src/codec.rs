@@ -12,7 +12,8 @@ use crate::error::{Error, Result};
 // 2: timestamped versions, per-writer logs. 3: append-only runs, manifest
 // records the applier. 4: codec byte. 5: leases record log placement.
 // 6: leases record applier candidacy. 7: manifests carry a tombstone bound.
-const VERSION: u8 = 7;
+// 8: log seals, logs under `wal/`, manifests list sealed writers.
+const VERSION: u8 = 8;
 const HEADER: usize = 6;
 
 #[derive(Copy, Clone, Debug)]

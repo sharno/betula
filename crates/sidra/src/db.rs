@@ -13,7 +13,9 @@
 //! unapplied for too long. Losing the role never affects writing.
 //!
 //! Versions merge newest-wins, so applying entries in any order is correct, and
-//! a slow writer's late entries need no special handling.
+//! a slow writer's late entries need no special handling. A writer presumed
+//! dead has its log sealed first (see `wal`), so none can arrive after the
+//! applier stopped waiting for it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::BuildHasher;
@@ -189,8 +191,6 @@ struct Shared {
     hlc: Hlc,
     /// Timestamps handed out but not yet durable (multiset).
     inflight: Mutex<BTreeMap<u64, usize>>,
-    /// The writer must not acknowledge writes at or after this (own clock).
-    lease_valid_until_ms: AtomicU64,
     applier: tokio::sync::Mutex<Option<Applier>>,
     is_applier: AtomicBool,
     /// Set once this writer can no longer write.
@@ -259,12 +259,7 @@ impl Shared {
 
     async fn renew_lease(&self) -> Result<()> {
         let ttl = self.cfg.lease.ttl.as_millis() as u64;
-        let started = self.now();
-        self.write_lease(started + ttl).await?;
-        // Stop a quarter-ttl early to absorb clock skew with the applier.
-        self.lease_valid_until_ms
-            .store(started + ttl - ttl / 4, Ordering::Release);
-        Ok(())
+        self.write_lease(self.now() + ttl).await
     }
 
     fn set_role(&self, guard: &mut Option<Applier>, role: Option<Applier>) {
@@ -392,42 +387,54 @@ impl Shared {
                 .is_some_and(|t| self.now() >= t + interval)
     }
 
-    /// Lowest floor among writers with a live lease. Must be read *before*
+    /// Every writer's lease, and this writer's floor. Must be read *before*
     /// pulling log entries, and the pull must cover every writer listed here:
     /// an entry made durable before its writer's lease was written is then
     /// already visible to the pull. (Pulling only previously known writers
     /// let a new writer's older entry arrive after a newer tombstone for the
     /// same key had been dropped, resurrecting the key.)
-    ///
-    /// Also returns every writer with objects in storage, and whether a
-    /// primary candidate other than this writer is alive.
-    async fn lease_floor(&self) -> Result<LeaseScan> {
+    async fn scan_leases(&self) -> Result<LeaseScan> {
         let store = self.store();
-        let now = self.now();
         let writers = store.list_writers().await?;
         self.follower.track(writers.iter().copied());
-        let leases =
+        let leases: Vec<Lease> =
             futures::future::try_join_all(writers.iter().map(|w| wal::read_lease(store, *w)))
-                .await?;
+                .await?
+                .into_iter()
+                .flatten()
+                .collect();
         let logs = self.follower.logs();
-        let live: Vec<Lease> = leases
-            .into_iter()
-            .flatten()
-            .inspect(|l| logs.learn(l))
-            .filter(|l| l.expires_at_ms > now)
-            .collect();
-        let floor = live
-            .iter()
-            .map(|l| l.floor_hlc)
-            .chain([self.floor_hlc()])
-            .min()
-            .expect("chained with our own floor");
+        leases.iter().for_each(|l| logs.learn(l));
         Ok(LeaseScan {
-            floor,
+            own_floor: self.floor_hlc(),
+            leases,
             present: writers.into_iter().collect(),
-            primary_alive: live
-                .iter()
-                .any(|l| l.candidacy == Candidacy::Primary && l.writer != self.writer),
+        })
+    }
+
+    /// Seals the logs of other writers whose lease ran out, pulling their
+    /// last entries. A log that can't be reached stays unsealed, so its
+    /// writer keeps holding tombstones back.
+    async fn seal_expired(&self, leases: &[Lease]) -> Result<()> {
+        let now = self.now();
+        let view = self.follower.view();
+        let expired = leases.iter().filter(|l| {
+            l.expires_at_ms <= now && l.writer != self.writer && !view.is_sealed(l.writer)
+        });
+        let sealed = futures::future::join_all(expired.map(|l| async move {
+            let r = self.follower.seal(l.writer, now).await;
+            if r.is_ok() {
+                tracing::info!(writer = %l.writer, "sealed the log of an expired writer");
+            }
+            r
+        }))
+        .await;
+        sealed.into_iter().try_for_each(|r| match r {
+            Err(e) if e.is_retryable() => {
+                tracing::warn!(%e, "sealing an expired writer's log");
+                Ok(())
+            }
+            other => other,
         })
     }
 
@@ -439,16 +446,17 @@ impl Shared {
         };
         let started = Instant::now();
         let LeaseScan {
-            floor,
+            own_floor,
+            leases,
             present,
-            primary_alive,
-        } = self.lease_floor().await?;
+        } = self.scan_leases().await?;
         let leased = started.elapsed();
         let unreachable = self
             .follower
             .refresh(false, Scope::AllWriters, self.now())
             .await?
             .unreachable;
+        self.seal_expired(&leases).await?;
         let pulled = started.elapsed();
         let misses_before = self.nodes.cache_stats().misses;
         let view = self.follower.view();
@@ -457,19 +465,35 @@ impl Shared {
             return Err(Error::NotApplier);
         }
         let victims = segments::pick_victims(&view.manifest.segments, &self.cfg.cleaner);
-        if view.tails.is_empty() && victims.is_empty() {
+        if view.tails.is_empty() && view.tails.sealed().next().is_none() && victims.is_empty() {
             return Ok(());
         }
         // A tombstone can go once no writer can still produce an older
         // version of its key. (Older versions already in the tree are carried
-        // down to the leaf whenever the leaf is rewritten.) Writers with a
-        // live lease stay above `floor`. A writer whose lease this scan
-        // missed wrote it after the previous manifest was published, then
-        // read a manifest at least that new and moved its clock past its
-        // `tombstone_bound` before writing: so the bound published last time
-        // caps what's safe to drop now. Clock skew doesn't enter into it.
-        // A writer whose log couldn't be pulled may hold entries older than
-        // the floor, so drop no tombstones until it's reachable again.
+        // down to the leaf whenever the leaf is rewritten, and so are this
+        // checkpoint's entries.) Every leased writer stays above its lease's
+        // floor until its log is sealed: then all its entries are in this
+        // checkpoint or applied, and it can write no more. Expiry alone
+        // proves nothing (a write may still be in flight), so a writer with a
+        // stale lease holds the floor back until sealed.
+        let floor = leases
+            .iter()
+            .filter(|l| !view.is_sealed(l.writer))
+            .map(|l| l.floor_hlc)
+            .fold(own_floor, u64::min);
+        let primary_alive = leases.iter().any(|l| {
+            l.candidacy == Candidacy::Primary
+                && l.writer != self.writer
+                && !view.is_sealed(l.writer)
+                && l.expires_at_ms > self.now()
+        });
+        // A writer whose lease this scan missed wrote it after the previous
+        // manifest was published, then read a manifest at least that new and
+        // moved its clock past its `tombstone_bound` before writing: so the
+        // bound published last time caps what's safe to drop now. Clock skew
+        // doesn't enter into it. A writer whose log couldn't be pulled may
+        // hold entries older than the floor, so drop no tombstones until
+        // it's reachable again.
         let drop_below = match unreachable.is_empty() {
             true => Ts {
                 hlc: floor.min(view.manifest.tombstone_bound),
@@ -520,12 +544,21 @@ impl Shared {
             applier_epoch: app.epoch,
             applier: Some(self.writer),
             tree: plan.root,
-            // Writers GC forgot (no lease, no logs) can never write again.
+            // Writers GC forgot (sealed, lease deleted) can never write again.
             frontier: view
                 .tails
                 .frontier(&view.manifest.frontier)
                 .into_iter()
                 .filter(|(w, _)| present.contains(w))
+                .collect(),
+            // Every entry before these seals is in this checkpoint.
+            sealed: view
+                .manifest
+                .sealed
+                .iter()
+                .copied()
+                .chain(view.tails.sealed())
+                .filter(|w| present.contains(w))
                 .collect(),
             segment_watermark: app.next_segment,
             tombstone_bound: view.manifest.tombstone_bound.max(floor),
@@ -600,9 +633,10 @@ pub struct Audit {
 }
 
 struct LeaseScan {
-    floor: u64,
+    own_floor: u64,
+    leases: Vec<Lease>,
+    /// Every writer with a lease in storage.
     present: BTreeSet<WriterId>,
-    primary_alive: bool,
 }
 
 pub struct Db {
@@ -704,7 +738,6 @@ impl Db {
             writer,
             hlc: Hlc::default(),
             inflight: Mutex::new(BTreeMap::new()),
-            lease_valid_until_ms: AtomicU64::new(0),
             applier: tokio::sync::Mutex::new(None),
             is_applier: AtomicBool::new(false),
             fatal: OnceLock::new(),
@@ -870,7 +903,7 @@ impl Db {
     }
 
     /// `Ok` while this writer can write; otherwise the error that stopped it
-    /// (for example a lost lease). Background failures surface here.
+    /// (for example a sealed log). Background failures surface here.
     pub fn status(&self) -> Result<()> {
         self.shared.check()
     }
@@ -969,9 +1002,10 @@ impl Db {
         }
     }
 
-    /// Flushes pending writes, applies them if this process is the applier,
-    /// marks the lease expired, and stops background work. Entries not yet
-    /// applied are applied later by whoever holds the role.
+    /// Flushes pending writes, seals this writer's log, applies it if this
+    /// process is the applier, marks the lease expired, and stops background
+    /// work. Entries not yet applied are applied later by whoever holds the
+    /// role.
     pub async fn close(mut self) -> Result<()> {
         // Dropping the sender makes the log task flush and exit.
         self.cmd.take();
@@ -981,6 +1015,16 @@ impl Db {
         }
         self.shared.shutdown.send_replace(true);
         futures::future::join_all(tasks).await;
+        // So the applier can stop holding tombstones back for us now rather
+        // than once our lease expires.
+        let sealed = self
+            .shared
+            .follower
+            .seal(self.shared.writer, self.shared.now())
+            .await;
+        if let Err(e) = sealed {
+            tracing::warn!(%e, "sealing the log on close failed");
+        }
         // A free (or dead applier's) role: take it so our writes get applied
         // now rather than whenever another writer next runs.
         if let Err(e) = self.shared.maybe_claim().await {
@@ -997,7 +1041,7 @@ impl Db {
                 Err(e) => tracing::warn!(%e, "final checkpoint failed"),
             }
         }
-        // Expire the lease so tombstone collection doesn't wait for us.
+        // Expire the lease: if sealing failed, the applier seals for us.
         let _ = self.shared.write_lease(self.shared.now()).await;
         match self.shared.fatal.get() {
             Some(e) => Err(e.clone()),
@@ -1136,9 +1180,6 @@ impl WalTask {
             }
             installed.await;
         }
-        if shared.now() >= shared.lease_valid_until_ms.load(Ordering::Acquire) {
-            return Err(shared.fail(Error::LeaseExpired));
-        }
         let batch = WalBatch {
             writer: shared.writer,
             ops,
@@ -1147,6 +1188,9 @@ impl WalTask {
         let compression = shared.cfg.compression;
         match wal::write(&shared.own_log, seq, &batch, compression).await {
             Ok(WalWrite::Written) => {}
+            // Presumed dead: this batch is not in the log, and no later one
+            // can be.
+            Ok(WalWrite::Sealed) => return Err(shared.fail(Error::LogSealed)),
             Ok(WalWrite::Taken) => return Err(shared.fail(Error::WriterIdTaken)),
             // The outcome is unknown, so the next batch can't safely reuse
             // this sequence number: stop writing.
@@ -1173,7 +1217,9 @@ async fn every(period: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
 }
 
 async fn lease_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
-    while every(shared.cfg.lease.interval, &mut shutdown).await {
+    // A writer that can't write lets its lease lapse, so the applier seals
+    // its log and stops holding tombstones back for it.
+    while every(shared.cfg.lease.interval, &mut shutdown).await && shared.check().is_ok() {
         if let Err(e) = shared.renew_lease().await {
             tracing::warn!(%e, "lease renewal failed");
         }

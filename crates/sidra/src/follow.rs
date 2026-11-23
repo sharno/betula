@@ -3,7 +3,8 @@
 //!
 //! Polling uses GETs on the next expected id (manifests and log entries are
 //! numbered consecutively), which cost far less than LISTs. LIST runs only on
-//! discovery, to find new writers and to catch up after GC.
+//! discovery, to find new writers and to catch up after GC. A sealed log
+//! (see `wal`) ends at its seal; once applied, it isn't polled again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -18,8 +19,9 @@ use crate::manifest::{self, Frontier, Manifest};
 use crate::memtable::Memtable;
 use crate::nodes::{Nodes, Warm};
 use crate::snapshot::Snapshot;
+use crate::store::Store;
 use crate::types::ManifestId;
-use crate::wal::{self, WalBatch};
+use crate::wal::{self, SealAt, WalBatch, WalRecord};
 
 /// Writer log entries not yet in the tree, merged newest-wins.
 #[derive(Clone, Debug, Default)]
@@ -31,6 +33,9 @@ pub struct Tails {
     retained: usize,
     /// When the oldest unapplied entry was first seen.
     pub since_ms: Option<u64>,
+    /// Seals no manifest records yet, by sequence number. Every entry of the
+    /// writer between the manifest's frontier and its seal is held here.
+    sealed: BTreeMap<WriterId, u64>,
 }
 
 impl Tails {
@@ -46,6 +51,11 @@ impl Tails {
         self.retained
     }
 
+    /// Writers whose seal was found since the last manifest.
+    pub fn sealed(&self) -> impl Iterator<Item = WriterId> + '_ {
+        self.sealed.keys().copied()
+    }
+
     fn add(&mut self, seq: u64, batch: Arc<WalBatch>, now_ms: u64) {
         let log = self.batches.entry(batch.writer).or_default();
         if log.contains_key(&seq) {
@@ -57,13 +67,14 @@ impl Tails {
         self.since_ms.get_or_insert(now_ms);
     }
 
-    /// Drops entries the tree now holds.
-    fn prune(&mut self, applied: &Frontier, now_ms: u64) {
+    /// Drops entries (and seals) the manifest holds.
+    fn prune(&mut self, m: &Manifest, now_ms: u64) {
         self.batches.iter_mut().for_each(|(w, log)| {
-            let upto = applied.get(w).copied().unwrap_or(0);
+            let upto = m.frontier.get(w).copied().unwrap_or(0);
             log.retain(|seq, _| *seq > upto);
         });
         self.batches.retain(|_, log| !log.is_empty());
+        self.sealed.retain(|w, _| !m.sealed.contains(w));
         self.retained = self
             .batches
             .values()
@@ -80,13 +91,14 @@ impl Tails {
         self.since_ms = (!self.is_empty()).then_some(now_ms);
     }
 
+    /// The first sequence number of `writer` neither held nor applied.
     fn next_seq(&self, writer: WriterId, applied: &Frontier) -> u64 {
         let known = self
             .batches
             .get(&writer)
             .and_then(|log| log.last_key_value())
-            .map(|(seq, _)| *seq);
-        known.or(applied.get(&writer).copied()).unwrap_or(0) + 1
+            .map_or(0, |(seq, _)| *seq);
+        known.max(applied.get(&writer).copied().unwrap_or(0)) + 1
     }
 
     /// `applied` advanced past every entry held here.
@@ -141,6 +153,29 @@ pub struct View {
     pub manifest_id: ManifestId,
     pub manifest: Arc<Manifest>,
     pub tails: Tails,
+}
+
+impl View {
+    /// Whether `writer`'s log is sealed with every entry before the seal
+    /// either applied or held in `tails`.
+    pub fn is_sealed(&self, writer: WriterId) -> bool {
+        self.manifest.sealed.contains(&writer) || self.tails.sealed.contains_key(&writer)
+    }
+
+    /// Adds what was read from `writer`'s log, skipping applied entries.
+    fn absorb(&mut self, writer: WriterId, read: LogRead, now_ms: u64) {
+        let upto = self.manifest.frontier.get(&writer).copied().unwrap_or(0);
+        read.entries
+            .into_iter()
+            .filter(|(seq, _)| *seq > upto)
+            .for_each(|(seq, batch)| self.tails.add(seq, batch, now_ms));
+        match read.end {
+            LogEnd::Sealed { at } if !self.manifest.sealed.contains(&writer) => {
+                self.tails.sealed.insert(writer, at);
+            }
+            LogEnd::Sealed { .. } | LogEnd::Open { .. } => {}
+        }
+    }
 }
 
 pub struct Follower {
@@ -226,7 +261,7 @@ impl Follower {
     pub fn install(&self, id: ManifestId, manifest: Arc<Manifest>, now_ms: u64) {
         let mut v = self.view.write();
         if id > v.manifest_id {
-            v.tails.prune(&manifest.frontier, now_ms);
+            v.tails.prune(&manifest, now_ms);
             v.manifest_id = id;
             v.manifest = manifest;
         }
@@ -264,35 +299,24 @@ impl Follower {
             self.nodes.warm(m.tree, self.rewarm).await?;
         }
 
-        let (applied, starts) = {
+        let starts: Vec<(WriterId, u64)> = {
             let v = self.view.read();
-            let applied = newer
-                .as_ref()
-                .map_or(v.manifest.frontier.clone(), |(_, m)| m.frontier.clone());
-            let starts: Vec<(WriterId, u64)> = self
-                .writers
+            let m = newer.as_ref().map_or(v.manifest.as_ref(), |(_, m)| m);
+            self.writers
                 .lock()
                 .iter()
-                .chain(applied.keys())
+                .chain(m.frontier.keys())
                 .filter(|w| scope == Scope::AllWriters && Some(**w) != self.own)
+                .filter(|w| !m.sealed.contains(w) && !v.tails.sealed.contains_key(w))
                 .collect::<BTreeSet<_>>()
                 .into_iter()
-                .map(|w| {
-                    (
-                        *w,
-                        v.tails
-                            .next_seq(*w, &applied)
-                            .max(applied.get(w).map_or(1, |s| s + 1)),
-                    )
-                })
-                .collect();
-            (applied, starts)
+                .map(|w| (*w, v.tails.next_seq(*w, &m.frontier)))
+                .collect()
         };
-        let results = futures::future::join_all(
-            starts
-                .into_iter()
-                .map(|(w, from)| async move { (w, read_log_from(&self.logs, w, from).await) }),
-        )
+        let results = futures::future::join_all(starts.into_iter().map(|(w, from)| async move {
+            let read = async { read_log_from(self.logs.of(w).await?, w, from).await };
+            (w, read.await)
+        }))
         .await;
         // Store failures (after retries) mean that store is down; anything
         // else, such as corruption, fails the refresh.
@@ -300,7 +324,7 @@ impl Follower {
         let mut fresh = Vec::new();
         for (w, r) in results {
             match r {
-                Ok(entries) => fresh.push(entries),
+                Ok(read) => fresh.push((w, read)),
                 Err(e) if e.is_retryable() => {
                     tracing::warn!(writer = %w, %e, "writer's log unreachable");
                     unreachable.push((w, e));
@@ -309,25 +333,54 @@ impl Follower {
             }
         }
 
-        let changed = newer.is_some() || fresh.iter().any(|f| !f.is_empty());
+        let changed = newer.is_some()
+            || fresh
+                .iter()
+                .any(|(_, r)| !r.entries.is_empty() || matches!(r.end, LogEnd::Sealed { .. }));
         let mut v = self.view.write();
         if let Some((id, m)) = newer.filter(|(id, _)| *id > v.manifest_id) {
-            v.tails.prune(&m.frontier, now_ms);
+            v.tails.prune(&m, now_ms);
             v.manifest_id = id;
             v.manifest = Arc::new(m);
         }
-        fresh.into_iter().flatten().for_each(|(seq, batch)| {
-            let upto = applied.get(&batch.writer).copied().unwrap_or(0);
-            if seq > upto {
-                v.tails.add(seq, batch, now_ms);
-            }
-        });
+        fresh
+            .into_iter()
+            .for_each(|(w, read)| v.absorb(w, read, now_ms));
         drop(v);
         self.installed.notify_waiters();
         Ok(Pulled {
             changed,
             unreachable,
         })
+    }
+
+    /// Seals `writer`'s log right after its last entry and pulls every entry
+    /// before the seal. A batch that lands first moves the seal past it.
+    /// Afterwards `view().is_sealed(writer)`.
+    pub async fn seal(&self, writer: WriterId, now_ms: u64) -> Result<()> {
+        let _guard = self.refreshing.lock().await;
+        let from = {
+            let v = self.view.read();
+            if v.is_sealed(writer) {
+                return Ok(());
+            }
+            v.tails.next_seq(writer, &v.manifest.frontier)
+        };
+        let store = self.logs.of(writer).await?;
+        let mut read = read_log_from(store, writer, from).await?;
+        while let LogEnd::Open { next } = read.end {
+            read.end = match wal::seal(store, writer, next).await? {
+                SealAt::Sealed => LogEnd::Sealed { at: next },
+                SealAt::Batch(b) => {
+                    read.entries.push((next, Arc::new(b)));
+                    let more = read_log_from(store, writer, next + 1).await?;
+                    read.entries.extend(more.entries);
+                    more.end
+                }
+            };
+        }
+        self.view.write().absorb(writer, read, now_ms);
+        Ok(())
     }
 }
 
@@ -355,18 +408,32 @@ async fn probe_manifests(
     Ok(newest)
 }
 
-/// Consecutive log entries of `writer` from `from`, stopping at the first gap.
-async fn read_log_from(
-    logs: &Logs,
-    writer: WriterId,
-    from: u64,
-) -> Result<Vec<(u64, Arc<WalBatch>)>> {
-    let store = logs.of(writer).await?;
-    let mut out = Vec::new();
+/// Where a read of a log stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogEnd {
+    /// Nothing at `next` yet.
+    Open { next: u64 },
+    /// The log is sealed at `at`.
+    Sealed { at: u64 },
+}
+
+struct LogRead {
+    entries: Vec<(u64, Arc<WalBatch>)>,
+    end: LogEnd,
+}
+
+/// Consecutive log entries of `writer` from `from`, up to the first gap or
+/// the seal.
+async fn read_log_from(store: &Store, writer: WriterId, from: u64) -> Result<LogRead> {
+    let mut entries = Vec::new();
     let mut seq = from;
-    while let Some(batch) = wal::read(store, writer, seq).await? {
-        out.push((seq, Arc::new(batch)));
+    let end = loop {
+        match wal::read(store, writer, seq).await? {
+            Some(WalRecord::Batch(batch)) => entries.push((seq, Arc::new(batch))),
+            Some(WalRecord::Seal) => break LogEnd::Sealed { at: seq },
+            None => break LogEnd::Open { next: seq },
+        }
         seq += 1;
-    }
-    Ok(out)
+    };
+    Ok(LogRead { entries, end })
 }
