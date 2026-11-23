@@ -157,6 +157,41 @@ impl Engine {
         Ok(())
     }
 
+    /// Deletes the keys atomically through writer `slot`.
+    pub async fn delete(&self, slot: u64, keys: Vec<Bytes>) -> Result<()> {
+        match self {
+            Engine::Sidra(dbs) => {
+                let mut batch = sidra::WriteBatch::new();
+                keys.iter().for_each(|k| {
+                    batch.delete(k);
+                });
+                dbs[slot as usize % dbs.len()].write(batch).await?
+            }
+            Engine::Slatedb(db) => {
+                let batch = keys.iter().fold(slatedb::WriteBatch::new(), |mut b, k| {
+                    b.delete(k);
+                    b
+                });
+                db.write(batch).await?.await_durable().await?
+            }
+        }
+        Ok(())
+    }
+
+    /// Tree shape (sidra only): walks every node.
+    pub async fn shape(&self) -> Result<Option<String>> {
+        Ok(match self {
+            Engine::Sidra(dbs) => {
+                let s = dbs[0].tree_shape().await?;
+                Some(format!(
+                    "internal {} leaves {} runs {} tombstones {}",
+                    s.internal, s.leaves, s.runs, s.tombstones
+                ))
+            }
+            Engine::Slatedb(_) => None,
+        })
+    }
+
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         Ok(match self {
             Engine::Sidra(dbs) => dbs[0].get(key).await?,

@@ -97,6 +97,11 @@ struct Args {
     /// checkpoints, cleaning) runs alongside traffic.
     #[arg(long, default_value_t = 0)]
     mixed_secs: u64,
+    /// After everything else, delete this percentage of keys, spread evenly
+    /// over the key space, then measure scans over what's left (warm, then
+    /// cold after a reopen). Shows the cost of sparse leaves.
+    #[arg(long, default_value_t = 0)]
+    delete_pct: u64,
     /// Percentage of the mixed phase's clients that only read; the rest only
     /// write batches (separate clients, so slow durable writes don't throttle
     /// reads).
@@ -286,6 +291,89 @@ async fn write_phase(
         }
     })
     .await
+}
+
+/// Whether key `id` is deleted by the delete phase: `pct` out of every 100
+/// consecutive ids, so every leaf loses about the same share.
+fn doomed(id: u64, pct: u64) -> bool {
+    id % 100 < pct
+}
+
+/// Deletes `pct`% of keys, settles, then scans the survivors warm and (after
+/// a reopen) cold. Returns the reopened engine.
+async fn delete_phases<F, Fut>(
+    args: &Args,
+    kind: EngineKind,
+    db: Arc<Engine>,
+    wl: Arc<Workload>,
+    pct: u64,
+    reopen: F,
+    record: &mut impl FnMut(&'static str, u64, Duration, Histogram<u64>),
+) -> Result<Arc<Engine>>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<Engine>>,
+{
+    let ids: Arc<Vec<u64>> = Arc::new((0..wl.keys).filter(|id| doomed(*id, pct)).collect());
+    let (c, batch) = (args.concurrency, args.batch);
+    let (elapsed, hist) = {
+        let (db, ids) = (db.clone(), ids.clone());
+        let wl = wl.clone();
+        run_ops((ids.len() as u64).div_ceil(batch), c, move |b| {
+            let (db, ids, wl) = (db.clone(), ids.clone(), wl.clone());
+            async move {
+                let lo = (b * batch) as usize;
+                let hi = (lo + batch as usize).min(ids.len());
+                db.delete(b, ids[lo..hi].iter().map(|id| wl.key(*id)).collect())
+                    .await
+            }
+        })
+        .await?
+    };
+    record("delete", ids.len() as u64, elapsed, hist);
+    let (elapsed, hist, ()) = timed(db.settle()).await?;
+    record("settle", 1, elapsed, hist);
+    if let Some(shape) = db.shape().await? {
+        eprintln!("[{}] after deletes: {shape}", kind.name());
+    }
+
+    let survivors = wl.keys - ids.len() as u64;
+    ensure!(survivors > 0, "--delete-pct leaves no keys");
+    let len = args.scan_len.min(survivors as usize);
+    // Scans start where at least `len` survivors follow.
+    let span = (len as u64 * 100).div_ceil(100 - pct) + 100;
+    let scans = |seed: u64, db: Arc<Engine>| {
+        let wl = wl.clone();
+        run_ops(args.scans, c, move |i| {
+            let (db, wl) = (db.clone(), wl.clone());
+            async move {
+                let start = wl.random_id(seed, i).min(wl.keys.saturating_sub(span));
+                let n = db.scan(wl.key(start), len).await?;
+                ensure!(n == len, "scan returned {n}, expected {len}");
+                Ok(())
+            }
+        })
+    };
+    let (elapsed, hist) = scans(4, db.clone()).await?;
+    record("scan-sparse", args.scans, elapsed, hist);
+
+    let db = Arc::try_unwrap(db).map_err(|_| anyhow::anyhow!("engine still shared"))?;
+    db.close().await?;
+    let (elapsed, hist, db) = timed(reopen()).await?;
+    record("reopen", 1, elapsed, hist);
+    let db = Arc::new(db);
+    let (elapsed, hist) = scans(5, db.clone()).await?;
+    record("scan-sparse-cold", args.scans, elapsed, hist);
+    // Spot-check: a deleted key is gone, a survivor isn't.
+    ensure!(
+        db.get(&wl.key(0)).await?.is_none(),
+        "deleted key still present"
+    );
+    ensure!(
+        db.get(&wl.key(pct)).await?.is_some(),
+        "surviving key missing"
+    );
+    Ok(db)
 }
 
 /// Mixed reads and write batches for `args.mixed_secs`. Prints a read-latency
@@ -635,6 +723,23 @@ async fn bench_engine(
             .into_iter()
             .for_each(|(name, ops, elapsed, hist)| record(name, ops, elapsed, hist, &mut phases));
     }
+
+    let db = match args.delete_pct {
+        0 => db,
+        pct => {
+            let reopen = || Engine::open(kind, os.clone(), &path, &params, writers);
+            delete_phases(
+                args,
+                kind,
+                db,
+                wl.clone(),
+                pct,
+                reopen,
+                &mut |name, ops, elapsed, hist| record(name, ops, elapsed, hist, &mut phases),
+            )
+            .await?
+        }
+    };
 
     let db = Arc::try_unwrap(db).map_err(|_| anyhow::anyhow!("engine still shared"))?;
     db.close().await?;

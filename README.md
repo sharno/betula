@@ -244,7 +244,8 @@ writer C ─► writers/C/wal/{seq} ─┘
   (about a checkpoint interval), unless it reads with `Freshness::Latest`.
 - GC deletes the leases of writers that expired long ago and have no logs
   left, and the applier then drops them from the manifest.
-- No merging of underfull leaves (only empty ones are removed).
+- No merging of underfull leaves (only empty ones are removed), so heavy
+  deletes leave sparse leaves until rewritten (see the roadmap).
 - Store requests retry transient failures with capped backoff (8 attempts,
   50 ms to 5 s). A log write that still fails ends its writer with
   `WriterLost`, since whether it landed is unknown.
@@ -257,9 +258,17 @@ replica readers).
 
 1. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
 2. **Soak tests:** multi-hour runs against a real store.
-3. **Faster scans and bulk loads:** fewer sources per scan page; bottom-up
-   build into an empty tree.
-4. **Optional conditional writes** (compare-and-set) routed through the
+3. **Fewer bytes written:** buffers account for most write amplification
+   (about 1.8x of message bytes in mixed traffic). Measure and try skipping
+   buffer levels for dense batches.
+4. **Merging underfull nodes:** after a flush rewrites a leaf below about a
+   quarter full, merge it with a sibling (flushing the sibling's runs too) or
+   rebalance the pair; the same for internal nodes by child count. Today
+   only empty leaves go, so delete-heavy workloads (TTL expiry, queues)
+   leave sparse leaves: slower scans, a larger cached upper tree, more
+   bytes. `sidra-bench --delete-pct 90` measures it.
+5. **Faster scans:** fewer sources per scan page.
+6. **Optional conditional writes** (compare-and-set) routed through the
    applier, for workloads that need them.
 
 ## Verification
