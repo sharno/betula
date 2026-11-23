@@ -1,7 +1,7 @@
 //! Runs the model checker with progress reports:
-//!     cargo run --release -p sidra-model --example check            # the protocol: exhaustive
+//!     cargo run --release -p sidra-model --example check            # exhaustive, small scenario
 //!     cargo run --release -p sidra-model --example check no-bound   # the bug, by random walks
-use sidra_model::{late_writer, model};
+use sidra_model::{late_writer, model, small};
 use stateright::report::WriteReporter;
 use stateright::{Checker, HasDiscoveries, Model, UniformChooser};
 
@@ -27,7 +27,7 @@ fn main() {
             );
         }
         _ => {
-            let checker = model(late_writer(true))
+            let checker = model(small())
                 .checker()
                 .threads(threads)
                 .spawn_bfs()

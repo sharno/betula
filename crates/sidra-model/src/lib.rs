@@ -879,7 +879,7 @@ pub struct Checked {
 }
 
 /// Every acknowledged write is visible or superseded.
-fn acknowledged_writes_stay_visible(_: &Checked, s: &Sys) -> bool {
+pub fn acknowledged_writes_stay_visible(_: &Checked, s: &Sys) -> bool {
     let acked = newest(
         s.procs
             .iter()
@@ -891,7 +891,7 @@ fn acknowledged_writes_stay_visible(_: &Checked, s: &Sys) -> bool {
 /// Every batch durable in a log stays visible or superseded, acknowledged
 /// or not: a manifest must not count an entry as applied that its tree
 /// lacks.
-fn durable_writes_stay_visible(_: &Checked, s: &Sys) -> bool {
+pub fn durable_writes_stay_visible(_: &Checked, s: &Sys) -> bool {
     let batches: Vec<WalBatch> = s
         .store
         .iter()
@@ -977,6 +977,33 @@ impl Model for Checked {
     }
 }
 
+/// Replaying hand-picked traces: each step must be enabled.
+impl Checked {
+    pub fn initial(&self) -> Sys {
+        self.init_states().remove(0)
+    }
+
+    /// Fires `timer` on `proc`; panics if it isn't enabled.
+    pub fn fire(&self, s: Sys, proc: usize, timer: Timer) -> Sys {
+        let action = Action::Fire { proc, timer };
+        let mut enabled = Vec::new();
+        self.actions(&s, &mut enabled);
+        assert!(enabled.contains(&action), "not enabled: {action:?}");
+        self.next_state(&s, action).expect("a step")
+    }
+
+    /// Delivers `proc`'s requests (and the ones they lead to) until it has
+    /// none outstanding.
+    pub fn drain(&self, mut s: Sys, proc: usize) -> Sys {
+        while !s.procs[proc].outbox.is_empty() {
+            s = self
+                .next_state(&s, Action::Deliver { proc, request: 0 })
+                .expect("a step");
+        }
+        s
+    }
+}
+
 pub fn model(cfg: Config) -> Checked {
     Checked { cfg }
 }
@@ -1003,6 +1030,19 @@ pub fn late_writer(observe_bound: bool) -> Config {
         lease_ttl: 1,
         max_manifest: 4,
         observe_bound,
+        renew_leases: true,
+    }
+}
+
+/// Small enough to search exhaustively (~25M states, ~20 s, ~11 GB): the
+/// applier also writes (a delete), and a second writer puts the same key.
+pub fn small() -> Config {
+    Config {
+        scripts: vec![vec![Write::Delete("k")], vec![Write::Put("k", "b")]],
+        max_clock: 3,
+        lease_ttl: 1,
+        max_manifest: 3,
+        observe_bound: true,
         renew_leases: true,
     }
 }

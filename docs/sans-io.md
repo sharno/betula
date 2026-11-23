@@ -75,9 +75,10 @@ the bound), states are typestates; where events arrive from many sources
    which shrank two-process scenarios from >200M states to ~25M (20 s).
    It found one real hazard: the checkpoint read its frontier from a later
    view than its messages; `Applying` now captures both from one view.
-   Open: it doesn't yet reproduce the tombstone-bound bug. The bug needs
-   three processes, three checkpoints and lease renewals, which exhaustive
-   search can't fit in 48 GB, and random walks haven't hit it. Next: a
-   scenario that pins the interleaving (scripted clock lag) instead of
-   searching for it; then crashes, lost responses, applier handover, GC.
+   Two kinds of checks: exhaustive search of a small scenario (25.7M
+   states, 22 s; `--ignored`), and replayed traces for scenarios too deep
+   to search. The tombstone-bound bug (three processes, three checkpoints,
+   lease renewal, ~60 steps) is a trace: without the bound the late put
+   resurrects the deleted key; with it the put is newer than the delete.
+   Next: crashes, lost responses, applier handover and standby, GC.
 5. Retire the TLA+ model once the model covers what it does.
