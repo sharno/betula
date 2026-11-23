@@ -108,6 +108,10 @@ struct Args {
     /// sidra cleans segments whose live fraction is below this.
     #[arg(long, default_value_t = 0.25)]
     clean_below: f64,
+    /// sidra: flush a child directly when one checkpoint brings it at least
+    /// this many KiB.
+    #[arg(long)]
+    direct_flush_kib: Option<usize>,
     /// sidra: disable garbage collection (for experiments).
     #[arg(long)]
     no_gc: bool,
@@ -489,6 +493,7 @@ async fn bench_engine(
         gc: (!args.no_gc).then_some(args.gc_deletes_per_sec),
         poll: Duration::from_millis(args.poll_ms),
         max_runs: args.max_runs,
+        direct_flush_kib: args.direct_flush_kib,
         compression: args.compression,
         warm: if args.warm_background {
             sidra::Warm::Background

@@ -39,6 +39,7 @@ pub struct SidraParams {
     /// How often sidra writers poll for each other's entries.
     pub poll: Duration,
     pub max_runs: usize,
+    pub direct_flush_kib: Option<usize>,
     pub compression: crate::CompressionArg,
     pub warm: sidra::Warm,
 }
@@ -67,6 +68,7 @@ impl Engine {
                         internal_max_bytes: params.internal_bytes,
                         max_fanout: params.fanout,
                         max_runs_per_child: params.max_runs,
+                        direct_flush_bytes: params.direct_flush_kib.map(|k| k << 10),
                     },
                     cache: sidra::CacheConfig {
                         inner_bytes: params.inner_cache_bytes,

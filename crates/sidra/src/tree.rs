@@ -38,6 +38,10 @@ pub struct TreeConfig {
     /// A child with more buffered runs than this is flushed, which bounds
     /// the runs a read checks per level.
     pub max_runs_per_child: usize,
+    /// A child receiving at least this many bytes of new messages in one
+    /// checkpoint is flushed right away instead of getting a run: the
+    /// messages skip a buffer level. `None` buffers everything.
+    pub direct_flush_bytes: Option<usize>,
 }
 
 impl Default for TreeConfig {
@@ -47,6 +51,7 @@ impl Default for TreeConfig {
             internal_max_bytes: 4 << 20,
             max_fanout: 64,
             max_runs_per_child: 16,
+            direct_flush_bytes: None,
         }
     }
 }
@@ -633,6 +638,13 @@ impl Writer<'_> {
                 Node::Internal(old) => {
                     let mut node = old.as_ref().clone();
                     let mut parts = split_by_child(&node.pivots, msgs);
+                    // Dense batches skip this level. A flushed child's
+                    // replacements get empty parts, so this ends.
+                    if let Some(t) = self.cfg.direct_flush_bytes {
+                        while let Some(i) = parts.iter().position(|p| msgs_bytes(p) >= t) {
+                            self.flush_child(&mut node, &mut parts, i).await?;
+                        }
+                    }
                     // Flush children while over budget. Choosing before
                     // writing runs means a child that is about to be flushed
                     // gets its new messages directly, without a run.

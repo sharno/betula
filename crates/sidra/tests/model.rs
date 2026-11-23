@@ -60,6 +60,7 @@ fn tiny_config() -> Settings {
             internal_max_bytes: 400,
             max_fanout: 4,
             max_runs_per_child: 2,
+            direct_flush_bytes: Some(120),
         },
         // Small caches force reloads from storage.
         cache: CacheConfig {
@@ -689,6 +690,7 @@ async fn paged_scans_match_model() {
         internal_max_bytes: 32 << 10,
         max_fanout: 8,
         max_runs_per_child: 6,
+        direct_flush_bytes: None,
     };
     cfg.checkpoint.bytes = 1 << 30;
     let db = Db::builder(ROOT, os.clone())
