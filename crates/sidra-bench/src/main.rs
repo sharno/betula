@@ -689,31 +689,40 @@ async fn bench_engine(
     let (elapsed, hist) = read_phase(1, db.clone(), 0).await?;
     record("read-warm", args.reads, elapsed, hist, &mut phases);
 
-    let (elapsed, hist) = {
-        let (db, wl, len) = (db.clone(), wl.clone(), args.scan_len);
+    let scan_phase = |seed: u64, db: Arc<Engine>| {
+        let (wl, len) = (wl.clone(), args.scan_len);
         run_ops(args.scans, c, move |i| {
             let (db, wl) = (db.clone(), wl.clone());
             async move {
-                let start = wl.random_id(2, i).min(wl.keys - len as u64);
+                let start = wl.random_id(seed, i).min(wl.keys - len as u64);
                 let n = db.scan(wl.key(start), len).await?;
                 ensure!(n == len, "scan returned {n}, expected {len}");
                 Ok(())
             }
         })
-        .await?
     };
+    let (elapsed, hist) = scan_phase(2, db.clone()).await?;
     record("scan", args.scans, elapsed, hist, &mut phases);
 
-    let db = Arc::try_unwrap(db).map_err(|_| anyhow::anyhow!("engine still shared"))?;
-    let (elapsed, hist, ()) = timed(db.close()).await?;
+    let reopen = |db: Arc<Engine>| async {
+        let db = Arc::try_unwrap(db).map_err(|_| anyhow::anyhow!("engine still shared"))?;
+        let (elapsed, hist, ()) = timed(db.close()).await?;
+        let (elapsed_open, hist_open, db) =
+            timed(Engine::open(kind, os.clone(), &path, &params, writers)).await?;
+        anyhow::Ok(((elapsed, hist), (elapsed_open, hist_open), Arc::new(db)))
+    };
+    let ((elapsed, hist), (elapsed_open, hist_open), db) = reopen(db).await?;
     record("close", 1, elapsed, hist, &mut phases);
-    let (elapsed, hist, db) =
-        timed(Engine::open(kind, os.clone(), &path, &params, writers)).await?;
-    record("reopen", 1, elapsed, hist, &mut phases);
-    let db = Arc::new(db);
+    record("reopen", 1, elapsed_open, hist_open, &mut phases);
 
     let (elapsed, hist) = read_phase(3, db.clone(), 0).await?;
     record("read-cold", args.reads, elapsed, hist, &mut phases);
+
+    // Reopened again so no leaf is cached: read-cold warmed most of them.
+    let (_, (elapsed, hist), db) = reopen(db).await?;
+    record("reopen", 1, elapsed, hist, &mut phases);
+    let (elapsed, hist) = scan_phase(6, db.clone()).await?;
+    record("scan-cold", args.scans, elapsed, hist, &mut phases);
 
     // Offset into the load order: different keys than the first loaded,
     // distinct so each is checkable as version 1.

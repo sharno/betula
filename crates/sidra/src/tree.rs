@@ -186,18 +186,36 @@ struct Frame {
 
 enum IterState {
     Start(Option<TreeRoot>),
-    /// Merging one leaf with the runs above it.
+    /// Merging one leaf with the runs above it; `behind` counts the leaves
+    /// the scan already finished.
     InLeaf {
         stack: Vec<Frame>,
         scan: LeafScan,
+        behind: u32,
     },
     Done,
 }
 
+/// Most leaves a scan fetches ahead of the one it reads.
+const READAHEAD_MAX: usize = 8;
+
+/// Leaves to fetch ahead once `behind` leaves are finished: none in the
+/// first leaf, so a scan that ends there costs no extra GET, then doubling
+/// per leaf (2, 4, 8) while the scan keeps going.
+fn readahead(behind: u32) -> usize {
+    match behind {
+        0 => 0,
+        n => 1usize
+            .checked_shl(n)
+            .map_or(READAHEAD_MAX, |w| w.min(READAHEAD_MAX)),
+    }
+}
+
 /// Visits leaves in key order. Each leaf's view is its entries overlaid with
 /// the runs buffered above it on its path, newest version per key winning.
-/// Yields one entry at a time, cloning only what the caller takes, and loads
-/// the next leaf only when the caller gets that far.
+/// Yields one entry at a time, cloning only what the caller takes. Once a
+/// scan moves past its first leaf, the next sibling leaves within the range
+/// are fetched ahead in the background (see `readahead`).
 pub struct TreeIter {
     nodes: Arc<Nodes>,
     range: KeyRange,
@@ -227,18 +245,41 @@ impl TreeIter {
                 IterState::Start(Some(root)) => {
                     let mut stack = Vec::new();
                     let leaf = self.descend(root.ptr, &mut stack).await?;
-                    let scan = self.scan_leaf(&stack, leaf).await?;
-                    IterState::InLeaf { stack, scan }
+                    self.enter(stack, leaf, 0).await?
                 }
-                IterState::InLeaf { mut stack, .. } => match self.advance(&mut stack).await? {
-                    Some(leaf) => {
-                        let scan = self.scan_leaf(&stack, leaf).await?;
-                        IterState::InLeaf { stack, scan }
-                    }
+                IterState::InLeaf {
+                    mut stack, behind, ..
+                } => match self.advance(&mut stack).await? {
+                    Some(leaf) => self.enter(stack, leaf, behind.saturating_add(1)).await?,
                     None => IterState::Done,
                 },
             };
         }
+    }
+
+    /// Starts reading `leaf`, with `behind` leaves already finished, after
+    /// fetching ahead the siblings that follow it under the same parent.
+    /// Leaves under the next parent wait for the scan to get there: one stall
+    /// per parent.
+    async fn enter(&self, stack: Vec<Frame>, leaf: Arc<Leaf>, behind: u32) -> Result<IterState> {
+        if let Some(parent) = stack.last() {
+            let ahead: Vec<NodePtr> = parent
+                .node
+                .children
+                .iter()
+                .take(parent.last + 1)
+                .skip(parent.idx + 1)
+                .take(readahead(behind))
+                .map(|c| c.ptr)
+                .collect();
+            self.nodes.prefetch(&ahead);
+        }
+        let scan = self.scan_leaf(&stack, leaf).await?;
+        Ok(IterState::InLeaf {
+            stack,
+            scan,
+            behind,
+        })
     }
 
     async fn descend(&self, mut ptr: NodePtr, stack: &mut Vec<Frame>) -> Result<Arc<Leaf>> {

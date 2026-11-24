@@ -266,28 +266,30 @@ async fn fetch(store: Store, source: Source, ptr: NodePtr) -> Result<Node> {
 }
 
 impl Nodes {
-    /// Loads every internal node of the tree, one level at a time.
-    /// Loads many nodes, fetching uncached ones per segment with one
-    /// coalesced ranged read (nearby ranges merge into one request). Each
-    /// node in a batch is registered as in flight, so a concurrent `load` of
-    /// it waits for the batch instead of fetching it again.
-    pub async fn load_many(&self, ptrs: &[NodePtr]) -> Result<Vec<Node>> {
-        {
-            let mut loading = self.loading.lock();
-            let missing: BTreeMap<SegmentId, Vec<NodePtr>> = ptrs
-                .iter()
-                .filter(|&&p| {
-                    self.inner.get(&p).or_else(|| self.leaves.get(&p)).is_none()
-                        && !loading.contains_key(&p)
-                })
-                .fold(BTreeMap::new(), |mut m, p| {
-                    m.entry(p.seg).or_default().push(*p);
-                    m
-                });
-            // Split each segment's nodes into batches of about BATCH_BYTES, so
-            // a read waiting on one node waits for a small batch.
-            let batches = missing.into_iter().flat_map(|(seg, mut group)| {
+    /// Registers the uncached, not yet loading nodes among `ptrs` as in
+    /// flight, fetched per segment with one coalesced ranged read (nearby
+    /// ranges merge into one request), so a concurrent `load` of any of them
+    /// waits for its batch instead of fetching it again. Returns them; the
+    /// fetches run only once something loads them.
+    fn register(&self, ptrs: &[NodePtr]) -> Vec<NodePtr> {
+        let mut loading = self.loading.lock();
+        let missing: BTreeMap<SegmentId, Vec<NodePtr>> = ptrs
+            .iter()
+            .filter(|&&p| {
+                self.inner.get(&p).or_else(|| self.leaves.get(&p)).is_none()
+                    && !loading.contains_key(&p)
+            })
+            .fold(BTreeMap::new(), |mut m, p| {
+                m.entry(p.seg).or_default().push(*p);
+                m
+            });
+        // Split each segment's nodes into batches of about BATCH_BYTES, so
+        // a read waiting on one node waits for a small batch.
+        let batches: Vec<(SegmentId, Vec<NodePtr>)> = missing
+            .into_iter()
+            .flat_map(|(seg, mut group)| {
                 group.sort();
+                group.dedup();
                 group
                     .into_iter()
                     .fold(Vec::<(u64, Vec<NodePtr>)>::new(), |mut acc, p| {
@@ -302,27 +304,51 @@ impl Nodes {
                     })
                     .into_iter()
                     .map(move |(_, b)| (seg, b))
+            })
+            .collect();
+        batches.iter().for_each(|(seg, group)| {
+            let batch = fetch_batch(self.store.clone(), self.source.clone(), *seg, group.clone())
+                .boxed()
+                .shared();
+            group.iter().enumerate().for_each(|(i, p)| {
+                let one = batch
+                    .clone()
+                    .map(move |r| r.map(|nodes| nodes[i].clone()))
+                    .boxed()
+                    .shared();
+                loading.insert(*p, one);
             });
-            for (seg, group) in batches {
-                let batch =
-                    fetch_batch(self.store.clone(), self.source.clone(), seg, group.clone())
-                        .boxed()
-                        .shared();
-                group.iter().enumerate().for_each(|(i, p)| {
-                    let one = batch
-                        .clone()
-                        .map(move |r| r.map(|nodes| nodes[i].clone()))
-                        .boxed()
-                        .shared();
-                    loading.entry(*p).or_insert(one);
-                });
-            }
-        }
+        });
+        batches.into_iter().flat_map(|(_, group)| group).collect()
+    }
+
+    /// Loads many nodes, fetching uncached ones as `register` does.
+    pub async fn load_many(&self, ptrs: &[NodePtr]) -> Result<Vec<Node>> {
+        self.register(ptrs);
         stream::iter(ptrs.iter().copied())
             .map(|p| self.load(p))
             .buffered(LOAD_CONCURRENCY)
             .try_collect()
             .await
+    }
+
+    /// Starts fetching uncached nodes in the background and returns at once.
+    /// A `load` of one of them joins its fetch.
+    pub fn prefetch(self: &Arc<Self>, ptrs: &[NodePtr]) {
+        let missing = self.register(ptrs);
+        if missing.is_empty() {
+            return;
+        }
+        let nodes = self.clone();
+        tokio::spawn(async move {
+            // Failures are dropped here: the reader that needs the node loads
+            // it again and gets the error itself.
+            stream::iter(missing)
+                .map(|p| nodes.load(p))
+                .buffer_unordered(LOAD_CONCURRENCY)
+                .for_each(|_| async {})
+                .await;
+        });
     }
 
     /// Loads every internal node of the tree, one level at a time, and

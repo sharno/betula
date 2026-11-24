@@ -203,8 +203,10 @@ writer C ─► wal/C/{seq} ─┘
 - **Reads stop early.** Each child pointer records the newest timestamp in its
   subtree. A point read stops once the version it holds is newer than
   everything below. A scan positions one cursor in each leaf and in each run
-  above it on its path, merges them with a heap one entry at a time, and
-  loads the next leaf only when it gets there.
+  above it on its path and merges them with a heap one entry at a time.
+  Past its first leaf, a scan fetches the next sibling leaves in its range
+  ahead (2, then 4, then 8), batched into coalesced ranged GETs per segment;
+  a scan that ends in its first leaf fetches nothing extra.
 - **Tombstones.** Deletes stay as tombstones until no writer can still
   produce an older version of the key. Each writer's lease
   (`writers/{id}/lease`) carries a floor under every timestamp it may still
@@ -276,7 +278,7 @@ writer C ─► wal/C/{seq} ─┘
 
 Done: LZ4 compression (on by default), lighter cleaning of inner segments,
 paced GC deletes, multi-region (regional writer logs, standby appliers,
-replica readers), heap-merged scans.
+replica readers), heap-merged scans, scan readahead.
 
 1. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
 2. **Soak tests:** multi-hour runs against a real store.
@@ -289,10 +291,7 @@ replica readers), heap-merged scans.
    only empty leaves go, so delete-heavy workloads (TTL expiry, queues)
    leave sparse leaves: slower cold scans, a larger cached upper tree, more
    bytes. `sidra-bench --delete-pct 90` measures it.
-5. **Cold-scan prefetch:** a scan loads leaves one at a time. Cached
-   parents already give the next leaves' `(segment, offset, len)`, so their
-   GETs could go out concurrently, merged when neighbours share a segment.
-6. **Optional conditional writes** (compare-and-set) routed through the
+5. **Optional conditional writes** (compare-and-set) routed through the
    applier, for workloads that need them.
 
 ## Verification
@@ -332,8 +331,9 @@ cargo run --release -p sidra-bench -- ... --delay-ms 20   # approximate S3 laten
 ```
 
 Phases: load (random order, batches of 32, 64 clients, durable writes), settle
-(checkpoint vs. memtable flush), warm random reads, 100-key scans, close and
-reopen, cold random reads, updates, settle. Every read is checked against the
+(checkpoint vs. memtable flush), warm random reads, scans (`--scan-len`,
+100 keys by default), close and reopen, cold random reads, reopen again,
+cold scans, updates, settle. Every read is checked against the
 expected value. Both engines get 640 MiB of cache: SlateDB keeps its defaults
 (512 MiB blocks + 128 MiB metadata), and sidra uses 256 MiB inner + 384 MiB
 leaf.
@@ -370,6 +370,19 @@ JSON-like values, LZ4 on for both engines, 5 minutes mixed:
 With compressible data the bytes-written gap narrows to about 1.1× under
 mixed traffic. Sidra's GC spreads each run's deletes over its interval: on
 RustFS, bursts of deletes pushed write p99 to 0.7–1.2 s.
+
+Cold scans: 1M keys × 256 B, 256 KiB leaves, 20 ms added to every request
+(`--delay-ms 20`), 64 clients, right after a reopen. Readahead is the leaf
+prefetch above:
+
+| | sidra, no readahead | sidra, readahead | SlateDB 0.18 |
+|---|---|---|---|
+| 1,000-key scans/s (p99 ms) | 3.7k (81) | **5.6k (72–78)** | 37 (1,769) |
+| 10,000-key scans/s (p99 ms) | 538 (351) | **1.5k (156)** | |
+| GETs, 10,000-key phase | 1,301 | **972** | |
+
+The leaves fit in cache, so most scans in the phase hit leaves earlier scans
+loaded; p99 shows the scans that went to the store. Warm scans are unchanged.
 
 Earlier runs:
 
