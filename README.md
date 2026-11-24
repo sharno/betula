@@ -331,7 +331,9 @@ cargo run --release -p sidra-bench -- ... --delay-ms 20   # approximate S3 laten
 ```
 
 Phases: load (random order, batches of 32, 64 clients, durable writes), settle
-(checkpoint vs. memtable flush), warm random reads, scans (`--scan-len`,
+(checkpoint vs. memtable flush, then wait until SlateDB's manifest stays
+unchanged for 10 s, so its compaction is done), warmup (one full scan, so
+both caches hold the data), warm random reads, scans (`--scan-len`,
 100 keys by default), close and reopen, cold random reads, reopen again,
 cold scans, updates, settle. Every read is checked against the
 expected value. Both engines get 640 MiB of cache: SlateDB keeps its defaults
@@ -345,44 +347,72 @@ them, which undercounted SlateDB's SST writes; the older tables below carry
 that error in their SlateDB byte figures.
 
 Current defaults, 1M keys × 256 B, 40 clients, then 15 minutes of mixed
-traffic (80% writes, 20% reads). Random (incompressible) values:
+traffic (80% writes, 20% reads), no added latency. Random (incompressible)
+values:
 
 | | sidra | SlateDB 0.18 |
 |---|---|---|
-| mixed reads/s (p99 ms) | **1.61M (0.01)**, flat | 311k (0.40), swings 168k–437k |
-| mixed GETs | **177k** | 4.6M |
-| mixed writes keys/s | **10.2k** | 9.4k |
-| mixed write p99 / p99.9 ms | **145 / 181** | 256 / 1,183 |
-| MiB written, mixed | 9,123 | **6,523** |
-| load write p99 ms | **131** | 144 |
-| MiB written, load | 830 | **755** |
-| cold reads (20k): GETs, reads/s | **3.6k, 158k** | 18.4k, 27k |
+| mixed reads/s (p99 ms) | **1.15M (0.01)**, 0.95M–1.27M | 184k (0.69), swings 71k–311k |
+| mixed GETs | **59k** | 2.9M |
+| mixed writes keys/s | **10.2k** | 9.6k |
+| mixed write p99 / p99.9 ms | **150 / 203** | 242 / 304 |
+| MiB written, mixed | 9,702 | **6,796** |
+| load write p99 ms | 133 | **125** |
+| MiB written, load | 884 | **755** |
+| cold reads (50k): GETs, reads/s | **1.3k, 398k** | 37.6k, 19k |
 
 JSON-like values, LZ4 on for both engines, 5 minutes mixed:
 
 | | sidra | SlateDB 0.18 |
 |---|---|---|
-| mixed reads/s | **1.49M** | 324k |
-| MiB written, load | 248 | **171** |
-| MiB written, mixed | 932 | **864** |
-| footprint after run | 1,195 MiB | **1,066 MiB** |
+| mixed reads/s | **1.18M** | 207k |
+| MiB written, load | **253** | 260 |
+| MiB written, mixed | 927 | **774** |
+| footprint after run | 1,204 MiB | **1,066 MiB** |
 
-With compressible data the bytes-written gap narrows to about 1.1× under
+SlateDB's compactor keeps rewriting SSTs under mixed traffic and doesn't
+cache its output, so its reads go back to the store.
+
+With compressible data the bytes-written gap narrows to about 1.2× under
 mixed traffic. Sidra's GC spreads each run's deletes over its interval: on
 RustFS, bursts of deletes pushed write p99 to 0.7–1.2 s.
 
-Cold scans: 1M keys × 256 B, 256 KiB leaves, 20 ms added to every request
-(`--delay-ms 20`), 64 clients, right after a reopen. Readahead is the leaf
-prefetch above:
+Reads and scans with S3-like latency: 1M keys × 256 B, 256 KiB leaves,
+20 ms added to every request (`--delay-ms 20`), 64 clients. Warm phases run
+after the warmup, cold ones right after a reopen. SlateDB scans cache their
+blocks like sidra caches leaves. No single SlateDB readahead setting wins
+every row: small fetches suit warm short scans and large ones suit cold
+scans. So each SlateDB scan cell is the best of three settings (read-ahead
+KiB / fetch tasks: 4/1, 64/4, 256/8), shown in brackets.
 
-| | sidra, no readahead | sidra, readahead | SlateDB 0.18 |
-|---|---|---|---|
-| 1,000-key scans/s (p99 ms) | 3.7k (81) | **5.6k (72–78)** | 37 (1,769) |
-| 10,000-key scans/s (p99 ms) | 538 (351) | **1.5k (156)** | |
-| GETs, 10,000-key phase | 1,301 | **972** | |
+| | sidra | SlateDB 0.18 |
+|---|---|---|
+| warm point reads/s | **831k** | 372k |
+| cold point reads (50k): GETs, reads/s | **1.3k, 81k** | 37.6k, 3.6k |
+| warm 100-key scans/s (p99 ms) | **66.6k** (5.0) | 53.2k (2.7) [4/1] |
+| cold 100-key scans/s (p99 ms) | **5.0k (49)** | 3.5k (85) [64/4] |
+| warm 1,000-key scans/s (p99 ms) | **6.8k (23)** | 5.0k (25) [64/4] |
+| cold 1,000-key scans/s (p99 ms) | **5.9k (71)** | 2.4k (99) [64/4] |
+| warm 10,000-key scans/s (p99 ms) | **662 (120)** | 550 (143) [256/8] |
+| cold 10,000-key scans/s (p99 ms) | **1.4k (166)** | 420 (340) [256/8] |
+| warm sparse scans/s, 90% deleted (p99 ms) | **112k (1.3)** | 3.5k (35) [64/4] |
+| cold sparse scans/s, 90% deleted (p99 ms) | **5.1k (84)** | 2.4k (136) [64/4] |
 
-The leaves fit in cache, so most scans in the phase hit leaves earlier scans
-loaded; p99 shows the scans that went to the store. Warm scans are unchanged.
+The leaves fit in cache, so most cold scans hit leaves earlier scans
+loaded; p99 shows the scans that went to the store. Leaf readahead took
+sidra's cold 10,000-key scans from 538 to 1.4k/s. SlateDB's cold scans vary
+up to 2× between runs; the table keeps its best run.
+
+Commands (SlateDB alone with `--engines slatedb --slatedb-read-ahead-kib N
+--slatedb-fetch-tasks N`):
+
+```sh
+B="--keys 1000000 --leaf-kib 256 --internal-kib 2048 --memtable-mib 32"
+sidra-bench $B --concurrency 40 --mixed-read-pct 20 --mixed-secs 900
+sidra-bench $B --concurrency 40 --mixed-read-pct 20 --mixed-secs 300 --values text --compression lz4
+sidra-bench $B --delay-ms 20 --scan-len 100 --scans 2000              # also 1000; 10000 with --scans 500
+sidra-bench $B --delay-ms 20 --scan-len 100 --scans 2000 --delete-pct 90
+```
 
 Earlier runs:
 
@@ -395,16 +425,13 @@ sidra builds:
 | load keys/s (p99 ms) | 20.3k (161) | 20.5k (132) | 19.4k (218) |
 | MiB written during load | 1,475 | **780** | 270 (+ deferred compaction) |
 | warm point reads/s | 931k | 1.03M | 336k |
-| 100-key scans/s | 33k | 36k | 80k |
 | open (reopen) | 52 ms | 140 ms (`Background`: 29 ms) | 53 ms |
 | cold point reads (50k): GETs, reads/s | 4.0k, 297k | 3.8k, 319k (`Background`: 3.8k, 262k) | 43k, 32k |
 
 At 64 clients × batches of 32, load for both engines sits at the ceiling set
 by the 100 ms log flush interval.
 
-Scans in that table predate heap-merged scans. After them, on RustFS: 100-key
-scans 37k → 77k/s, sparse scans (`--delete-pct`) 48k → 120k/s, sparse
-cold scans 21k → 28k/s.
+SlateDB's numbers in that table predate the compaction wait and the warmup.
 
 Several writers on one database (500k keys, 64 clients in total, spread
 across them). SlateDB allows only one writer:

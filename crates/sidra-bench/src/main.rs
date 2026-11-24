@@ -16,7 +16,7 @@ use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 
-use engine::{Engine, EngineKind, SidraParams};
+use engine::{Engine, EngineKind, EngineParams};
 use metered::{Counters, Metered};
 
 #[derive(Parser, Debug)]
@@ -71,6 +71,15 @@ struct Args {
     /// before returning.
     #[arg(long)]
     warm_background: bool,
+    /// SlateDB: bytes per block fetch in scans. SlateDB's own default reads
+    /// one block per request. No setting wins every scan: 4 KiB / 1 task is
+    /// best for warm 100-key scans, 256 KiB / 8 for cold 10,000-key ones;
+    /// 64 KiB / 4 wins the rest.
+    #[arg(long, default_value_t = 64)]
+    slatedb_read_ahead_kib: usize,
+    /// SlateDB: concurrent block fetches per scan. SlateDB's own default is 1.
+    #[arg(long, default_value_t = 4)]
+    slatedb_fetch_tasks: usize,
     /// sidra: buffered runs per child before it is flushed.
     #[arg(long, default_value_t = 16)]
     max_runs: usize,
@@ -358,6 +367,10 @@ where
             }
         })
     };
+    // Warm both caches first, as before the warm phases of the main run.
+    let (elapsed, hist, n) = timed(db.warm_up(wl.key(0), survivors as usize)).await?;
+    ensure!(n == survivors as usize, "warm-up scan returned {n} keys");
+    record("warmup", 1, elapsed, hist);
     let (elapsed, hist) = scans(4, db.clone()).await?;
     record("scan-sparse", args.scans, elapsed, hist);
 
@@ -587,7 +600,7 @@ async fn bench_engine(
     let counters: Arc<Counters> = metered.counters.clone();
     let os: Arc<dyn ObjectStore> = metered;
     let path = format!("runs/{}-{}", kind.name(), unique());
-    let params = SidraParams {
+    let params = EngineParams {
         leaf_bytes: args.leaf_kib << 10,
         internal_bytes: args.internal_kib << 10,
         fanout: args.fanout,
@@ -605,6 +618,12 @@ async fn bench_engine(
         } else {
             sidra::Warm::Blocking
         },
+        // Scanned blocks are cached, as sidra caches leaves; SlateDB's
+        // default leaves them out of the block cache.
+        slatedb_scan: slatedb::config::ScanOptions::default()
+            .with_cache_blocks(true)
+            .with_read_ahead_bytes(args.slatedb_read_ahead_kib << 10)
+            .with_max_fetch_tasks(args.slatedb_fetch_tasks),
     };
     let writers = match kind {
         EngineKind::Sidra => args.writers,
@@ -686,6 +705,13 @@ async fn bench_engine(
             }
         })
     };
+    // One pass over every key, so the warm phases find the data cached in
+    // both engines: sidra caches what it writes, SlateDB doesn't cache
+    // compaction output.
+    let (elapsed, hist, n) = timed(db.warm_up(wl.key(0), wl.keys as usize)).await?;
+    ensure!(n == wl.keys as usize, "warm-up scan returned {n} keys");
+    record("warmup", 1, elapsed, hist, &mut phases);
+
     let (elapsed, hist) = read_phase(1, db.clone(), 0).await?;
     record("read-warm", args.reads, elapsed, hist, &mut phases);
 

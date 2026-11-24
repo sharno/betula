@@ -5,7 +5,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use clap::ValueEnum;
 use object_store::ObjectStore;
-use slatedb::config::{FlushOptions, FlushType};
+use slatedb::config::{FlushOptions, FlushType, ScanOptions};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum EngineKind {
@@ -23,7 +23,7 @@ impl EngineKind {
 }
 
 #[derive(Clone, Debug)]
-pub struct SidraParams {
+pub struct EngineParams {
     pub leaf_bytes: usize,
     pub internal_bytes: usize,
     pub fanout: usize,
@@ -41,13 +41,48 @@ pub struct SidraParams {
     pub max_runs: usize,
     pub compression: crate::CompressionArg,
     pub warm: sidra::Warm,
+    /// How SlateDB scans fetch and cache blocks.
+    pub slatedb_scan: ScanOptions,
 }
+
+/// How long SlateDB's manifest must stay unchanged to count as settled.
+const SETTLE_QUIET: Duration = Duration::from_secs(10);
+const SETTLE_LIMIT: Duration = Duration::from_secs(600);
+
+/// Returns once SlateDB's manifest stops changing: its background compaction
+/// is done. Without this, later phases race a compaction that rewrites every
+/// SST, and SlateDB doesn't cache compaction output, so "warm" reads go to
+/// the store.
+async fn compaction_done(db: &slatedb::Db) -> Result<()> {
+    let mut last = db.manifest().id();
+    loop {
+        tokio::time::sleep(SETTLE_QUIET).await;
+        db.refresh_manifest().await?;
+        let id = db.manifest().id();
+        if id == last {
+            return Ok(());
+        }
+        last = id;
+    }
+}
+
+/// Which scan settings a SlateDB scan uses.
+#[derive(Clone, Copy)]
+enum Pass {
+    /// The settings under test.
+    Measured,
+    /// Large fetches, for the unmeasured warm-up.
+    Warmup,
+}
+
+const WARMUP_READ_AHEAD: usize = 1 << 20;
+const WARMUP_FETCH_TASKS: usize = 8;
 
 pub enum Engine {
     /// Several concurrent writers on one database. The first opened takes
     /// the applier role and serves reads, so its cache is the warm one.
     Sidra(Vec<sidra::Db>),
-    Slatedb(slatedb::Db),
+    Slatedb(slatedb::Db, ScanOptions),
 }
 
 impl Engine {
@@ -55,7 +90,7 @@ impl Engine {
         kind: EngineKind,
         os: Arc<dyn ObjectStore>,
         path: &str,
-        params: &SidraParams,
+        params: &EngineParams,
         writers: usize,
     ) -> Result<Self> {
         Ok(match kind {
@@ -129,6 +164,7 @@ impl Engine {
                         .with_settings(settings)
                         .build()
                         .await?,
+                    params.slatedb_scan.clone(),
                 )
             }
         })
@@ -148,7 +184,7 @@ impl Engine {
                     .await
                     .map(drop)?
             }
-            Engine::Slatedb(db) => {
+            Engine::Slatedb(db, _) => {
                 let batch = pairs
                     .into_iter()
                     .fold(slatedb::WriteBatch::new(), |mut b, (k, v)| {
@@ -174,7 +210,7 @@ impl Engine {
                     .await
                     .map(drop)?
             }
-            Engine::Slatedb(db) => {
+            Engine::Slatedb(db, _) => {
                 let batch = keys.iter().fold(slatedb::WriteBatch::new(), |mut b, k| {
                     b.delete(k);
                     b
@@ -195,19 +231,32 @@ impl Engine {
                     s.internal, s.leaves, s.runs, s.tombstones
                 ))
             }
-            Engine::Slatedb(_) => None,
+            Engine::Slatedb(..) => None,
         })
     }
 
+    /// SlateDB's default `ReadOptions` already match sidra: fetched blocks are
+    /// cached, and bloom filters (10 bits per key) skip SSTs without the key.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         Ok(match self {
             Engine::Sidra(dbs) => dbs[0].get(key).await?,
-            Engine::Slatedb(db) => db.get(key).await?,
+            Engine::Slatedb(db, _) => db.get(key).await?,
         })
     }
 
     /// Reads up to `limit` entries starting at `start`; returns the count.
     pub async fn scan(&self, start: Bytes, limit: usize) -> Result<usize> {
+        self.scan_pass(start, limit, Pass::Measured).await
+    }
+
+    /// An unmeasured scan that fills the caches. SlateDB fetches in large
+    /// blocks here, so warming up doesn't take as long as the scan settings
+    /// under test would (one 4 KiB block per GET is minutes at 20 ms).
+    pub async fn warm_up(&self, start: Bytes, limit: usize) -> Result<usize> {
+        self.scan_pass(start, limit, Pass::Warmup).await
+    }
+
+    async fn scan_pass(&self, start: Bytes, limit: usize, pass: Pass) -> Result<usize> {
         let mut n = 0;
         match self {
             Engine::Sidra(dbs) => {
@@ -216,8 +265,15 @@ impl Engine {
                     n += 1;
                 }
             }
-            Engine::Slatedb(db) => {
-                let mut it = db.scan(start..).await?;
+            Engine::Slatedb(db, measured) => {
+                let options = match pass {
+                    Pass::Measured => measured.clone(),
+                    Pass::Warmup => ScanOptions::default()
+                        .with_cache_blocks(true)
+                        .with_read_ahead_bytes(WARMUP_READ_AHEAD)
+                        .with_max_fetch_tasks(WARMUP_FETCH_TASKS),
+                };
+                let mut it = db.scan_with_options(start.., &options).await?;
                 while n < limit && it.next().await?.is_some() {
                     n += 1;
                 }
@@ -226,8 +282,8 @@ impl Engine {
         Ok(n)
     }
 
-    /// Moves everything written into the engine's long-term structure
-    /// (tree checkpoint / L0 flush).
+    /// Moves everything written into the engine's long-term structure (tree
+    /// checkpoint / L0 flush) and waits for background compaction to finish.
     pub async fn settle(&self) -> Result<()> {
         match self {
             Engine::Sidra(dbs) => {
@@ -243,11 +299,16 @@ impl Engine {
                 };
                 applier.checkpoint().await?
             }
-            Engine::Slatedb(db) => {
+            Engine::Slatedb(db, _) => {
                 db.flush_with_options(FlushOptions {
                     flush_type: FlushType::MemTable,
                 })
-                .await?
+                .await?;
+                tokio::time::timeout(SETTLE_LIMIT, compaction_done(db))
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("SlateDB still compacting after {SETTLE_LIMIT:?}")
+                    })??
             }
         }
         Ok(())
@@ -283,7 +344,7 @@ impl Engine {
                     100.0 * s.live_bytes as f64 / s.segment_bytes.max(1) as f64
                 )
             }
-            Engine::Slatedb(_) => String::new(),
+            Engine::Slatedb(..) => String::new(),
         }
     }
 
@@ -298,7 +359,7 @@ impl Engine {
                     db.close().await?;
                 }
             }
-            Engine::Slatedb(db) => db.close().await?,
+            Engine::Slatedb(db, _) => db.close().await?,
         }
         Ok(())
     }
