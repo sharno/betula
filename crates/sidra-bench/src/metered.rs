@@ -1,12 +1,12 @@
-//! `ObjectStore` wrapper that counts requests and bytes, and can add a fixed
-//! per-request delay to approximate a remote store such as S3.
+//! `ObjectStore` wrapper that counts requests and bytes, and adds simulated
+//! latency (see `latency`) to approximate a remote store such as S3.
 
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
+use crate::latency::{Latency, Op};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -94,26 +94,31 @@ impl std::ops::Sub for Snapshot {
 pub struct Metered {
     inner: Arc<dyn ObjectStore>,
     pub counters: Arc<Counters>,
-    delay: Duration,
+    latency: Arc<Latency>,
 }
 
 impl Metered {
-    pub fn new(inner: Arc<dyn ObjectStore>, delay: Duration) -> Self {
+    pub fn new(inner: Arc<dyn ObjectStore>, latency: Latency) -> Self {
         Self {
             inner,
             counters: Arc::default(),
-            delay,
+            latency: Arc::new(latency),
         }
     }
 
-    async fn pause(&self) {
-        if !self.delay.is_zero() {
-            tokio::time::sleep(self.delay).await;
-        }
+    async fn pause(&self, op: Op, bytes: u64) {
+        pause(&self.latency, op, bytes).await
     }
 
     fn add(counter: &AtomicU64, n: u64) {
         counter.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+async fn pause(latency: &Latency, op: Op, bytes: u64) {
+    let d = latency.delay(op, bytes);
+    if !d.is_zero() {
+        tokio::time::sleep(d).await;
     }
 }
 
@@ -131,7 +136,7 @@ impl ObjectStore for Metered {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
-        self.pause().await;
+        self.pause(Op::Write, payload.content_length() as u64).await;
         Self::add(&self.counters.puts, 1);
         Self::add(&self.counters.put_bytes, payload.content_length() as u64);
         Self::add(
@@ -147,28 +152,28 @@ impl ObjectStore for Metered {
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
         // One PUT per part (that's how stores bill multipart uploads), with
-        // the part's bytes.
-        self.pause().await;
+        // the part's bytes. Each part waits its own latency.
+        self.pause(Op::Write, 0).await;
         let inner = self.inner.put_multipart_opts(location, opts).await?;
         Ok(Box::new(MeteredUpload {
             inner,
             counters: self.counters.clone(),
+            latency: self.latency.clone(),
             kind: kind_of(location),
         }))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        self.pause().await;
         let head = options.head;
         let result = self.inner.get_opts(location, options).await?;
+        let bytes = result.range.end - result.range.start;
+        // After the call, so the delay covers the bytes actually returned.
+        self.pause(Op::Read, if head { 0 } else { bytes }).await;
         if head {
             Self::add(&self.counters.heads, 1);
         } else {
             Self::add(&self.counters.gets, 1);
-            Self::add(
-                &self.counters.get_bytes,
-                result.range.end - result.range.start,
-            );
+            Self::add(&self.counters.get_bytes, bytes);
         }
         Ok(result)
     }
@@ -216,13 +221,13 @@ impl ObjectStore for Metered {
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        self.pause().await;
+        self.pause(Op::Read, 0).await;
         Self::add(&self.counters.lists, 1);
         self.inner.list_with_delimiter(prefix).await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        self.pause().await;
+        self.pause(Op::Write, 0).await;
         Self::add(&self.counters.copies, 1);
         self.inner.copy_opts(from, to, options).await
     }
@@ -232,6 +237,7 @@ impl ObjectStore for Metered {
 struct MeteredUpload {
     inner: Box<dyn MultipartUpload>,
     counters: Arc<Counters>,
+    latency: Arc<Latency>,
     kind: usize,
 }
 
@@ -240,11 +246,14 @@ impl MultipartUpload for MeteredUpload {
     fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
         Metered::add(&self.counters.puts, 1);
         Metered::add(&self.counters.put_bytes, data.content_length() as u64);
-        Metered::add(
-            &self.counters.put_bytes_by[self.kind],
-            data.content_length() as u64,
-        );
-        self.inner.put_part(data)
+        let bytes = data.content_length() as u64;
+        Metered::add(&self.counters.put_bytes_by[self.kind], bytes);
+        let latency = self.latency.clone();
+        let part = self.inner.put_part(data);
+        Box::pin(async move {
+            pause(&latency, Op::Write, bytes).await;
+            part.await
+        })
     }
 
     async fn complete(&mut self) -> Result<PutResult> {

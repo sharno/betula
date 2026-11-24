@@ -1,6 +1,7 @@
 //! Benchmarks sidra against SlateDB on an S3-compatible store (e.g. RustFS).
 
 mod engine;
+mod latency;
 mod metered;
 
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 
 use engine::{Engine, EngineKind, EngineParams};
+use latency::{Latency, LatencyArg};
 use metered::{Counters, Metered};
 
 #[derive(Parser, Debug)]
@@ -58,9 +60,10 @@ struct Args {
     /// latencies are per batch.
     #[arg(long, default_value_t = 32)]
     batch: u64,
-    /// Delay added to every object store request, to approximate S3 latency.
-    #[arg(long, default_value_t = 0)]
-    delay_ms: u64,
+    /// Latency added to every object store request: `none`, a fixed delay
+    /// such as `20ms`, or `s3` (sampled per request, with S3's tail).
+    #[arg(long, default_value_t = LatencyArg::None)]
+    latency: LatencyArg,
     #[arg(long, default_value_t = 64)]
     leaf_kib: usize,
     #[arg(long, default_value_t = 1024)]
@@ -593,10 +596,7 @@ async fn bench_engine(
     raw: Arc<dyn ObjectStore>,
     wl: Arc<Workload>,
 ) -> Result<Vec<Phase>> {
-    let metered = Arc::new(Metered::new(
-        raw.clone(),
-        Duration::from_millis(args.delay_ms),
-    ));
+    let metered = Arc::new(Metered::new(raw.clone(), Latency::new(args.latency)));
     let counters: Arc<Counters> = metered.counters.clone();
     let os: Arc<dyn ObjectStore> = metered;
     let path = format!("runs/{}-{}", kind.name(), unique());

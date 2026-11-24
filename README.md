@@ -318,7 +318,7 @@ See [`spec/README.md`](spec/README.md):
   fencing, GC (only referenced segments remain, space amplification is
   bounded), and crash orphans.
 - `crates/sidra-bench`: sidra vs SlateDB on an S3 endpoint, with a metered
-  object store (request counts, bytes, optional added latency).
+  object store (request counts, bytes, simulated S3 latency).
   `s3probe` measures the store's raw PUT/GET throughput.
 
 ## Benchmark
@@ -327,8 +327,14 @@ See [`spec/README.md`](spec/README.md):
 # RustFS, no docker
 rustfs server --address 127.0.0.1:9100 /path/to/data   # RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY
 cargo run --release -p sidra-bench -- --keys 1000000 --leaf-kib 256 --internal-kib 2048 --memtable-mib 32
-cargo run --release -p sidra-bench -- ... --delay-ms 20   # approximate S3 latency
+cargo run --release -p sidra-bench -- ... --latency s3     # or a fixed delay: --latency 20ms
 ```
+
+`--latency s3` adds a delay sampled per request: log-normal time to first
+byte (GET p50 20 ms, p99 120 ms; PUT p50 40 ms, p99 250 ms), 1 in 1,000
+requests stalling 0.5–3 s, and transfer at 80 MiB/s per request. These are
+rough public figures for S3 Standard in-region, not a fit to measurements.
+The sequence is seeded, so the n-th request of every run draws the same delay.
 
 Phases: load (random order, batches of 32, 64 clients, durable writes), settle
 (checkpoint vs. memtable flush, then wait until SlateDB's manifest stays
@@ -378,7 +384,7 @@ mixed traffic. Sidra's GC spreads each run's deletes over its interval: on
 RustFS, bursts of deletes pushed write p99 to 0.7–1.2 s.
 
 Reads and scans with S3-like latency: 1M keys × 256 B, 256 KiB leaves,
-20 ms added to every request (`--delay-ms 20`), 64 clients. Warm phases run
+20 ms added to every request (`--latency 20ms`), 64 clients. Warm phases run
 after the warmup, cold ones right after a reopen. SlateDB scans cache their
 blocks like sidra caches leaves. No single SlateDB readahead setting wins
 every row: small fetches suit warm short scans and large ones suit cold
@@ -403,6 +409,33 @@ loaded; p99 shows the scans that went to the store. Leaf readahead took
 sidra's cold 10,000-key scans from 538 to 1.4k/s. SlateDB's cold scans vary
 up to 2× between runs; the table keeps its best run.
 
+With simulated S3 latency (`--latency s3`, see above) instead of a fixed
+20 ms; same setup, SlateDB scan settings picked the same way. Cold scans show
+latency percentiles, because one stall can set the length of a short phase:
+
+| | sidra | SlateDB 0.18 |
+|---|---|---|
+| warm point reads/s | **895k** | 323k |
+| cold point reads/s (p99 / p99.9 ms) | **60k (34 / 101)** | 2.6k (122 / 281) |
+| warm 100-key scans/s | **70.5k** | 47.5k [4/1] |
+| cold 100-key scans: p50 / p99 / p99.9 ms (scans/s) | **0.06 / 125** / 1,362 (1.1k) | 13 / 158 / **191 (2.1k)** [256/8] |
+| warm 1,000-key scans/s | **6.8k** | 5.0k [64/4] |
+| cold 1,000-key scans: p50 / p99 / p99.9 ms (scans/s) | **0.13 / 147** / 1,434 (1.2k) | 24 / 184 / **238 (2.0k)** [256/8] |
+| warm 10,000-key scans/s | **669** | 505 [64/4] |
+| cold 10,000-key scans: p50 / p99 / p99.9 ms (scans/s) | **1.4 / 295 / 1,525 (293)** | 138 / 419 / 2,163 (231) [256/8] |
+| warm sparse scans/s, 90% deleted | **105k** | 2.8k [4/1] |
+| cold sparse scans: p50 / p99 / p99.9 ms (scans/s) | **0.17 / 153 / 278 (3.1k)** | 34 / 271 / 590 (1.5k) [256/8] |
+| mixed reads/s, 40 clients, 5 min | **1.18M** | 1.7k |
+| mixed write p99 / p99.9 ms | **366 / 586** | 402 / 1,790 |
+
+Most cold scans in sidra hit leaves that earlier scans loaded, so its median
+stays below a millisecond. But a stalled GET holds every scan waiting on the
+leaves in its batch, and a cold phase makes only about 1,000 GETs, so one
+stall sets the phase's length: sidra's cold scans/s fall below SlateDB's.
+Sidra doesn't hedge reads yet; a second GET after about the p95 latency
+would cut this tail. SlateDB's mixed reads mostly miss its cache, so S3
+latency takes them from 184k to 1.7k/s.
+
 Commands (SlateDB alone with `--engines slatedb --slatedb-read-ahead-kib N
 --slatedb-fetch-tasks N`):
 
@@ -410,8 +443,10 @@ Commands (SlateDB alone with `--engines slatedb --slatedb-read-ahead-kib N
 B="--keys 1000000 --leaf-kib 256 --internal-kib 2048 --memtable-mib 32"
 sidra-bench $B --concurrency 40 --mixed-read-pct 20 --mixed-secs 900
 sidra-bench $B --concurrency 40 --mixed-read-pct 20 --mixed-secs 300 --values text --compression lz4
-sidra-bench $B --delay-ms 20 --scan-len 100 --scans 2000              # also 1000; 10000 with --scans 500
-sidra-bench $B --delay-ms 20 --scan-len 100 --scans 2000 --delete-pct 90
+sidra-bench $B --latency 20ms --scan-len 100 --scans 2000              # also 1000; 10000 with --scans 500
+sidra-bench $B --latency 20ms --scan-len 100 --scans 2000 --delete-pct 90
+# --latency s3: the two scan commands above with s3 in place of 20ms, and
+sidra-bench $B --latency s3 --concurrency 40 --mixed-read-pct 20 --mixed-secs 300
 ```
 
 Earlier runs:
