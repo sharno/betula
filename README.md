@@ -202,7 +202,9 @@ writer C ─► wal/C/{seq} ─┘
   GET.
 - **Reads stop early.** Each child pointer records the newest timestamp in its
   subtree. A point read stops once the version it holds is newer than
-  everything below. Scans build each leaf's view one page at a time.
+  everything below. A scan positions one cursor in each leaf and in each run
+  above it on its path, merges them with a heap one entry at a time, and
+  loads the next leaf only when it gets there.
 - **Tombstones.** Deletes stay as tombstones until no writer can still
   produce an older version of the key. Each writer's lease
   (`writers/{id}/lease`) carries a floor under every timestamp it may still
@@ -274,7 +276,7 @@ writer C ─► wal/C/{seq} ─┘
 
 Done: LZ4 compression (on by default), lighter cleaning of inner segments,
 paced GC deletes, multi-region (regional writer logs, standby appliers,
-replica readers).
+replica readers), heap-merged scans.
 
 1. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
 2. **Soak tests:** multi-hour runs against a real store.
@@ -285,9 +287,11 @@ replica readers).
    quarter full, merge it with a sibling (flushing the sibling's runs too) or
    rebalance the pair; the same for internal nodes by child count. Today
    only empty leaves go, so delete-heavy workloads (TTL expiry, queues)
-   leave sparse leaves: slower scans, a larger cached upper tree, more
+   leave sparse leaves: slower cold scans, a larger cached upper tree, more
    bytes. `sidra-bench --delete-pct 90` measures it.
-5. **Faster scans:** fewer sources per scan page.
+5. **Cold-scan prefetch:** a scan loads leaves one at a time. Cached
+   parents already give the next leaves' `(segment, offset, len)`, so their
+   GETs could go out concurrently, merged when neighbours share a segment.
 6. **Optional conditional writes** (compare-and-set) routed through the
    applier, for workloads that need them.
 
@@ -384,6 +388,10 @@ sidra builds:
 
 At 64 clients × batches of 32, load for both engines sits at the ceiling set
 by the 100 ms log flush interval.
+
+Scans in that table predate heap-merged scans. After them, on RustFS: 100-key
+scans 37k → 77k/s, sparse scans (`--delete-pct`) 48k → 120k/s, sparse
+cold scans 21k → 28k/s.
 
 Several writers on one database (500k keys, 64 clients in total, spread
 across them). SlateDB allows only one writer:
