@@ -388,7 +388,7 @@ where
     // Once the tombstones are old enough, a checkpoint pushes them down into
     // their leaves and drops them: the tree a later reader sees.
     tokio::time::sleep(Duration::from_secs(args.purge_secs + 1)).await;
-    let (elapsed, hist, ()) = timed(db.settle()).await?;
+    let (elapsed, hist, ()) = timed(db.purge()).await?;
     record("purge", 1, elapsed, hist);
     if let Some(shape) = db.shape(args.leaf_kib << 10).await? {
         eprintln!("[{}] after purge: {shape}", kind.name());

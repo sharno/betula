@@ -47,6 +47,10 @@ pub struct TreeConfig {
     /// every leaf a delete reached a second time, a checkpoint later.
     #[serde(with = "humantime_serde")]
     pub purge_tombstones_after: std::time::Duration,
+    /// Encoded bytes a checkpoint may write for purges before it starts no
+    /// more; later checkpoints carry on. Bounds the applier's time after a
+    /// mass delete, which could otherwise rewrite much of the tree at once.
+    pub purge_bytes_per_checkpoint: usize,
 }
 
 impl Default for TreeConfig {
@@ -57,6 +61,7 @@ impl Default for TreeConfig {
             max_fanout: 64,
             max_runs_per_child: 16,
             purge_tombstones_after: std::time::Duration::from_secs(60),
+            purge_bytes_per_checkpoint: 64 << 20,
         }
     }
 }
@@ -569,6 +574,8 @@ pub struct WriteStats {
     pub leaves_underfull: u64,
     pub merges_free: u64,
     pub merges_any: u64,
+    /// Encoded bytes written by purges (`TreeConfig::purge_bytes_per_checkpoint`).
+    pub purge_bytes: u64,
 }
 
 /// Applies sorted, key-unique `msgs` to the tree at `root`, writing new nodes
@@ -612,6 +619,7 @@ pub async fn apply(
         stats: WriteStats::default(),
         depth: 0,
         leaf_sizes: HashMap::new(),
+        purging: false,
     };
     if let Some(r) = root.filter(|_| !victims.is_empty()) {
         w.mark_dirty(r.ptr, r.height).await?;
@@ -647,6 +655,8 @@ struct Writer<'a> {
     depth: usize,
     /// Logical bytes of the leaves this checkpoint wrote.
     leaf_sizes: HashMap<NodePtr, usize>,
+    /// Inside a purge, whose bytes are counted once it returns.
+    purging: bool,
 }
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -671,8 +681,13 @@ impl Writer<'_> {
     /// for it in this checkpoint, which count as one more run) hold
     /// tombstones due for purging. Counting `part` matters when a purge
     /// carries a parent's runs down: their tombstones go on down now rather
-    /// than sit in a new run until the next checkpoint.
+    /// than sit in a new run until the next checkpoint. A purge already
+    /// under way finishes; a new one starts only within the budget.
     fn needs_purge(&self, child: &Child, part: &[(Bytes, Version)]) -> bool {
+        let budget = self.cfg.purge_bytes_per_checkpoint as u64;
+        if !self.purging && self.stats.purge_bytes >= budget {
+            return false;
+        }
         let part = part.iter().map(|(_, v)| (v.ts, v.msg == Msg::Delete));
         let runs = child.runs.iter().map(|r| (r.newest, r.tombstones));
         buffer_purge_at(runs.chain(part))
@@ -828,8 +843,10 @@ impl Writer<'_> {
                     let mut i = 0;
                     while i < node.children.len() {
                         let child = &node.children[i];
-                        if self.subtree_needs_move(child) || self.needs_purge(child, &parts[i]) {
+                        if self.subtree_needs_move(child) {
                             self.flush_child(&mut node, &mut parts, i).await?;
+                        } else if self.needs_purge(child, &parts[i]) {
+                            self.purge_child(&mut node, &mut parts, i).await?;
                         } else {
                             if self.runs_need_move(child) {
                                 let mut child = node.children[i].clone();
@@ -913,6 +930,29 @@ impl Writer<'_> {
     }
 
     /// Merges child `i`'s runs and new messages into it.
+    /// Flushes child `i` to purge its subtree. The outermost purge counts
+    /// what it and the purges nested in it write.
+    async fn purge_child(
+        &mut self,
+        node: &mut Internal,
+        parts: &mut Parts,
+        i: usize,
+    ) -> Result<()> {
+        if self.purging {
+            return self.flush_child(node, parts, i).await;
+        }
+        let before = self.written();
+        self.purging = true;
+        let flushed = self.flush_child(node, parts, i).await;
+        self.purging = false;
+        self.stats.purge_bytes += self.written() - before;
+        flushed
+    }
+
+    fn written(&self) -> u64 {
+        self.stats.leaf_bytes + self.stats.internal_bytes + self.stats.run_bytes
+    }
+
     async fn flush_child(
         &mut self,
         node: &mut Internal,

@@ -542,6 +542,7 @@ impl Shared {
                     leaves_underfull = plan.stats.leaves_underfull,
                     merges_free = plan.stats.merges_free,
                     merges_any = plan.stats.merges_any,
+                    purge_bytes = plan.stats.purge_bytes,
                     // Phase durations in ms: leases, log pull, tree rewrite
                     // (including node loads), segment upload, publish.
                     lease_ms = leased.as_millis(),

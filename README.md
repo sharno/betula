@@ -235,7 +235,10 @@ writer C ─► wal/C/{seq} ─┘
   still buffered in a run waits until its buffer has had no writes that
   long, then is carried down: a busy buffer flushes on its own, and forcing
   it early would cost its batching. Child pointers summarize when each
-  subtree is due, so due ones are found without loading anything.
+  subtree is due, so due ones are found without loading anything. A
+  checkpoint starts no new purge once its purges wrote
+  `purge_bytes_per_checkpoint` (64 MiB), so a mass delete spreads over
+  several checkpoints instead of stalling the applier on one.
 - **Inner-node cache.** Internal nodes and runs have their own cache. By
   default, open loads both before returning (`Warm::Blocking`), so reads are
   full speed from the first request. `Warm::Background` returns after the

@@ -107,6 +107,7 @@ impl Engine {
                         max_fanout: params.fanout,
                         max_runs_per_child: params.max_runs,
                         purge_tombstones_after: params.purge_after,
+                        purge_bytes_per_checkpoint: defaults.tree.purge_bytes_per_checkpoint,
                     },
                     cache: sidra::CacheConfig {
                         inner_bytes: params.inner_cache_bytes,
@@ -306,6 +307,28 @@ impl Engine {
             }
         }
         Ok(n)
+    }
+
+    /// Settles until due tombstones are gone. sidra purges at most
+    /// `purge_bytes_per_checkpoint` per checkpoint, so it checkpoints until
+    /// one leaves the tree as it was.
+    pub async fn purge(&self) -> Result<()> {
+        let root = || match self {
+            Engine::Sidra(dbs) => dbs
+                .iter()
+                .find(|d| d.is_applier())
+                .and_then(|d| d.metrics().tree),
+            Engine::Slatedb(..) => None,
+        };
+        let mut before = root();
+        loop {
+            self.settle().await?;
+            let after = root();
+            if after == before {
+                return Ok(());
+            }
+            before = after;
+        }
     }
 
     /// Moves everything written into the engine's long-term structure (tree

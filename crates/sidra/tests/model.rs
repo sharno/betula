@@ -134,6 +134,8 @@ fn tiny_config() -> Settings {
             max_runs_per_child: 2,
             // Purge as soon as allowed, so purges happen constantly.
             purge_tombstones_after: Duration::ZERO,
+            // A few leaves' worth, so purges often span checkpoints.
+            purge_bytes_per_checkpoint: 1000,
         },
         // Small caches force reloads from storage.
         cache: CacheConfig {
@@ -957,6 +959,53 @@ async fn idle_tree_purges_buffered_tombstones() {
     assert_eq!(db.scan(KeyRange::all()).collect().await.unwrap().len(), 150);
 }
 
+/// A purge bigger than `purge_bytes_per_checkpoint` spreads over more
+/// checkpoints instead of rewriting everything at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purge_spreads_over_checkpoints() {
+    let unbounded = checkpoints_to_purge(usize::MAX).await;
+    // One purge per checkpoint.
+    let bounded = checkpoints_to_purge(1).await;
+    assert!(bounded > unbounded, "{bounded} vs {unbounded}");
+}
+
+/// Deletes half of 300 keys and counts the idle checkpoints that purge them.
+async fn checkpoints_to_purge(budget: usize) -> usize {
+    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = ManualClock::new();
+    let mut cfg = tiny_config();
+    cfg.tree.purge_tombstones_after = Duration::from_secs(10);
+    cfg.tree.purge_bytes_per_checkpoint = budget;
+    let db = Db::builder(ROOT, os.clone())
+        .with_settings(cfg)
+        .with_clock(clock.clone())
+        .build()
+        .await
+        .unwrap();
+    for i in 0..300u32 {
+        clock.tick();
+        db.put(format!("k{i:04}"), "v").await.unwrap();
+    }
+    db.checkpoint().await.unwrap();
+    for i in 0..150u32 {
+        clock.tick();
+        db.delete(format!("k{i:04}")).await.unwrap();
+    }
+    db.checkpoint().await.unwrap();
+    clock.advance(Duration::from_secs(20));
+    let mut checkpoints = 0;
+    while {
+        let shape = db.tree_shape().await.unwrap();
+        shape.runs_with_tombstones > 0 || shape.tombstones > 0
+    } {
+        assert!(checkpoints < 100, "purge makes no progress");
+        db.checkpoint().await.unwrap();
+        checkpoints += 1;
+    }
+    assert_eq!(db.scan(KeyRange::all()).collect().await.unwrap().len(), 150);
+    checkpoints
+}
+
 async fn segment_objects(os: &Arc<dyn ObjectStore>) -> usize {
     let prefix = Path::from(format!("{ROOT}/seg"));
     os.list(Some(&prefix))
@@ -1050,6 +1099,7 @@ async fn paged_scans_match_model() {
         max_fanout: 8,
         max_runs_per_child: 6,
         purge_tombstones_after: HOUR,
+        ..TreeConfig::default()
     };
     cfg.checkpoint.bytes = 1 << 30;
     let db = Db::builder(ROOT, os.clone())
