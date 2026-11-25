@@ -47,8 +47,8 @@ pub struct TreeConfig {
     /// every leaf a delete reached a second time, a checkpoint later.
     #[serde(with = "humantime_serde")]
     pub purge_tombstones_after: std::time::Duration,
-    /// Encoded bytes a checkpoint may write for purges before it starts no
-    /// more; later checkpoints carry on. Bounds the applier's time after a
+    /// Encoded bytes a checkpoint may load and write for purges before it
+    /// starts no more; later checkpoints carry on. Bounds the applier's time after a
     /// mass delete, which could otherwise rewrite much of the tree at once.
     pub purge_bytes_per_checkpoint: usize,
 }
@@ -574,7 +574,10 @@ pub struct WriteStats {
     pub leaves_underfull: u64,
     pub merges_free: u64,
     pub merges_any: u64,
-    /// Encoded bytes written by purges (`TreeConfig::purge_bytes_per_checkpoint`).
+    /// Encoded bytes of the nodes and runs this checkpoint loaded.
+    pub loaded_bytes: u64,
+    /// Encoded bytes purges loaded and wrote
+    /// (`TreeConfig::purge_bytes_per_checkpoint`).
     pub purge_bytes: u64,
 }
 
@@ -619,7 +622,7 @@ pub async fn apply(
         stats: WriteStats::default(),
         depth: 0,
         leaf_sizes: HashMap::new(),
-        purging: false,
+        purge_start: None,
     };
     if let Some(r) = root.filter(|_| !victims.is_empty()) {
         w.mark_dirty(r.ptr, r.height).await?;
@@ -655,8 +658,8 @@ struct Writer<'a> {
     depth: usize,
     /// Logical bytes of the leaves this checkpoint wrote.
     leaf_sizes: HashMap<NodePtr, usize>,
-    /// Inside a purge, whose bytes are counted once it returns.
-    purging: bool,
+    /// `work()` when the outermost purge under way started.
+    purge_start: Option<u64>,
 }
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -681,11 +684,12 @@ impl Writer<'_> {
     /// for it in this checkpoint, which count as one more run) hold
     /// tombstones due for purging. Counting `part` matters when a purge
     /// carries a parent's runs down: their tombstones go on down now rather
-    /// than sit in a new run until the next checkpoint. A purge already
-    /// under way finishes; a new one starts only within the budget.
+    /// than sit in a new run until the next checkpoint. None starts past
+    /// the budget, at any depth: one child of the root can hold much of the
+    /// tree. Writes land bottom-up, so the first purge of a checkpoint
+    /// still reaches a leaf.
     fn needs_purge(&self, child: &Child, part: &[(Bytes, Version)]) -> bool {
-        let budget = self.cfg.purge_bytes_per_checkpoint as u64;
-        if !self.purging && self.stats.purge_bytes >= budget {
+        if self.purged() >= self.cfg.purge_bytes_per_checkpoint as u64 {
             return false;
         }
         let part = part.iter().map(|(_, v)| (v.ts, v.msg == Msg::Delete));
@@ -810,6 +814,7 @@ impl Writer<'_> {
         Box::pin(async move {
             debug_assert!(!self.is_ours(ptr), "rewrite of a node from this checkpoint");
             let node = self.nodes.load(ptr).await?;
+            self.stats.loaded_bytes += u64::from(ptr.len);
             self.freed.push(ptr);
             match node {
                 Node::Run(_) => Err(corrupt(ptr, "a tree node")),
@@ -938,19 +943,27 @@ impl Writer<'_> {
         parts: &mut Parts,
         i: usize,
     ) -> Result<()> {
-        if self.purging {
+        if self.purge_start.is_some() {
             return self.flush_child(node, parts, i).await;
         }
-        let before = self.written();
-        self.purging = true;
+        let start = self.work();
+        self.purge_start = Some(start);
         let flushed = self.flush_child(node, parts, i).await;
-        self.purging = false;
-        self.stats.purge_bytes += self.written() - before;
+        self.purge_start = None;
+        self.stats.purge_bytes += self.work() - start;
         flushed
     }
 
-    fn written(&self) -> u64 {
-        self.stats.leaf_bytes + self.stats.internal_bytes + self.stats.run_bytes
+    /// Bytes purges loaded and wrote so far, including the one under way.
+    fn purged(&self) -> u64 {
+        self.stats.purge_bytes + self.purge_start.map_or(0, |s| self.work() - s)
+    }
+
+    /// Bytes this checkpoint loaded and wrote. Loads count: purging a leaf
+    /// whose keys are all deleted writes nothing but still reads it.
+    fn work(&self) -> u64 {
+        let s = &self.stats;
+        s.loaded_bytes + s.leaf_bytes + s.internal_bytes + s.run_bytes
     }
 
     async fn flush_child(
@@ -968,6 +981,7 @@ impl Writer<'_> {
             "run from this checkpoint"
         );
         let runs = self.nodes.load_many(&run_ptrs).await?;
+        self.stats.loaded_bytes += run_ptrs.iter().map(|p| u64::from(p.len)).sum::<u64>();
         let mut msgs = std::mem::take(&mut parts[i]);
         for (ptr, run) in run_ptrs.iter().zip(runs) {
             let Node::Run(run) = run else {

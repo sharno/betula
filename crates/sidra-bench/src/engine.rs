@@ -89,6 +89,14 @@ pub enum Engine {
     Slatedb(slatedb::Db, ScanOptions),
 }
 
+/// See `Engine::backlog`.
+#[derive(Clone, Copy, Debug)]
+pub struct Backlog {
+    pub unapplied: u64,
+    pub applied: u64,
+    pub last_checkpoint: Option<Duration>,
+}
+
 impl Engine {
     pub async fn open(
         kind: EngineKind,
@@ -201,6 +209,29 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// sidra's backlog: unapplied bytes (the most any writer sees), log bytes
+    /// applied so far, and the last checkpoint's duration.
+    pub fn backlog(&self) -> Option<Backlog> {
+        match self {
+            Engine::Sidra(dbs) => {
+                let ms: Vec<_> = dbs.iter().map(|d| d.metrics()).collect();
+                Some(Backlog {
+                    unapplied: ms
+                        .iter()
+                        .map(|m| m.unapplied_bytes as u64)
+                        .max()
+                        .unwrap_or(0),
+                    applied: ms.iter().map(|m| m.applied_bytes).sum(),
+                    last_checkpoint: ms
+                        .iter()
+                        .filter(|m| m.is_applier)
+                        .find_map(|m| m.last_checkpoint),
+                })
+            }
+            Engine::Slatedb(..) => None,
+        }
     }
 
     /// Deletes the keys atomically through writer `slot`.

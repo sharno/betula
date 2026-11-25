@@ -150,6 +150,8 @@ fn tiny_config() -> Settings {
         checkpoint: CheckpointConfig {
             bytes: 400,
             interval: HOUR,
+            // A few batches, so backlogs often span checkpoints.
+            max_bytes: 1000,
             max_unapplied_bytes: 1 << 30,
         },
         poll: PollConfig {
@@ -715,14 +717,7 @@ fn sim_lags() -> impl Strategy<Value = Vec<u64>> {
 /// happen only then (under faults a lost writer may lose them, so they're
 /// awaited).
 fn simulate(ops: Vec<Op>, lags: Vec<u64>, faults: Option<Faults>, seed: u64) -> Trace {
-    // Time only: the IO driver (unused, the store is in memory) parks for
-    // real between timers even with time paused, 40x slower.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap();
-    rt.block_on(async {
+    virtual_runtime().block_on(async {
         let setup = Setup {
             faults,
             seed,
@@ -744,6 +739,130 @@ proptest! {
     ) {
         simulate(ops, lags, faults, seed);
     }
+}
+
+/// A paused current-thread runtime, for `VirtualClock` runs. Time only: the
+/// IO driver (unused, the store is in memory) parks for real between timers
+/// even with time paused, 40x slower.
+fn virtual_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap()
+}
+
+/// Writers that outpace the applier stall at the backlog limit instead of
+/// failing, share it fairly, and the applier keeps publishing: a checkpoint
+/// must not grow with the backlog until another writer takes the role
+/// mid-checkpoint, and the next one, over and over.
+#[test]
+fn overload_stalls_writers_while_the_applier_keeps_up() {
+    const LIMIT: usize = 100_000;
+    const RUN: Duration = Duration::from_secs(300);
+    virtual_runtime().block_on(async {
+        let store = Arc::new(Faulty::new(Arc::new(InMemory::new()), Faults::NONE, 0));
+        // Uploading a checkpoint of the whole backlog takes well past
+        // `steal_after` (30 s).
+        store.throttle_puts(|p| p.ends_with(".seg"), 800);
+        let os: Arc<dyn ObjectStore> = store.clone();
+        let clock = VirtualClock::new();
+        let mut cfg = sim_config();
+        cfg.checkpoint.max_unapplied_bytes = LIMIT;
+        let open = |w: u64| {
+            Db::builder(ROOT, os.clone())
+                .with_settings(cfg.clone())
+                .with_clock(clock.clone())
+                .with_writer_id(sidra::WriterId(w + 1))
+                .build()
+        };
+        let mut dbs = Vec::new();
+        for w in 0..WRITERS as u64 {
+            dbs.push(Arc::new(open(w).await.unwrap()));
+        }
+        let start = tokio::time::Instant::now();
+        let writers = dbs.iter().enumerate().map(|(w, db)| {
+            let db = db.clone();
+            tokio::spawn(async move {
+                // Last value written per key, and when each write was acked.
+                let mut wrote = BTreeMap::new();
+                let mut acked = Vec::new();
+                for n in 0u32.. {
+                    if start.elapsed() >= RUN {
+                        break;
+                    }
+                    let (k, v) = (format!("w{w}-{:03}", n % 500), format!("{n:0100}"));
+                    // Stalled, not stuck: a livelocked applier hangs here.
+                    tokio::time::timeout(RUN, db.put(k.clone(), v.clone()))
+                        .await
+                        .expect("write stalled the whole run")
+                        .unwrap();
+                    wrote.insert(k, v);
+                    acked.push(start.elapsed());
+                }
+                (wrote, acked)
+            })
+        });
+        let writers = futures::future::join_all(writers);
+        tokio::pin!(writers);
+        // Sample the backlog and the applier until the writers stop.
+        let (mut backlog, mut gap) = (0, Duration::ZERO);
+        let mut epochs = std::collections::BTreeSet::new();
+        let mut last_manifest = (dbs[0].metrics().manifest_id, start.elapsed());
+        let results = loop {
+            tokio::select! {
+                biased;
+                r = &mut writers => break r,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+            let m = dbs
+                .iter()
+                .map(|d| d.metrics())
+                .max_by_key(|m| m.manifest_id)
+                .unwrap();
+            backlog = backlog.max(
+                dbs.iter()
+                    .map(|d| d.metrics().unapplied_bytes)
+                    .max()
+                    .unwrap(),
+            );
+            epochs.insert(m.applier_epoch);
+            if m.manifest_id != last_manifest.0 {
+                last_manifest = (m.manifest_id, start.elapsed());
+            }
+            gap = gap.max(start.elapsed() - last_manifest.1);
+        };
+        eprintln!("backlog {backlog} B, manifest gap {gap:?}, epochs {epochs:?}");
+        assert!(gap <= Duration::from_secs(15), "no manifest for {gap:?}");
+        assert_eq!(epochs.len(), 1, "the applier role changed hands");
+        assert!(backlog <= 2 * LIMIT, "backlog reached {backlog} B");
+        // Each writer gets a fair share: the applier, which sees room
+        // first, doesn't starve the rest.
+        let acks: Vec<usize> = results
+            .iter()
+            .map(|r| r.as_ref().unwrap().1.len())
+            .collect();
+        eprintln!("acks per writer {acks:?}");
+        let (least, most) = (acks.iter().min().unwrap(), acks.iter().max().unwrap());
+        assert!(least * 2 >= *most, "unfair: {acks:?}");
+        // Drains, and nothing acknowledged is lost.
+        for db in &dbs {
+            db.flush_wal().await.unwrap();
+        }
+        let applier = dbs.iter().find(|d| d.is_applier()).expect("an applier");
+        while applier.metrics().unapplied_bytes > 0 {
+            applier.checkpoint().await.unwrap();
+        }
+        for (wrote, _) in results.into_iter().map(Result::unwrap) {
+            for (k, v) in wrote {
+                assert_eq!(
+                    applier.get(&k).await.unwrap().as_deref(),
+                    Some(v.as_bytes()),
+                    "{k}"
+                );
+            }
+        }
+    });
 }
 
 /// A seed replays the same store requests, so a failing case reproduces
@@ -961,11 +1080,13 @@ async fn idle_tree_purges_buffered_tombstones() {
 
 /// A purge bigger than `purge_bytes_per_checkpoint` spreads over more
 /// checkpoints instead of rewriting everything at once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn purge_spreads_over_checkpoints() {
-    let unbounded = checkpoints_to_purge(usize::MAX).await;
+/// On paused time, so the background applier interleaves the same way
+/// every run.
+#[test]
+fn purge_spreads_over_checkpoints() {
+    let unbounded = virtual_runtime().block_on(checkpoints_to_purge(usize::MAX));
     // One purge per checkpoint.
-    let bounded = checkpoints_to_purge(1).await;
+    let bounded = virtual_runtime().block_on(checkpoints_to_purge(1));
     assert!(bounded > unbounded, "{bounded} vs {unbounded}");
 }
 
@@ -976,6 +1097,13 @@ async fn checkpoints_to_purge(budget: usize) -> usize {
     let mut cfg = tiny_config();
     cfg.tree.purge_tombstones_after = Duration::from_secs(10);
     cfg.tree.purge_bytes_per_checkpoint = budget;
+    // Only purges may carry tombstones down here: not the cleaner moving
+    // live nodes, nor full buffers flushing (tiny ones cascade to the
+    // leaves on any flush).
+    cfg.cleaner.clean_below_live = 0.0;
+    cfg.cleaner.clean_inner_below_live = 0.0;
+    cfg.tree.internal_max_bytes = 1 << 20;
+    cfg.tree.max_runs_per_child = 64;
     let db = Db::builder(ROOT, os.clone())
         .with_settings(cfg)
         .with_clock(clock.clone())
@@ -992,18 +1120,93 @@ async fn checkpoints_to_purge(budget: usize) -> usize {
         db.delete(format!("k{i:04}")).await.unwrap();
     }
     db.checkpoint().await.unwrap();
+    // Every checkpoint counts, the background applier's too.
+    let before = db.metrics().checkpoints;
     clock.advance(Duration::from_secs(20));
-    let mut checkpoints = 0;
+    renewed().await;
     while {
         let shape = db.tree_shape().await.unwrap();
         shape.runs_with_tombstones > 0 || shape.tombstones > 0
     } {
-        assert!(checkpoints < 100, "purge makes no progress");
+        assert!(
+            db.metrics().checkpoints - before < 100,
+            "purge makes no progress"
+        );
         db.checkpoint().await.unwrap();
-        checkpoints += 1;
     }
     assert_eq!(db.scan(KeyRange::all()).collect().await.unwrap().len(), 150);
-    checkpoints
+    (db.metrics().checkpoints - before) as usize
+}
+
+/// A checkpoint that leaves entries for later (`max_bytes`) must keep
+/// tombstones newer than any of them. Batch `{x@1, del k@4}` is older by its
+/// first entry than `{put k@3}`, so it goes first; if a later checkpoint
+/// dropped the tombstone while the put still waited, the put would show
+/// once applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_checkpoint_keeps_tombstones_newer_than_what_it_left() {
+    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = ManualClock::new();
+    let mut cfg = tiny_config();
+    // One batch per checkpoint.
+    cfg.checkpoint.max_bytes = 1;
+    // Writes stay queued until `flush_wal`, so one batch spans several
+    // timestamps; and only `a` applies.
+    let queued = Settings {
+        wal: WalConfig {
+            flush_interval: HOUR,
+            max_bytes: 1 << 20,
+        },
+        applier: ApplierRole::Never,
+        ..cfg.clone()
+    };
+    let open = |cfg: Settings| {
+        Db::builder(ROOT, os.clone())
+            .with_settings(cfg)
+            .with_clock(clock.clone())
+            .build()
+    };
+    let a = open(cfg.clone()).await.unwrap();
+    let (b, c) = (
+        open(queued.clone()).await.unwrap(),
+        open(queued).await.unwrap(),
+    );
+    let queue = |key: &str, put: bool| {
+        let mut batch = WriteBatch::new();
+        match put {
+            true => batch.put(key, "v"),
+            false => batch.delete(key),
+        };
+        (
+            batch,
+            WriteOptions {
+                durability: Durability::Queued,
+            },
+        )
+    };
+    // A log flushes at its first tick: spend b's on a batch of its own.
+    clock.tick();
+    b.put("w", "v").await.unwrap();
+    clock.tick();
+    let (batch, opts) = queue("x", true);
+    b.write_with(batch, opts).await.unwrap();
+    clock.tick();
+    let (batch, opts) = queue("y", true);
+    c.write_with(batch, opts).await.unwrap();
+    clock.tick();
+    a.put("k", "old").await.unwrap();
+    clock.tick();
+    let (batch, opts) = queue("k", false);
+    b.write_with(batch, opts).await.unwrap();
+    b.flush_wal().await.unwrap();
+    c.flush_wal().await.unwrap();
+    // Leases renew with floors past every entry: tombstones may go.
+    clock.advance(Duration::from_secs(20));
+    renewed().await;
+    // Applies b's two batches, then c's (which may drop tombstones), then
+    // a's.
+    a.checkpoint().await.unwrap();
+    assert_eq!(a.get("k").await.unwrap(), None);
 }
 
 async fn segment_objects(os: &Arc<dyn ObjectStore>) -> usize {

@@ -76,6 +76,19 @@ impl Hold {
     }
 }
 
+/// Slows PUTs to matching paths to `bytes_per_sec`, like a link that limits
+/// how fast a process can upload. Independent of `Faults`.
+pub struct Throttle {
+    matches: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    bytes_per_sec: u64,
+}
+
+impl fmt::Debug for Throttle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Throttle({} B/s)", self.bytes_per_sec)
+    }
+}
+
 impl fmt::Debug for Hold {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Hold(arrived: {})", self.arrived())
@@ -89,6 +102,7 @@ pub struct Faulty {
     rng: Arc<AtomicU64>,
     enabled: Arc<AtomicBool>,
     holds: Mutex<Vec<Arc<Hold>>>,
+    throttles: Mutex<Vec<Arc<Throttle>>>,
     pub injected: Arc<AtomicU64>,
     /// Requests seen and an order-sensitive digest of them, so a simulation
     /// can check that a seed replays the same requests.
@@ -135,6 +149,7 @@ impl Faulty {
             rng: Arc::new(AtomicU64::new(seed)),
             enabled: Arc::new(AtomicBool::new(true)),
             holds: Mutex::new(Vec::new()),
+            throttles: Mutex::new(Vec::new()),
             injected: Arc::default(),
             trace: Arc::default(),
         }
@@ -162,6 +177,18 @@ impl Faulty {
         });
         self.holds.lock().unwrap().push(hold.clone());
         hold
+    }
+
+    /// Slows PUTs whose path matches to `bytes_per_sec` each.
+    pub fn throttle_puts(
+        &self,
+        matches: impl Fn(&str) -> bool + Send + Sync + 'static,
+        bytes_per_sec: u64,
+    ) {
+        self.throttles.lock().unwrap().push(Arc::new(Throttle {
+            matches: Box::new(matches),
+            bytes_per_sec,
+        }));
     }
 
     /// Turns faults on or off (for fault-free verification at the end).
@@ -224,6 +251,17 @@ impl ObjectStore for Faulty {
             .cloned();
         if let Some(h) = hold {
             h.wait().await;
+        }
+        let throttle = self
+            .throttles
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| (t.matches)(location.as_ref()))
+            .cloned();
+        if let Some(t) = throttle {
+            let secs = payload.content_length() as f64 / t.bytes_per_sec as f64;
+            tokio::time::sleep(Duration::from_secs_f64(secs)).await;
         }
         self.before("put", location).await?;
         let r = self.inner.put_opts(location, payload, opts).await;

@@ -109,9 +109,9 @@ impl Follower {
         }
     }
 
-    /// Bytes of unapplied batches held in memory.
-    pub fn tails_bytes(&self) -> usize {
-        self.view.read().tails.retained_bytes()
+    /// See `Tails::has_room`.
+    pub fn has_room(&self, me: WriterId, limit: usize) -> bool {
+        self.view.read().tails.has_room(me, limit)
     }
 
     /// Adds this process's own durable batch without waiting for a poll.

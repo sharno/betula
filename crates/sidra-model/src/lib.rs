@@ -526,6 +526,8 @@ fn checkpoint_step(p: &mut Proc, cfg: &Config, resp: Response, o: &mut Out) {
         cleaner: &cleaner,
         // The model's tree has no tombstones to purge.
         purge_after: std::time::Duration::from_secs(60),
+        // One batch per checkpoint, so backlogs span checkpoints.
+        max_bytes: 1,
     };
     let stage = std::mem::replace(&mut a.stage, Stage::Idle);
     let next = |req: Request, stage: Stage, a: &mut Applier, p: &mut Proc, o: &mut Out| {
@@ -742,6 +744,7 @@ fn advance_pull(
                 },
                 cleaner: &cleaner,
                 purge_after: std::time::Duration::from_secs(60),
+                max_bytes: 1,
             };
             advance_seal(a, p, o, sealing, queue, None, clock, who);
         }

@@ -37,6 +37,8 @@ pub struct Applier<'a> {
     pub cleaner: &'a CleanerConfig,
     /// `TreeConfig::purge_tombstones_after`.
     pub purge_after: Duration,
+    /// `CheckpointConfig::max_bytes`.
+    pub max_bytes: usize,
 }
 
 /// Leases read: every writer with a lease, and this writer's own floor.
@@ -67,6 +69,14 @@ pub struct Sealing {
     pub to_seal: Vec<WriterId>,
     scanned: Scanned,
     pull: Pull,
+}
+
+/// Whether a checkpoint left held entries for the next one
+/// (`CheckpointConfig::max_bytes`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Left {
+    Nothing,
+    Entries,
 }
 
 /// What a checkpoint found to do.
@@ -107,16 +117,23 @@ impl Sealing {
         {
             return Plan::Nothing;
         }
+        let taken = view.tails.take(a.max_bytes, &view.manifest.frontier);
+        let drop_below = tombstones::drop_below(floor, view.manifest.tombstone_bound, self.pull);
         Plan::Apply(Applying {
-            msgs: view.tails.mem().to_sorted_vec(),
-            drop_below: tombstones::drop_below(floor, view.manifest.tombstone_bound, self.pull),
+            left: match taken.rest_oldest {
+                Some(_) => Left::Entries,
+                None => Left::Nothing,
+            },
+            msgs: taken.msgs,
+            msg_bytes: taken.bytes,
+            drop_below: taken.rest_oldest.map_or(drop_below, |t| drop_below.min(t)),
             victims,
             hand_back: hand_back(a.role, &leases, a.me, now_ms, is_sealed),
             floor,
             present,
             prev: view.manifest.clone(),
-            frontier: view.tails.frontier(&view.manifest.frontier),
-            newly_sealed: view.tails.sealed().collect(),
+            frontier: taken.frontier,
+            newly_sealed: taken.sealed,
         })
     }
 }
@@ -130,6 +147,9 @@ impl Sealing {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Applying {
     pub msgs: Vec<(Bytes, Version)>,
+    /// Log bytes of the batches `msgs` came from.
+    pub msg_bytes: usize,
+    pub left: Left,
     pub drop_below: Ts,
     pub victims: BTreeSet<SegmentId>,
     floor: u64,

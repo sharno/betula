@@ -162,8 +162,10 @@ pub struct Metrics {
     /// Batches this writer made durable, and the log objects holding them.
     pub batches_written: u64,
     pub log_flushes: u64,
-    /// Checkpoints this process published as applier.
+    /// Checkpoints this process published as applier, and the log bytes
+    /// they applied.
     pub checkpoints: u64,
+    pub applied_bytes: u64,
     pub last_checkpoint: Option<Duration>,
     pub cache: CacheStats,
     pub requests: RequestStats,
@@ -174,6 +176,7 @@ struct Counters {
     batches: AtomicU64,
     flushes: AtomicU64,
     checkpoints: AtomicU64,
+    applied_bytes: AtomicU64,
     /// Duration of the last checkpoint in microseconds plus one (0: none).
     last_checkpoint_us: AtomicU64,
 }
@@ -420,8 +423,15 @@ impl Shared {
         })
     }
 
-    /// Folds every pulled log entry into the tree and publishes a manifest.
-    async fn checkpoint(&self) -> Result<()> {
+    /// Checkpoints until no held entry is left.
+    async fn checkpoint_all(&self) -> Result<()> {
+        while self.checkpoint().await? == checkpoint::Left::Entries {}
+        Ok(())
+    }
+
+    /// Folds the oldest pulled log entries, up to `CheckpointConfig::max_bytes`,
+    /// into the tree and publishes a manifest.
+    async fn checkpoint(&self) -> Result<checkpoint::Left> {
         let mut guard = self.applier.lock().await;
         let Some(app) = guard.as_mut() else {
             return Err(Error::NotApplier);
@@ -455,9 +465,10 @@ impl Shared {
             role: self.cfg.applier,
             cleaner: &self.cfg.cleaner,
             purge_after: self.cfg.tree.purge_tombstones_after,
+            max_bytes: self.cfg.checkpoint.max_bytes,
         };
         let mut applying = match sealing.sealed(&view, who, self.now()) {
-            checkpoint::Plan::Nothing => return Ok(()),
+            checkpoint::Plan::Nothing => return Ok(checkpoint::Left::Nothing),
             checkpoint::Plan::Apply(applying) => applying,
         };
         let out = tree::Outputs {
@@ -469,7 +480,7 @@ impl Shared {
         app.next_segment = out.leaves.next();
         let msgs = std::mem::take(&mut applying.msgs);
         let msg_count = msgs.len();
-        let msg_bytes = view.tails.mem().bytes();
+        let (msg_bytes, left) = (applying.msg_bytes, applying.left);
         let victims = applying.victims.clone();
         let ck = tree::Checkpoint {
             out,
@@ -542,6 +553,7 @@ impl Shared {
                     leaves_underfull = plan.stats.leaves_underfull,
                     merges_free = plan.stats.merges_free,
                     merges_any = plan.stats.merges_any,
+                    loaded_bytes = plan.stats.loaded_bytes,
                     purge_bytes = plan.stats.purge_bytes,
                     // Phase durations in ms: leases, log pull, tree rewrite
                     // (including node loads), segment upload, publish.
@@ -557,13 +569,15 @@ impl Shared {
                 self.follower.install(next_id, Arc::new(next), self.now());
                 let c = &self.counters;
                 c.checkpoints.fetch_add(1, Ordering::Relaxed);
+                c.applied_bytes
+                    .fetch_add(msg_bytes as u64, Ordering::Relaxed);
                 let us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX - 1);
                 c.last_checkpoint_us.store(us + 1, Ordering::Relaxed);
                 if hand_back {
                     tracing::info!(writer = %self.writer, "handing the applier role back");
                     self.release_locked(&mut guard).await?;
                 }
-                Ok(())
+                Ok(left)
             }
             Publish::Conflict => {
                 tracing::info!(writer = %self.writer, "lost the applier role");
@@ -884,10 +898,10 @@ impl Db {
     }
 
     /// Applier only: folds every durable entry from every writer into the
-    /// tree now.
+    /// tree now, in checkpoints of at most `CheckpointConfig::max_bytes`.
     pub async fn checkpoint(&self) -> Result<()> {
         self.flush_wal().await?;
-        self.shared.checkpoint().await
+        self.shared.checkpoint_all().await
     }
 
     /// Takes the applier role from whoever holds it. Returns whether this
@@ -951,6 +965,7 @@ impl Db {
             batches_written: c.batches.load(Ordering::Relaxed),
             log_flushes: c.flushes.load(Ordering::Relaxed),
             checkpoints: c.checkpoints.load(Ordering::Relaxed),
+            applied_bytes: c.applied_bytes.load(Ordering::Relaxed),
             last_checkpoint: c
                 .last_checkpoint_us
                 .load(Ordering::Relaxed)
@@ -991,7 +1006,7 @@ impl Db {
             tracing::debug!(%e, "claim on close failed");
         }
         if self.is_applier() {
-            match self.shared.checkpoint().await {
+            match self.shared.checkpoint_all().await {
                 Ok(()) => {
                     if let Err(e) = self.shared.release().await {
                         tracing::warn!(%e, "releasing the applier role failed");
@@ -1073,7 +1088,10 @@ type PutFuture =
 impl WalTask {
     fn gate(&self) -> Gate {
         let s = &self.shared;
-        match s.follower.tails_bytes() < s.cfg.checkpoint.max_unapplied_bytes {
+        match s
+            .follower
+            .has_room(s.writer, s.cfg.checkpoint.max_unapplied_bytes)
+        {
             true => Gate::Open,
             false => Gate::Closed,
         }
@@ -1269,7 +1287,7 @@ async fn applier_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) 
             Due::Purge | Due::No => continue,
         }
         match shared.checkpoint().await {
-            Ok(()) | Err(Error::NotApplier) => {}
+            Ok(_) | Err(Error::NotApplier) => {}
             Err(e) => {
                 tracing::warn!(%e, "checkpoint failed, retrying");
                 let _ = every(Duration::from_secs(1), &mut shutdown).await;

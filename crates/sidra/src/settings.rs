@@ -200,7 +200,14 @@ pub struct CheckpointConfig {
     /// ...or once the oldest has waited this long.
     #[serde(with = "humantime_serde")]
     pub interval: Duration,
-    /// Writers stall while unapplied entries exceed this.
+    /// A checkpoint applies at most this much, oldest entries first, so it
+    /// takes about as long however far behind the applier is. One that
+    /// grew with the backlog could outlast `steal_after`: another writer
+    /// would take the role mid-checkpoint, face a bigger backlog, and lose
+    /// the role the same way.
+    pub max_bytes: usize,
+    /// Unapplied entries stay near this: a writer stalls while its own
+    /// exceed an even share of it among writers with unapplied entries.
     pub max_unapplied_bytes: usize,
 }
 
@@ -209,6 +216,7 @@ impl Default for CheckpointConfig {
         Self {
             bytes: 32 << 20,
             interval: Duration::from_secs(2),
+            max_bytes: 64 << 20,
             max_unapplied_bytes: 512 << 20,
         }
     }

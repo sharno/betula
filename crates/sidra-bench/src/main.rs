@@ -116,6 +116,15 @@ struct Args {
     /// checkpoints, cleaning) runs alongside traffic.
     #[arg(long, default_value_t = 0)]
     mixed_secs: u64,
+    /// Seconds of write-only overload after the update phase (0: skip):
+    /// `--ingest-concurrency` clients overwrite random keys in batches of
+    /// `--batch` as fast as they're acked. Finds sidra's applier ceiling and
+    /// shows how writers stall beyond it; prints acked and applied MiB/s
+    /// and the backlog each second, then times the drain.
+    #[arg(long, default_value_t = 0)]
+    ingest_secs: u64,
+    #[arg(long, default_value_t = 1024)]
+    ingest_concurrency: usize,
     /// After everything else, delete this percentage of keys, spread evenly
     /// over the key space, then measure scans over what's left (warm, then
     /// cold after a reopen). Shows the cost of sparse leaves.
@@ -552,6 +561,83 @@ async fn mixed_phase(
     ])
 }
 
+/// See `Args::ingest_secs`.
+async fn ingest_phase(
+    args: &Args,
+    kind: EngineKind,
+    db: Arc<Engine>,
+    wl: Arc<Workload>,
+) -> Result<Vec<(&'static str, u64, Duration, Histogram<u64>)>> {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(args.ingest_secs);
+    let (next, acked) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let batch = args.batch;
+    let tasks: Vec<_> = (0..args.ingest_concurrency)
+        .map(|_| {
+            let (db, wl, next, acked) = (db.clone(), wl.clone(), next.clone(), acked.clone());
+            tokio::spawn(async move {
+                let mut hist = Histogram::<u64>::new(3)?;
+                while Instant::now() < deadline {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let pairs = (0..batch)
+                        .map(|j| wl.random_id(13, i * batch + j))
+                        .map(|id| (wl.key(id), wl.value(id, 2 + i % 7)))
+                        .collect();
+                    let t = Instant::now();
+                    db.write(i, pairs).await?;
+                    hist.record(t.elapsed().as_micros() as u64)?;
+                    acked.fetch_add(batch, Ordering::Relaxed);
+                }
+                Ok::<_, anyhow::Error>(hist)
+            })
+        })
+        .collect();
+    let entry = (wl.key(0).len() + wl.value_size + 24) as f64;
+    let mib = |b: f64| b / (1 << 20) as f64;
+    let (mut was, mut peak) = ((0, db.backlog()), 0);
+    eprintln!(
+        "[{}] ingest each second: acked MiB/s, applied MiB/s, unapplied MiB, last checkpoint ms",
+        kind.name()
+    );
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let now = (acked.load(Ordering::Relaxed), db.backlog());
+        if let (Some(b), Some(prev)) = (now.1, was.1) {
+            peak = peak.max(b.unapplied);
+            eprintln!(
+                "[{}]   {:>4}s {:>7.1} {:>7.1} {:>7.1} {:>7}",
+                kind.name(),
+                started.elapsed().as_secs(),
+                mib((now.0 - was.0) as f64 * entry),
+                mib((b.applied - prev.applied) as f64),
+                mib(b.unapplied as f64),
+                b.last_checkpoint.map_or(0, |d| d.as_millis())
+            );
+        }
+        was = now;
+    }
+    let hists = futures::future::try_join_all(tasks).await?;
+    let elapsed = started.elapsed();
+    let hist = hists
+        .into_iter()
+        .try_fold(Histogram::<u64>::new(3)?, |mut acc, h| {
+            acc.add(h?)?;
+            Ok::<_, anyhow::Error>(acc)
+        })?;
+    let ops = acked.load(Ordering::Relaxed);
+    eprintln!(
+        "[{}] ingest: acked {:.1} MiB/s, peak unapplied {:.1} MiB",
+        kind.name(),
+        mib(ops as f64 * entry) / elapsed.as_secs_f64(),
+        mib(peak as f64)
+    );
+    let (drained, drain_hist, ()) = timed(db.settle()).await?;
+    Ok(vec![
+        ("ingest", ops, elapsed, hist),
+        ("drain", 1, drained, drain_hist),
+    ])
+}
+
 async fn timed<T>(f: impl Future<Output = Result<T>>) -> Result<(Duration, Histogram<u64>, T)> {
     let t = Instant::now();
     let out = f.await?;
@@ -826,6 +912,13 @@ async fn bench_engine(
         db.get(&wl.key(probe)).await? == Some(wl.value(probe, 1)),
         "update lost"
     );
+
+    if args.ingest_secs > 0 {
+        ingest_phase(args, kind, db.clone(), wl.clone())
+            .await?
+            .into_iter()
+            .for_each(|(name, ops, elapsed, hist)| record(name, ops, elapsed, hist, &mut phases));
+    }
 
     if args.mixed_secs > 0 {
         let mixed = mixed_phase(args, kind, db.clone(), wl.clone(), &counters).await?;

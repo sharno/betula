@@ -187,8 +187,13 @@ writer C ─► wal/C/{seq} ─┘
   id (put-if-absent), which fences the previous applier. A closing applier
   releases the role. Another writer takes it over when there's work and the
   role is free, the applier's lease has expired, or nothing was published
-  for `steal_after`. It folds every writer's unapplied
-  entries into the tree and records each writer's applied sequence number.
+  for `steal_after`. It folds writers' unapplied entries into the tree,
+  oldest first and at most `checkpoint.max_bytes` (64 MiB) per checkpoint,
+  and records each writer's applied sequence number. A checkpoint that took
+  the whole backlog would grow with it: past `steal_after`, another writer
+  takes the role mid-checkpoint, faces a bigger backlog, and loses it the
+  same way, so nothing gets applied again. Tombstones go only below the
+  oldest entry left for a later checkpoint.
   Any writer takes the role over when entries sit unapplied too long. Losing
   the role never affects writing.
 - **Bε-tree with append-only buffers.** Internal nodes hold pivots and, for
@@ -236,9 +241,10 @@ writer C ─► wal/C/{seq} ─┘
   long, then is carried down: a busy buffer flushes on its own, and forcing
   it early would cost its batching. Child pointers summarize when each
   subtree is due, so due ones are found without loading anything. A
-  checkpoint starts no new purge once its purges wrote
-  `purge_bytes_per_checkpoint` (64 MiB), so a mass delete spreads over
-  several checkpoints instead of stalling the applier on one.
+  checkpoint starts no new purge, at any depth, once its purges loaded and
+  wrote `purge_bytes_per_checkpoint` (64 MiB), so a mass delete spreads
+  over several checkpoints instead of stalling the applier on one. Loads
+  count: purging a leaf whose keys are all deleted writes nothing.
 - **Inner-node cache.** Internal nodes and runs have their own cache. By
   default, open loads both before returning (`Warm::Blocking`), so reads are
   full speed from the first request. `Warm::Background` returns after the
@@ -269,9 +275,16 @@ writer C ─► wal/C/{seq} ─┘
 - One writer's unreachable log store (a regional outage) doesn't stall the
   others: their writes keep getting applied, tombstone collection pauses,
   and `Freshness::Latest` reads fail rather than miss writes.
-- The unapplied backlog limit counts every unapplied batch held, so
-  overwrites of one key apply backpressure too. `close()` skips it to make
-  queued writes durable, so it can't hang waiting for an applier.
+- Writers stall once unapplied entries reach `max_unapplied_bytes`, split
+  evenly among writers with unapplied entries: each stalls when its own
+  exceed its share. Otherwise the applier, which sees room first, refills
+  the backlog before the others notice and starves them. Under sustained
+  overload, writes go at the applier's pace. Each checkpoint frees up to
+  `checkpoint.max_bytes` at once, writers refill it within a second or
+  two, then wait for the next, so a write stalls for up to about one
+  checkpoint. The limit counts every unapplied batch held, so overwrites
+  of one key apply backpressure too. `close()` skips it to make queued
+  writes durable, so it can't hang waiting for an applier.
 - By default every writer pulls every other writer's log to show unapplied
   writes, which costs about (writers − 1) × log bytes in GETs. With
   `poll.follow = "manifest_only"` a writer sees others' writes once applied
@@ -311,7 +324,12 @@ buffered tombstones.
    the gain is fewer leaves (cache, GETs per key), not faster scans.
    Contiguous deletes (TTL, queues) need no merging: their leaves empty and
    go (`--delete-order prefix --delete-pct 90`: 1,308 leaves to 179).
-5. **Optional conditional writes** (compare-and-set) routed through the
+5. **Parallel loads in checkpoints:** a checkpoint loads each child it
+   flushes on its own, one after another. With a cold cache and S3
+   latency that is about 35 ms per leaf, and 64 MiB checkpoints take 6–8 s
+   instead of 1–2 s (see Applier saturation). Prefetch the children a node
+   will flush, together with their runs.
+6. **Optional conditional writes** (compare-and-set) routed through the
    applier, for workloads that need them.
 
 ## Verification
@@ -335,6 +353,17 @@ See [`spec/README.md`](spec/README.md):
   `PROPTEST_CASES=100000 cargo test --release -p sidra --test model
   simulation`. Planting a bug in the tombstone floor or in GC retention
   fails it within a few thousand cases.
+- an overload simulation: three writers outpace an applier on a slow store
+  for five virtual minutes. The applier must keep the role and publish
+  regularly, writers must share the backlog fairly and stall rather than
+  fail, and nothing acknowledged may be lost. Without the per-checkpoint
+  cap the role changes hands every `steal_after` and nothing is applied;
+  without the even share, the applier's own writer takes twice the others'
+  share.
+- a targeted test for partial checkpoints: a tombstone applied while an
+  older put to its key waits for a later checkpoint must survive, or the
+  put resurrects. Only group-committed batches with several timestamps
+  reach this; the model and the simulation don't produce them.
 
 ## Layout
 
@@ -369,8 +398,10 @@ Phases: load (random order, batches of 32, 64 clients, durable writes), settle
 unchanged for 10 s, so its compaction is done), warmup (one full scan, so
 both caches hold the data), warm random reads, scans (`--scan-len`,
 100 keys by default), close and reopen, cold random reads, reopen again,
-cold scans, updates, settle. Every read is checked against the
-expected value. Both engines get 640 MiB of cache: SlateDB keeps its defaults
+cold scans, updates, settle, and with `--ingest-secs N` N seconds of
+random overwrites with no wait between batches, printing acked and
+applied MiB/s and the backlog each second. Every read is checked against
+the expected value. Both engines get 640 MiB of cache: SlateDB keeps its defaults
 (512 MiB blocks + 128 MiB metadata), and sidra uses 256 MiB inner + 384 MiB
 leaf.
 
@@ -513,6 +544,32 @@ Capacity, 256 clients × batches of 128, 2M keys:
 |---|---|---|
 | load keys/s (p99 ms) | 203k (399) | 307k (162) |
 | update keys/s (p99 ms) | 305k (174) | 294k (119) |
+
+Applier saturation, `--latency s3`, 1M keys, then 120 s of random
+overwrites from 1,024 clients (`--ingest-secs 120`), defaults otherwise
+(512 MiB backlog, 64 MiB checkpoints):
+
+| | 1 writer | 4 writers (one process) |
+|---|---|---|
+| acked MiB/s | 22.0 | 14.9 |
+| write p50 / p99 / p99.9 ms | 337 / 1,337 / 1,659 | 267 / 7,348 / 8,897 |
+| peak unapplied | 295 MiB | 520 MiB |
+| checkpoint, cold cache | 6–8 s per 64 MiB (150–210 leaf loads) | 7–9 s per 64 MiB |
+| checkpoint, warm cache | 0.8 s per 37 MiB (keeps up) | 1.5–2.7 s per 64 MiB |
+| log GETs during ingest | 158 MiB | 5,978 MiB |
+
+The applier starts with a cold leaf cache after the reopen phases and
+loads leaves one at a time, about 35 ms each, so for the first 40–60 s it
+applies 8–9 MiB/s. Once warm, one writer can't outrun it: 37 MiB
+checkpoints in 0.8 s, about 45 MiB/s, mostly upload. With four writers
+the backlog sits at its limit while the cache is cold, and writes stall
+for one checkpoint at a time (p99 7.3 s). Warm, it applies about 30 MiB/s:
+each writer also pulls the other three's logs (6 GiB of GETs in 120 s),
+which slows the applier's own log pull to 0.2–1.3 s.
+
+```sh
+sidra-bench $B --latency s3 --scans 200 --reads 5000 --ingest-secs 120 --ingest-concurrency 1024 --writers 4
+```
 
 Bulk loading into an empty tree is limited by the single applier's
 copy-on-write rewrites. sidra pays for its read advantage in bytes written:

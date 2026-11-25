@@ -5,10 +5,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::hlc::WriterId;
+use bytes::Bytes;
+
+use crate::hlc::{Ts, WriterId};
 use crate::manifest::{Frontier, Manifest};
 use crate::memtable::Memtable;
-use crate::types::{ManifestId, entry_bytes};
+use crate::types::{ManifestId, Version, entry_bytes};
 use crate::wal::{WalBatch, WalRecord};
 
 /// Writer log entries not yet in the tree, merged newest-wins.
@@ -96,16 +98,85 @@ impl Tails {
         known.max(applied.get(&writer).copied().unwrap_or(0)) + 1
     }
 
-    /// `applied` advanced past every entry held here.
-    pub fn frontier(&self, applied: &Frontier) -> Frontier {
-        let mut f = applied.clone();
-        self.batches.iter().for_each(|(w, log)| {
-            if let Some((seq, _)) = log.last_key_value() {
-                f.insert(*w, *seq);
-            }
-        });
-        f
+    /// Whether `me` may add more under a backlog `limit`: while its own
+    /// held bytes are under an even share of it among writers holding
+    /// entries, itself included. A writer alone gets all of it. Under
+    /// contention one that sees new manifests first (the applier) can't
+    /// refill the backlog before the others notice room and starve them.
+    pub fn has_room(&self, me: WriterId, limit: usize) -> bool {
+        let own: usize = self
+            .batches
+            .get(&me)
+            .map_or(0, |log| log.values().map(|b| batch_bytes(b)).sum());
+        let writers = self.batches.keys().filter(|w| **w != me).count() + 1;
+        own < limit / writers
     }
+
+    /// What one checkpoint applies: the oldest batches held, across
+    /// writers, up to `max_bytes` (at least one, so a huge batch still
+    /// goes). Each writer's batches are taken in log order, so the frontier
+    /// stays a prefix of its log.
+    pub fn take(&self, max_bytes: usize, applied: &Frontier) -> Taken {
+        // A batch's age: its oldest version, raised to its predecessors' in
+        // the same log, so sorting by it keeps each log in order.
+        let mut order: Vec<(Ts, WriterId, u64, &WalBatch)> = self
+            .batches
+            .iter()
+            .flat_map(|(w, log)| {
+                log.iter()
+                    .scan(None, move |age: &mut Option<Ts>, (seq, b)| {
+                        *age = (*age).max(b.ops.iter().map(|(_, v)| v.ts).min());
+                        Some((age.unwrap_or(Ts::MIN), *w, *seq, b.as_ref()))
+                    })
+            })
+            .collect();
+        order.sort_by_key(|(age, w, seq, _)| (*age, *w, *seq));
+        let n = order
+            .iter()
+            .scan(0, |before, (.., b)| {
+                let at = *before;
+                *before += batch_bytes(b);
+                Some(at)
+            })
+            .take_while(|at| *at == 0 || *at < max_bytes)
+            .count();
+        let (taken, rest) = order.split_at(n);
+        let mem = taken.iter().fold(Memtable::default(), |mut mem, (.., b)| {
+            mem.apply(b.ops.iter().cloned());
+            mem
+        });
+        let frontier = taken.iter().fold(applied.clone(), |mut f, (_, w, seq, _)| {
+            f.insert(*w, *seq);
+            f
+        });
+        let left: BTreeSet<WriterId> = rest.iter().map(|(_, w, ..)| *w).collect();
+        Taken {
+            msgs: mem.to_sorted_vec(),
+            bytes: taken.iter().map(|(.., b)| batch_bytes(b)).sum(),
+            frontier,
+            sealed: self.sealed().filter(|w| !left.contains(w)).collect(),
+            rest_oldest: rest
+                .iter()
+                .flat_map(|(.., b)| b.ops.iter().map(|(_, v)| v.ts))
+                .min(),
+        }
+    }
+}
+
+/// One checkpoint's share of the held entries (`Tails::take`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Taken {
+    pub msgs: Vec<(Bytes, Version)>,
+    /// Bytes of the batches taken.
+    pub bytes: usize,
+    /// The applied frontier advanced past the batches taken.
+    pub frontier: Frontier,
+    /// Writers whose seal was found and whose every held batch was taken.
+    pub sealed: BTreeSet<WriterId>,
+    /// The oldest version left for a later checkpoint. Tombstones may go
+    /// only below it: an older version left out would otherwise come back
+    /// once applied.
+    pub rest_oldest: Option<Ts>,
 }
 
 /// What a refresh pulls.
