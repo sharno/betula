@@ -21,10 +21,13 @@ full=()
 [[ ${FULL:-} == 1 ]] && full=(Sidra TwoAppliers)
 for cfg in ${full[@]+"${full[@]}"}; do
   s=$(run "$cfg" | status)
-  echo "$cfg: $s (want success)"
-  [[ $s == success ]] || fail=1
+  echo "$cfg: $s (want ok)"
+  [[ $s == ok ]] || fail=1
 done
-for cfg in BugDiscovery BugCarryDown BugUnfenced BugBound; do
+s=$(run PartialCap | status)
+echo "PartialCap: $s (want ok)"
+[[ $s == ok ]] || fail=1
+for cfg in BugDiscovery BugCarryDown BugUnfenced BugBound BugPartial; do
   s=$(run "$cfg" | status)
   echo "$cfg: $s (want invariant)"
   [[ $s == invariant ]] || fail=1

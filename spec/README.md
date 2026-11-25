@@ -14,11 +14,14 @@ The model covers one key and these actors:
 - writers that start late, stamp writes, flush batches to their own logs,
   renew leases, and self-fence (losing unacknowledged writes);
 - appliers that read leases, pull logs, and publish a new tree with
-  put-if-absent on the next manifest version;
+  put-if-absent on the next manifest version. A checkpoint applies only the
+  oldest pulled batches (any oldest-first prefix, at least one; age = a batch's
+  oldest timestamp raised to its log predecessors', ties by writer and seq);
 - GC of log entries the manifest already holds.
 
 The tree is a buffer level over a leaf level. Tombstones are dropped below
-the lease floor when a leaf is rewritten (a flush, or a purge or relocation).
+the lease floor, and below the oldest timestamp among batches a checkpoint left
+out, when a leaf is rewritten (a flush, or a purge or relocation).
 
 | Invariant | Meaning |
 |---|---|
@@ -35,13 +38,15 @@ for each, so the invariants are strong enough to catch these bugs:
 | `BugDiscovery.cfg` | the checkpoint pulls every writer whose lease it read | violation in 14 steps |
 | `BugCarryDown.cfg` | a leaf rewrite carries the buffered versions above it down | violation in 16 steps |
 | `BugUnfenced.cfg` | manifest publish is put-if-absent | violation in 11 steps |
+| `PartialCap.cfg` | none (partial checkpoints, bounded by `Small`: 2 writes per writer, no expiry or GC) | pass, 3.0M distinct states, 28 s |
+| `BugPartial.cfg` | tombstones are dropped only below the oldest timestamp left out of a partial checkpoint | violation in 17 steps, 20 s |
 | `BugBound.cfg` | tombstones are dropped only below the previous manifest's bound, which new writers move their clocks past | violation in 11 steps |
 
 Clock readings are unconstrained (any skew), which the model gained after a
 review found the `BugBound` bug: until then it had one global clock, so a
 late writer with a lagging clock couldn't happen. With free clock readings,
 `Sidra.cfg` and `TwoAppliers.cfg` no longer finish within 48 GB of memory;
-`check.sh` runs them only with `FULL=1`. The protocol is moving to a
+`check.sh` runs them only with `FULL=1`. Their state counts above predate partial checkpoints and the clock change; the correct protocol is checked in bounded form by `PartialCap`. The protocol is moving to a
 sans-IO Rust core checked with Stateright, which replaces this model.
 
 `BugDiscovery` reproduced a real bug that randomized testing found once and

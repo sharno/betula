@@ -25,7 +25,13 @@
 (* the clock reading and the last timestamp plus one), which keeps each    *)
 (* writer's own timestamps increasing.                                     *)
 (*                                                                         *)
-(* Four switches reproduce bugs: FixDiscovery = FALSE pulls only writers  *)
+(* A checkpoint applies the oldest pulled batches, across writers, up to a  *)
+(* cap that the model leaves nondeterministic: any oldest-first prefix of   *)
+(* at least one batch. A batch's age is its oldest timestamp raised to its  *)
+(* predecessors' in the same log, so every writer's taken batches are a     *)
+(* prefix of its log. Ties break on (writer, seq).                          *)
+(*                                                                         *)
+(* Five switches reproduce bugs: FixDiscovery = FALSE pulls only writers  *)
 (* the applier already knew instead of every writer whose lease it read;   *)
 (* CarryDown = FALSE rewrites a leaf without carrying down the buffered    *)
 (* versions above it; FencedPublish = FALSE publishes without              *)
@@ -33,14 +39,17 @@
 (* FixBound = FALSE drops tombstones below the lease floor alone, without  *)
 (* the manifest's tombstone bound that new writers move their clocks past  *)
 (* (a writer opening after a drop, with a lagging clock, then writes a     *)
-(* version older than the dropped tombstone).                              *)
+(* version older than the dropped tombstone); CapRest = FALSE drops        *)
+(* tombstones without capping at the oldest timestamp among the batches a   *)
+(* partial checkpoint left out (a left-out older put then resurrects the    *)
+(* key once applied).                                                       *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
 Max(a, b) == IF a > b THEN a ELSE b
 
 CONSTANTS Writers, Appliers, MaxTime, MaxWrites, MaxVer, FixDiscovery, CarryDown, FencedPublish,
-          FixBound
+          FixBound, CapRest
 
 Ops == {"put", "del"}
 NONE == [t |-> 0, w |-> 0, op |-> "none"]
@@ -59,16 +68,20 @@ VARIABLES
     mver,       \* manifest version
     gcd,        \* per writer: batches deleted by GC (a prefix of the log)
     tbound,     \* manifest: tombstone bound
-    pc, floor, known, base, snapBuf, snapLeaf, snapFrontier, snapBound, pulled
+    pc, floor, known, base, snapBuf, snapLeaf, snapFrontier, snapBound, pulled,
+    snapRest    \* oldest timestamp among batches the pull left out (Inf if none)
 
 vars == <<started, ready, alive, last, inflight, wlog, lease, writes,
           buf, leaf, frontier, mver, gcd, tbound, pc, floor, known, base, snapBuf,
-          snapLeaf, snapFrontier, snapBound, pulled>>
+          snapLeaf, snapFrontier, snapBound, pulled, snapRest>>
 
 Min(a, b) == IF a < b THEN a ELSE b
 
 \* The hybrid clock's next timestamp for writer w, reading clock value c.
 Hlc(w, c) == Max(c, last[w] + 1)
+
+\* "No timestamp": above every real one.
+Inf == MaxTime + 3
 
 \* Clock readings, and the range hybrid timestamps may reach.
 Readings == 1..MaxTime
@@ -98,6 +111,27 @@ Visible == NewestOf({buf, leaf} \cup Unapplied(frontier))
 \* A leaf rewrite drops tombstones older than the floor.
 Drop(e, fl) == IF e.op = "del" /\ e.t < fl THEN NONE ELSE e
 
+\* Partial checkpoints. A pulled batch is <<writer, seq>> with its age: the
+\* oldest timestamp in it, raised to its predecessors' still held in the log.
+MinT(b) == CHOOSE t \in {e.t : e \in b} : \A u \in {e.t : e \in b} : t <= u
+
+Held(w) == (Max(frontier[w], gcd[w]) + 1)..Len(wlog[w])
+
+Pend(p) ==
+    UNION {{[w |-> w, i |-> i,
+             age |-> LET ts == {MinT(wlog[w][j]) : j \in (Max(frontier[w], gcd[w]) + 1)..i}
+                     IN CHOOSE a \in ts : \A u \in ts : u <= a]
+            : i \in Held(w)} : w \in known[p]}
+
+\* b is no later than c in the checkpoint order (age, writer, seq).
+Upto(b, c) == b.age < c.age
+              \/ (b.age = c.age /\ (b.w < c.w \/ (b.w = c.w /\ b.i <= c.i)))
+
+\* Every oldest-first prefix of at least one batch (none if nothing pulled).
+TakeChoices(p) ==
+    IF Pend(p) = {} THEN {{}}
+    ELSE {{b \in Pend(p) : Upto(b, c)} : c \in Pend(p)}
+
 Init ==
     /\ started = [w \in Writers |-> FALSE]
     /\ ready = [w \in Writers |-> FALSE]
@@ -121,10 +155,11 @@ Init ==
     /\ snapFrontier = [p \in Appliers |-> [w \in Writers |-> 0]]
     /\ snapBound = [p \in Appliers |-> 0]
     /\ pulled = [p \in Appliers |-> {}]
+    /\ snapRest = [p \in Appliers |-> Inf]
 
 Writing == <<started, ready, alive, last, inflight, wlog, lease, writes>>
 Applying == <<buf, leaf, frontier, mver, gcd, tbound, pc, floor, known, base,
-              snapBuf, snapLeaf, snapFrontier, snapBound, pulled>>
+              snapBuf, snapLeaf, snapFrontier, snapBound, pulled, snapRest>>
 
 \* Opening writes the lease before any write.
 Start(w, c) ==
@@ -182,7 +217,7 @@ Discover(p) ==
     /\ known[p] # {w \in Writers : started[w]}
     /\ known' = [known EXCEPT ![p] = {w \in Writers : started[w]}]
     /\ UNCHANGED <<Writing, buf, leaf, frontier, mver, gcd, tbound, pc, floor,
-                   base, snapBuf, snapLeaf, snapFrontier, snapBound, pulled>>
+                   base, snapBuf, snapLeaf, snapFrontier, snapBound, pulled, snapRest>>
 
 \* Step 1: read every listed writer's lease. `c` is the applier's own clock
 \* reading, unconstrained per scan: any skew against the writers.
@@ -196,19 +231,30 @@ ReadLeases(p, c) ==
           /\ known' = IF FixDiscovery THEN [known EXCEPT ![p] = @ \cup ls] ELSE known
     /\ pc' = [pc EXCEPT ![p] = "leased"]
     /\ UNCHANGED <<Writing, buf, leaf, frontier, mver, gcd, tbound, base, snapBuf,
-                   snapLeaf, snapFrontier, snapBound, pulled>>
+                   snapLeaf, snapFrontier, snapBound, pulled, snapRest>>
 
-\* Step 2: load the manifest and pull known writers' entries past its frontier.
+\* Step 2: load the manifest and pull known writers' entries past its frontier,
+\* then take the oldest of them (a checkpoint's byte cap, any prefix here). The
+\* frontier advances only past the batches taken.
 Pull(p) ==
     /\ pc[p] = "leased"
+    /\ \E taken \in TakeChoices(p) :
+        LET rest == Pend(p) \ taken
+        IN /\ snapFrontier' = [snapFrontier EXCEPT ![p] =
+                  [w \in Writers |-> IF \E b \in taken : b.w = w
+                                     THEN CHOOSE i \in {b.i : b \in {c \in taken : c.w = w}} :
+                                              \A j \in {b.i : b \in {c \in taken : c.w = w}} : j <= i
+                                     ELSE frontier[w]]]
+           /\ pulled' = [pulled EXCEPT ![p] =
+                  UNION {wlog[b.w][b.i] : b \in taken}]
+           /\ snapRest' = [snapRest EXCEPT ![p] =
+                  IF rest = {} THEN Inf
+                  ELSE LET ts == {e.t : e \in UNION {wlog[b.w][b.i] : b \in rest}}
+                       IN CHOOSE t \in ts : \A u \in ts : t <= u]
     /\ base' = [base EXCEPT ![p] = mver]
     /\ snapBuf' = [snapBuf EXCEPT ![p] = buf]
     /\ snapLeaf' = [snapLeaf EXCEPT ![p] = leaf]
     /\ snapBound' = [snapBound EXCEPT ![p] = tbound]
-    /\ snapFrontier' = [snapFrontier EXCEPT ![p] =
-          [w \in Writers |-> IF w \in known[p] THEN Len(wlog[w]) ELSE frontier[w]]]
-    /\ pulled' = [pulled EXCEPT ![p] =
-          UNION {UNION {wlog[w][i] : i \in (Max(frontier[w], gcd[w]) + 1)..Len(wlog[w])} : w \in known[p]}]
     /\ pc' = [pc EXCEPT ![p] = "pulled"]
     /\ UNCHANGED <<Writing, buf, leaf, frontier, mver, gcd, tbound, floor, known>>
 
@@ -226,7 +272,10 @@ Publish(p, mode) ==
        THEN LET b == Max2(snapBuf[p], NewestOf(pulled[p]))
                 \* Only below the bound the previous manifest published: a
                 \* writer this lease scan missed moved its clock past it.
-                fl == IF FixBound THEN Min(floor[p], snapBound[p]) ELSE floor[p]
+                fb == IF FixBound THEN Min(floor[p], snapBound[p]) ELSE floor[p]
+                \* A batch left out may hold a put older than a tombstone dropped
+                \* now; it would come back once applied.
+                fl == IF CapRest THEN Min(fb, snapRest[p]) ELSE fb
                 carried == Drop(Max2(snapLeaf[p], b), fl)
             IN /\ mver' = mver + 1
                /\ frontier' = snapFrontier[p]
@@ -244,6 +293,7 @@ Publish(p, mode) ==
     /\ snapFrontier' = [snapFrontier EXCEPT ![p] = [w \in Writers |-> 0]]
     /\ snapBound' = [snapBound EXCEPT ![p] = 0]
     /\ pulled' = [pulled EXCEPT ![p] = {}]
+    /\ snapRest' = [snapRest EXCEPT ![p] = Inf]
     /\ UNCHANGED <<Writing, known, gcd>>
 
 \* GC deletes log entries the current manifest already holds. (The real GC
@@ -253,7 +303,7 @@ GcLog(w) ==
     /\ gcd[w] < frontier[w]
     /\ gcd' = [gcd EXCEPT ![w] = frontier[w]]
     /\ UNCHANGED <<Writing, buf, leaf, frontier, mver, tbound, pc, floor, known,
-                   base, snapBuf, snapLeaf, snapFrontier, snapBound, pulled>>
+                   base, snapBuf, snapLeaf, snapFrontier, snapBound, pulled, snapRest>>
 
 Next ==
     \/ \E w \in Writers : Observe(w) \/ Flush(w) \/ Renew(w) \/ Expire(w) \/ GcLog(w)
@@ -266,6 +316,16 @@ Next ==
 Spec == Init /\ [][Next]_vars
 
 -----------------------------------------------------------------------------
+\* State constraint for BugPartial.cfg, which keeps its search to seconds: at
+\* most two writes per writer, writer 1 only puts, timestamps up to 3, no
+\* lease expiry, no log GC. Enough for the counterexample.
+Small == \A w \in Writers :
+    LET es == inflight[w] \cup UNION {wlog[w][i] : i \in 1..Len(wlog[w])}
+    IN /\ Cardinality(es) <= 2
+       /\ \A e \in es : e.t <= 3 /\ (w = 1 => e.op = "put")
+       /\ (alive[w] \/ ~started[w])
+       /\ gcd[w] = 0
+
 TypeOK ==
     /\ mver \in 0..MaxVer
     /\ \A w \in Writers : frontier[w] <= Len(wlog[w])
