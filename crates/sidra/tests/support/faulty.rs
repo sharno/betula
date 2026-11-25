@@ -90,9 +90,30 @@ pub struct Faulty {
     enabled: Arc<AtomicBool>,
     holds: Mutex<Vec<Arc<Hold>>>,
     pub injected: Arc<AtomicU64>,
+    /// Requests seen and an order-sensitive digest of them, so a simulation
+    /// can check that a seed replays the same requests.
+    trace: Arc<Mutex<Trace>>,
 }
 
-fn splitmix(mut z: u64) -> u64 {
+/// See `Faulty::trace`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Trace {
+    pub requests: u64,
+    pub digest: u64,
+}
+
+impl Trace {
+    fn record(&mut self, what: &str, path: &str) {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        // `DefaultHasher::new` uses fixed keys: the same in every run.
+        let mut h = DefaultHasher::new();
+        (what, path).hash(&mut h);
+        self.requests += 1;
+        self.digest = splitmix(self.digest.rotate_left(5) ^ h.finish());
+    }
+}
+
+pub fn splitmix(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -115,7 +136,16 @@ impl Faulty {
             enabled: Arc::new(AtomicBool::new(true)),
             holds: Mutex::new(Vec::new()),
             injected: Arc::default(),
+            trace: Arc::default(),
         }
+    }
+
+    pub fn trace(&self) -> Trace {
+        *self.trace.lock().unwrap()
+    }
+
+    fn record(&self, what: &str, path: &str) {
+        self.trace.lock().unwrap().record(what, path);
     }
 
     /// Holds up to `max` PUTs whose path matches until the hold is released.
@@ -152,7 +182,8 @@ impl Faulty {
         hit
     }
 
-    async fn before(&self, what: &str) -> Result<()> {
+    async fn before(&self, what: &str, path: &Path) -> Result<()> {
+        self.record(what, path.as_ref());
         if self.enabled.load(Ordering::Relaxed) && !self.faults.max_delay.is_zero() {
             tokio::time::sleep(self.faults.max_delay.mul_f64(self.roll())).await;
         }
@@ -194,7 +225,7 @@ impl ObjectStore for Faulty {
         if let Some(h) = hold {
             h.wait().await;
         }
-        self.before("put").await?;
+        self.before("put", location).await?;
         let r = self.inner.put_opts(location, payload, opts).await;
         self.after("put response", r)
     }
@@ -204,17 +235,17 @@ impl ObjectStore for Faulty {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        self.before("multipart").await?;
+        self.before("multipart", location).await?;
         self.inner.put_multipart_opts(location, opts).await
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        self.before("get").await?;
+        self.before("get", location).await?;
         self.inner.get_opts(location, options).await
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
-        self.before("get ranges").await?;
+        self.before("get ranges", location).await?;
         self.inner.get_ranges(location, ranges).await
     }
 
@@ -222,6 +253,7 @@ impl ObjectStore for Faulty {
         &self,
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
+        self.record("delete", "");
         // Deletes apply; some responses are lost.
         let (rng, enabled, injected_count, p) = (
             self.rng.clone(),
@@ -247,6 +279,7 @@ impl ObjectStore for Faulty {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.record("list", prefix.map_or("", |p| p.as_ref()));
         match self.hit(self.faults.fail_before) {
             true => futures::stream::once(async { Err(injected("list")) }).boxed(),
             false => self.inner.list(prefix),
@@ -258,6 +291,7 @@ impl ObjectStore for Faulty {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.record("list from", offset.as_ref());
         match self.hit(self.faults.fail_before) {
             true => futures::stream::once(async { Err(injected("list")) }).boxed(),
             false => self.inner.list_with_offset(prefix, offset),
@@ -265,12 +299,13 @@ impl ObjectStore for Faulty {
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        self.before("list").await?;
+        self.before("list", prefix.unwrap_or(&Path::default()))
+            .await?;
         self.inner.list_with_delimiter(prefix).await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        self.before("copy").await?;
+        self.before("copy", from).await?;
         let r = self.inner.copy_opts(from, to, options).await;
         self.after("copy response", r)
     }

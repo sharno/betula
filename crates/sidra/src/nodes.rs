@@ -69,7 +69,10 @@ impl Weighter<NodePtr, Node> for EncodedSize {
     }
 }
 
-type NodeCache = Cache<NodePtr, Node, EncodedSize>;
+// A fixed-seed hasher: eviction then depends only on the requests, so a
+// simulation replays the same loads. Keys are our own node pointers, so a
+// random seed protects nothing.
+type NodeCache = Cache<NodePtr, Node, EncodedSize, foldhash::fast::FixedState>;
 
 /// A fetch shared by every concurrent reader of the same missing node.
 type Loading = Shared<BoxFuture<'static, Result<Node>>>;
@@ -114,7 +117,12 @@ fn new_cache(bytes: u64, item_estimate: u64) -> NodeCache {
         .shards(shards)
         .build()
         .expect("cache options are complete");
-    Cache::with_options(options, EncodedSize, Default::default(), Default::default())
+    Cache::with_options(
+        options,
+        EncodedSize,
+        foldhash::fast::FixedState::default(),
+        Default::default(),
+    )
 }
 
 impl Nodes {

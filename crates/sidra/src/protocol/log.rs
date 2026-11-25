@@ -192,6 +192,11 @@ impl<W> LogWriter<W> {
         }
     }
 
+    /// Writes wait for the next flush tick. Ticks do nothing otherwise.
+    pub fn has_pending(&self) -> bool {
+        matches!(&self.state, State::Open { pending, .. } if !pending.ops.is_empty())
+    }
+
     /// A due batch waits only for backpressure to ease.
     pub fn held_back(&self) -> bool {
         matches!(

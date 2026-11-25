@@ -4,7 +4,8 @@
 
 use std::ops::RangeBounds;
 use std::sync::Arc;
-use std::time::Instant;
+// tokio's, so simulations with paused time control it.
+use tokio::time::Instant;
 
 use bytes::Bytes;
 use object_store::ObjectStore;

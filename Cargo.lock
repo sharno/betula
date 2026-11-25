@@ -2676,6 +2676,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "figment",
+ "foldhash",
  "futures",
  "humantime-serde",
  "imbl",

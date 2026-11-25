@@ -324,6 +324,14 @@ See [`spec/README.md`](spec/README.md):
   without closing, and appliers killed part-way through a checkpoint.
   Every acknowledged write must survive, and every read must match the
   model. (`PROPTEST_CASES=400` for stress runs.)
+- deterministic simulation: the same proptest on a paused single-threaded
+  tokio runtime, so virtual time drives every timer and a seed replays the
+  same store requests (checked). Timers are realistic and waits let
+  minutes pass, so lease expiry, takeover, purges and GC run, and a
+  long-lived reader checks GC keeps what it needs. About 15 ms per case:
+  `PROPTEST_CASES=100000 cargo test --release -p sidra --test model
+  simulation`. Planting a bug in the tombstone floor or in GC retention
+  fails it within a few thousand cases.
 
 ## Layout
 

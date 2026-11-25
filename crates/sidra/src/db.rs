@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use object_store::ObjectStore;
@@ -29,7 +29,8 @@ use object_store::path::Path;
 use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tokio::time::MissedTickBehavior;
+// tokio's, so simulations with paused time control it.
+use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::error::{Error, Result};
 use crate::follow::{Follower, Scope};
@@ -599,6 +600,7 @@ pub struct DbBuilder {
     settings: Settings,
     regions: RegionStores,
     clock: Arc<dyn Clock>,
+    writer: Option<WriterId>,
 }
 
 impl DbBuilder {
@@ -610,6 +612,14 @@ impl DbBuilder {
     /// Replaces the wall clock (for tests and simulations).
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Fixes this writer's id instead of a random one, so a simulation
+    /// replays the same request order. Ids must be unique among every
+    /// writer the database ever had.
+    pub fn with_writer_id(mut self, writer: WriterId) -> Self {
+        self.writer = Some(writer);
         self
     }
 
@@ -628,7 +638,18 @@ impl DbBuilder {
     pub async fn build(self) -> Result<Db> {
         let mut regions = RegionStores::from_urls(&self.settings.regions)?;
         regions.extend(self.regions);
-        Db::start(self.store, self.path, self.settings, regions, self.clock).await
+        let writer = self
+            .writer
+            .unwrap_or_else(|| random_writer_id(self.clock.now_ms()));
+        Db::start(
+            self.store,
+            self.path,
+            self.settings,
+            regions,
+            self.clock,
+            writer,
+        )
+        .await
     }
 }
 
@@ -653,6 +674,7 @@ impl Db {
             settings: Settings::default(),
             regions: RegionStores::default(),
             clock: Arc::new(SystemClock),
+            writer: None,
         }
     }
 
@@ -662,12 +684,12 @@ impl Db {
         cfg: Settings,
         regions: RegionStores,
         clock: Arc<dyn Clock>,
+        writer: WriterId,
     ) -> Result<Self> {
         let home = Store::new(os, path, cfg.hedge);
         let logs = Arc::new(Logs::new(home.clone(), regions));
         let own_log = logs.at(&cfg.log)?.clone();
         let nodes = Arc::new(Nodes::new(home, cfg.cache));
-        let writer = random_writer_id(clock.now_ms());
         let follower =
             Follower::open(nodes.clone(), logs, cfg.warm, cfg.rewarm, Some(writer)).await?;
         let (shutdown, shutdown_rx) = watch::channel(false);
@@ -1068,16 +1090,11 @@ impl WalTask {
                 return;
             }
             let installed = self.shared.follower.installed.notified();
+            // Biased, so a seed replays the same order (`select!` otherwise
+            // polls in random order). Commands come last: under load they're
+            // always ready and would starve the rest.
             let event = tokio::select! {
-                cmd = rx.recv(), if open => match cmd {
-                    Some(WalCmd::Write { hlc, ops, done }) => log::Event::Write { hlc, ops, waiter: done },
-                    Some(WalCmd::Flush { done }) => log::Event::Flush { waiter: done },
-                    None => {
-                        open = false;
-                        log::Event::Close
-                    }
-                },
-                _ = tick.tick() => log::Event::Tick,
+                biased;
                 (seq, result) = async { putting.as_mut().expect("guarded").await }, if putting.is_some() => {
                     putting = None;
                     let outcome = match result {
@@ -1091,7 +1108,20 @@ impl WalTask {
                     };
                     log::Event::PutDone { seq, outcome }
                 },
+                // Only while writes wait: an idle writer doesn't wake every
+                // flush interval (and a simulation's cost follows its work,
+                // not its virtual time). A write after a quiet spell finds
+                // the tick overdue and goes out at once.
+                _ = tick.tick(), if self.log.has_pending() => log::Event::Tick,
                 _ = installed, if self.log.held_back() => log::Event::Retry,
+                cmd = rx.recv(), if open => match cmd {
+                    Some(WalCmd::Write { hlc, ops, done }) => log::Event::Write { hlc, ops, waiter: done },
+                    Some(WalCmd::Flush { done }) => log::Event::Flush { waiter: done },
+                    None => {
+                        open = false;
+                        log::Event::Close
+                    }
+                },
             };
             let gate = self.gate();
             for effect in self.log.step(event, gate) {
@@ -1152,8 +1182,10 @@ impl WalTask {
 
 async fn every(period: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
     tokio::select! {
-        _ = tokio::time::sleep(period) => !*shutdown.borrow(),
+        // Biased for replayable simulations; shutdown wins a tie.
+        biased;
         _ = shutdown.changed() => false,
+        _ = tokio::time::sleep(period) => !*shutdown.borrow(),
     }
 }
 
@@ -1211,9 +1243,11 @@ async fn applier_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) 
     let mut purge_tried: Option<Instant> = None;
     loop {
         tokio::select! {
+            // Biased for replayable simulations; shutdown wins a tie.
+            biased;
+            _ = shutdown.changed() => return,
             _ = shared.wake_applier.notified() => {}
             _ = tokio::time::sleep(shared.cfg.poll.interval) => {}
-            _ = shutdown.changed() => return,
         }
         if *shutdown.borrow() {
             return;

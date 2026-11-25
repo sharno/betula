@@ -17,6 +17,7 @@ object_store.workspace = true
 parking_lot.workspace = true
 postcard.workspace = true
 quick_cache.workspace = true
+foldhash.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

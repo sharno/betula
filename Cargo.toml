@@ -24,6 +24,7 @@ parking_lot = "0.12"
 postcard = { version = "1.1", features = ["use-std"] }
 proptest = "1.7"
 quick_cache = "0.7"
+foldhash = "0.2"
 serde = { version = "1", features = ["derive", "rc"] }
 slatedb = "0.18.1"
 stateright = "0.31"

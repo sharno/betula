@@ -6,6 +6,9 @@
 //! call order, so the model is plain sequential last-writer-wins. Queued
 //! (not yet durable) writes and checkpoints that flush only the applier make
 //! late writes from slow writers happen for real.
+//!
+//! `simulation_*` runs the same harness deterministically in virtual time
+//! (see the section below).
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -21,13 +24,13 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use proptest::prelude::*;
 use sidra::{
     ApplierRole, CacheConfig, CheckpointConfig, CleanerConfig, Clock, Db, DbReader, Durability,
-    Error, ErrorKind, Gc, KeyRange, LeaseConfig, PollConfig, ReaderSettings, SegmentId, Settings,
-    TreeConfig, Ts, WalConfig, Warm, WriteBatch, WriteOptions,
+    Error, ErrorKind, Gc, GcConfig, KeyRange, LeaseConfig, PollConfig, ReaderSettings, SegmentId,
+    Settings, TreeConfig, Ts, WalConfig, Warm, WriteBatch, WriteOptions,
 };
 
 #[path = "support/faulty.rs"]
 mod faulty;
-use faulty::{Faults, Faulty};
+use faulty::{Faults, Faulty, Trace};
 
 const ROOT: &str = "db";
 const WRITERS: usize = 3;
@@ -53,9 +56,66 @@ impl Clock for ManualClock {
     }
 }
 
+/// tokio's clock, for runs on a paused current-thread runtime: background
+/// loops run as virtual time passes, and a seed replays exactly.
+struct VirtualClock {
+    start: tokio::time::Instant,
+}
+
+impl VirtualClock {
+    /// Virtual time starts here, so lagging clocks stay positive.
+    const EPOCH_MS: u64 = 1_000_000;
+
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            start: tokio::time::Instant::now(),
+        })
+    }
+}
+
+impl Clock for VirtualClock {
+    fn now_ms(&self) -> u64 {
+        Self::EPOCH_MS + self.start.elapsed().as_millis() as u64
+    }
+}
+
+/// How time passes in a run.
+#[derive(Clone)]
+enum Time {
+    /// Moves only when the test moves it: a tick before every write makes
+    /// timestamp order equal call order.
+    Manual(Arc<ManualClock>),
+    Virtual(Arc<VirtualClock>),
+}
+
+impl Time {
+    fn clock(&self) -> Arc<dyn Clock> {
+        match self {
+            Time::Manual(c) => c.clone(),
+            Time::Virtual(c) => c.clone(),
+        }
+    }
+
+    fn tick(&self) {
+        match self {
+            Time::Manual(c) => c.tick(),
+            // Virtual time moves on its own; the model orders writes by the
+            // timestamps they got.
+            Time::Virtual(_) => {}
+        }
+    }
+
+    async fn wait(&self, d: Duration) {
+        match self {
+            Time::Manual(c) => c.advance(d),
+            Time::Virtual(_) => tokio::time::sleep(d).await,
+        }
+    }
+}
+
 /// A process clock running `lag_ms` behind the shared one.
 struct Skewed {
-    base: Arc<ManualClock>,
+    base: Arc<dyn Clock>,
     lag_ms: u64,
 }
 
@@ -176,6 +236,13 @@ enum Op {
     /// second value (ms).
     Crash(usize, u64, u64),
     ReaderScan,
+    /// A read through a long-lived reader that refreshes on its own timer,
+    /// so it may still be on an old manifest. It must not fail: GC keeps
+    /// what such a reader needs for the retention period.
+    StaleGet(u8),
+    /// Time passes (ms) with nothing asked of the writers; their background
+    /// loops (polls, leases, checkpoints, purges, GC) keep running.
+    Wait(u64),
 }
 
 fn key(k: u8) -> Bytes {
@@ -196,6 +263,7 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (w.clone(), 0u64..300).prop_map(|(w, lag)| Op::Reopen(w, lag)),
         1 => (w, 0u64..3000, 0u64..300).prop_map(|(w, us, lag)| Op::Crash(w, us, lag)),
         1 => Just(Op::ReaderScan),
+        1 => (0u8..60).prop_map(Op::StaleGet),
     ]
 }
 
@@ -240,7 +308,13 @@ fn model_range(model: &Model, range: &KeyRange) -> Vec<(Bytes, Bytes)> {
         .collect()
 }
 
-/// Makes every writer's queued writes durable and lets `reader` see them.
+/// Whether `e` is a fault the store injected, the only failure a run
+/// tolerates. Other store errors (an object GC deleted too early, say) are
+/// bugs, even though they're retryable.
+fn injected(e: &Error) -> bool {
+    e.is_retryable() && format!("{e:?}").contains("injected fault")
+}
+
 /// Retries an operation that failed only because the store did (injected
 /// faults); any other error fails the test.
 async fn until_ok<T, Fut>(what: &str, mut f: impl FnMut() -> Fut) -> T
@@ -251,38 +325,68 @@ where
     for _ in 0..100 {
         match f().await {
             Ok(v) => return v,
-            Err(e) if e.is_retryable() => last = Some(e),
+            Err(e) if injected(&e) => last = Some(e),
             Err(e) => panic!("{what}: {e}"),
         }
     }
     panic!("{what}: still failing after 100 attempts: {last:?}");
 }
 
+/// What a run varies besides its ops and clock lags.
+struct Setup {
+    /// `None`: a fault-free store.
+    faults: Option<Faults>,
+    /// Seeds faults and writer ids.
+    seed: u64,
+    time: Time,
+    cfg: Settings,
+}
+
 /// Several writers on one store, optionally behind injected faults.
 struct World {
     os: Arc<dyn ObjectStore>,
-    clock: Arc<ManualClock>,
+    /// The store under `os`; it injects faults only when `faults` is set.
+    store: Arc<Faulty>,
+    faults: bool,
+    time: Time,
+    cfg: Settings,
+    seed: u64,
+    /// Writers opened so far, for their ids.
+    opened: AtomicU64,
     /// How far behind the shared clock each writer slot's clock runs.
     lags: Vec<u64>,
     dbs: Vec<Db>,
-    faulty: Option<Arc<Faulty>>,
+    /// See `Op::StaleGet`.
+    reader: DbReader,
 }
 
 impl World {
-    async fn new(faults: Option<(Faults, u64)>, lags: Vec<u64>) -> Self {
-        let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let faulty = faults.map(|(f, seed)| Arc::new(Faulty::new(mem, f, seed)));
-        let os: Arc<dyn ObjectStore> = match &faulty {
-            Some(f) => f.clone(),
-            None => Arc::new(InMemory::new()),
-        };
-        let clock = ManualClock::new();
+    async fn new(setup: Setup, lags: Vec<u64>) -> Self {
+        let store = Arc::new(Faulty::new(
+            Arc::new(InMemory::new()),
+            setup.faults.unwrap_or(Faults::NONE),
+            setup.seed,
+        ));
+        let reader = until_ok("reader open", || {
+            DbReader::builder(ROOT, store.clone() as Arc<dyn ObjectStore>)
+                .with_settings(ReaderSettings {
+                    refresh_interval: Some(Duration::from_secs(1)),
+                    ..reader_config()
+                })
+                .build()
+        })
+        .await;
         let mut w = Self {
-            os,
-            clock,
+            reader,
+            os: store.clone(),
+            store,
+            faults: setup.faults.is_some(),
+            time: setup.time,
+            cfg: setup.cfg,
+            seed: setup.seed,
+            opened: AtomicU64::new(0),
             lags,
             dbs: Vec::new(),
-            faulty,
         };
         for slot in 0..WRITERS {
             let db = w.open(slot).await;
@@ -293,13 +397,16 @@ impl World {
 
     async fn open(&self, slot: usize) -> Db {
         let clock = Arc::new(Skewed {
-            base: self.clock.clone(),
+            base: self.time.clock(),
             lag_ms: self.lags[slot],
         });
         until_ok("open", || {
+            // A fresh id per attempt: a failed open may have left a lease.
+            let n = self.opened.fetch_add(1, Ordering::Relaxed);
             Db::builder(ROOT, self.os.clone())
-                .with_settings(tiny_config())
+                .with_settings(self.cfg.clone())
                 .with_clock(clock.clone())
+                .with_writer_id(sidra::WriterId(faulty::splitmix(self.seed ^ n)))
                 .build()
         })
         .await
@@ -309,11 +416,11 @@ impl World {
     async fn reopen(&mut self, w: usize) {
         let fresh = self.open(w).await;
         let old = std::mem::replace(&mut self.dbs[w], fresh);
-        match (old.close().await, &self.faulty) {
-            (Ok(()), _) => {}
+        match old.close().await {
+            Ok(()) => {}
             // A lost writer, or a store failure while releasing the role.
-            (Err(e), Some(_)) if e.is_retryable() || e.kind() == ErrorKind::WriterLost => {}
-            (Err(e), _) => panic!("close: {e}"),
+            Err(e) if self.faults && (injected(&e) || e.kind() == ErrorKind::WriterLost) => {}
+            Err(e) => panic!("close: {e}"),
         }
     }
 
@@ -323,7 +430,7 @@ impl World {
         for _ in 0..100 {
             match self.dbs[w].write_with(batch.clone(), opts).await {
                 Ok(ts) => return ts.expect("non-empty batch"),
-                Err(e) if e.is_retryable() => {}
+                Err(e) if injected(&e) => {}
                 Err(e) if e.kind() == ErrorKind::WriterLost => self.reopen(w).await,
                 Err(e) => panic!("write: {e}"),
             }
@@ -373,7 +480,7 @@ async fn checkpoint(dbs: &[Db]) {
             None => match dbs[0].claim_applier().await {
                 Ok(true) => break 0,
                 Ok(false) => tokio::task::yield_now().await,
-                Err(e) if e.is_retryable() => return,
+                Err(e) if injected(&e) => return,
                 Err(e) => panic!("claim: {e}"),
             },
         }
@@ -382,38 +489,40 @@ async fn checkpoint(dbs: &[Db]) {
         Ok(()) => assert_accounting(&dbs[applier]).await,
         // Lost the role to a concurrent claim, or the store failed: fine.
         Err(Error::NotApplier) => {}
-        Err(e) if e.is_retryable() => {}
+        Err(e) if injected(&e) => {}
         Err(e) => panic!("checkpoint: {e}"),
     }
 }
 
-async fn run(ops: Vec<Op>, lags: Vec<u64>, faults: Option<(Faults, u64)>) {
-    let mut world = World::new(faults, lags).await;
+/// Runs `ops`, checking reads against the model as it goes and everything
+/// at the end. Returns the store's request trace.
+async fn run(ops: Vec<Op>, lags: Vec<u64>, setup: Setup) -> Trace {
+    let mut world = World::new(setup, lags).await;
     let mut lww = Lww::default();
     for op in ops {
         match op {
             Op::Put(w, k, v) => {
-                world.clock.tick();
+                world.time.tick();
                 let mut batch = WriteBatch::new();
                 batch.put(key(k), &v);
                 let ts = world.write(w, batch, WriteOptions::default()).await;
                 lww.apply(key(k), ts, Some(Bytes::from(v)));
             }
             Op::PutQueued(w, k, v) => {
-                world.clock.tick();
+                world.time.tick();
                 let mut batch = WriteBatch::new();
                 batch.put(key(k), &v);
                 // A queued write is lost if its writer is lost before the
                 // flush, so under faults only acknowledged writes count.
-                let durability = match world.faulty {
-                    Some(_) => Durability::AwaitDurable,
-                    None => Durability::Queued,
+                let durability = match world.faults {
+                    true => Durability::AwaitDurable,
+                    false => Durability::Queued,
                 };
                 let ts = world.write(w, batch, WriteOptions { durability }).await;
                 lww.apply(key(k), ts, Some(Bytes::from(v)));
             }
             Op::Delete(w, k) => {
-                world.clock.tick();
+                world.time.tick();
                 let mut batch = WriteBatch::new();
                 batch.delete(key(k));
                 let ts = world.write(w, batch, WriteOptions::default()).await;
@@ -443,7 +552,7 @@ async fn run(ops: Vec<Op>, lags: Vec<u64>, faults: Option<(Faults, u64)>) {
             Op::Checkpoint => checkpoint(&world.dbs).await,
             Op::Claim(w) => match world.dbs[w].claim_applier().await {
                 Ok(_) => {}
-                Err(e) if e.is_retryable() => {}
+                Err(e) if injected(&e) => {}
                 Err(e) => panic!("claim: {e}"),
             },
             Op::Reopen(w, lag) => {
@@ -454,6 +563,12 @@ async fn run(ops: Vec<Op>, lags: Vec<u64>, faults: Option<(Faults, u64)>) {
                 world.lags[w] = lag;
                 world.crash(w, Duration::from_micros(us)).await
             }
+            Op::Wait(ms) => world.time.wait(Duration::from_millis(ms)).await,
+            Op::StaleGet(k) => match world.reader.get(key(k)).await {
+                Ok(_) => {}
+                Err(e) if injected(&e) => {}
+                Err(e) => panic!("stale get {k}: {e}"),
+            },
             Op::ReaderScan => {
                 world.sync(0).await;
                 let model = lww.visible();
@@ -469,21 +584,20 @@ async fn run(ops: Vec<Op>, lags: Vec<u64>, faults: Option<(Faults, u64)>) {
         }
     }
     // Verify without faults: everything acknowledged survived them.
-    if let Some(f) = &world.faulty {
-        f.set_enabled(false);
-    }
+    world.store.set_enabled(false);
     world.sync(1).await;
     let model = lww.visible();
     let all = world.dbs[1].scan(KeyRange::all()).collect().await.unwrap();
     assert_eq!(all, model_range(&model, &KeyRange::all()));
     checkpoint(&world.dbs).await;
-    let World { os, clock, dbs, .. } = world;
-    for db in dbs {
+    for db in std::mem::take(&mut world.dbs) {
         db.close().await.unwrap();
     }
-    let db = open(&os, &clock).await;
+    let db = world.open(0).await;
     let all = db.scan(KeyRange::all()).collect().await.unwrap();
     assert_eq!(all, model_range(&model, &KeyRange::all()), "after reopen");
+    db.close().await.unwrap();
+    world.store.trace()
 }
 
 /// `default` cases, or `PROPTEST_CASES` for stress runs (an explicit
@@ -498,9 +612,10 @@ fn cases(default: u32) -> u32 {
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(48), ..ProptestConfig::default() })]
     #[test]
-    fn matches_model(ops in proptest::collection::vec(op(), 1..250), lags in lags()) {
+    fn matches_model(ops in proptest::collection::vec(op(), 1..250), lags in lags(), seed in any::<u64>()) {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-        rt.block_on(run(ops, lags, None));
+        let setup = Setup { faults: None, seed, time: Time::Manual(ManualClock::new()), cfg: tiny_config() };
+        rt.block_on(run(ops, lags, setup));
     }
 }
 
@@ -517,8 +632,134 @@ proptest! {
             fail_after: 0.05,
             max_delay: Duration::from_millis(1),
         };
-        rt.block_on(run(ops, lags, Some((faults, seed))));
+        let setup = Setup { faults: Some(faults), seed, time: Time::Manual(ManualClock::new()), cfg: tiny_config() };
+        rt.block_on(run(ops, lags, setup));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic simulation: the same harness on a paused current-thread
+// runtime, so virtual time drives every timer and a seed replays exactly.
+// Timers are realistic (seconds, not hours) and waits let minutes pass, so
+// lease expiry, takeover, purges and GC all happen.
+
+const SIM_FAULTS: Faults = Faults {
+    fail_before: 0.03,
+    fail_after: 0.03,
+    max_delay: Duration::from_millis(20),
+};
+
+fn sim_config() -> Settings {
+    let tiny = tiny_config();
+    Settings {
+        tree: TreeConfig {
+            purge_tombstones_after: Duration::from_secs(5),
+            ..tiny.tree
+        },
+        // Short next to polls, as with a real store, so writers act many
+        // times before they see each other's progress.
+        wal: WalConfig {
+            flush_interval: Duration::from_millis(1),
+            ..tiny.wal
+        },
+        checkpoint: CheckpointConfig {
+            interval: Duration::from_secs(1),
+            ..tiny.checkpoint
+        },
+        poll: PollConfig {
+            interval: Duration::from_millis(200),
+            max_interval: Duration::from_secs(2),
+            discovery_interval: Duration::from_secs(2),
+            ..tiny.poll
+        },
+        lease: LeaseConfig {
+            interval: Duration::from_secs(1),
+            ttl: Duration::from_secs(10),
+        },
+        applier: ApplierRole::Auto {
+            steal_after: Duration::from_secs(30),
+        },
+        gc: Gc::On(GcConfig {
+            interval: Duration::from_secs(5),
+            retention: Duration::from_secs(60),
+            max_deletes_per_sec: 1000,
+        }),
+        ..tiny
+    }
+}
+
+/// The model test's ops plus waits: mostly short, sometimes past a lease
+/// timeout or the GC retention.
+fn sim_op() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        20 => op(),
+        3 => (0u64..2_000).prop_map(Op::Wait),
+        1 => (2_000u64..90_000).prop_map(Op::Wait),
+    ]
+}
+
+/// Clock lags for simulations: up to 3 s, so a slow writer's late writes
+/// still predate tombstones that virtual time has carried down and dropped.
+/// Still well under the lease TTL.
+fn sim_lags() -> impl Strategy<Value = Vec<u64>> {
+    prop_oneof![
+        1 => Just(vec![0; WRITERS]),
+        3 => proptest::collection::vec(0u64..3_000, WRITERS),
+    ]
+}
+
+/// Runs `ops` in a fresh simulated world, on a store that injects `faults`.
+/// Without faults, queued writes stay queued: late writes from slow writers
+/// happen only then (under faults a lost writer may lose them, so they're
+/// awaited).
+fn simulate(ops: Vec<Op>, lags: Vec<u64>, faults: Option<Faults>, seed: u64) -> Trace {
+    // Time only: the IO driver (unused, the store is in memory) parks for
+    // real between timers even with time paused, 40x slower.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let setup = Setup {
+            faults,
+            seed,
+            time: Time::Virtual(VirtualClock::new()),
+            cfg: sim_config(),
+        };
+        run(ops, lags, setup).await
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(128), ..ProptestConfig::default() })]
+    #[test]
+    fn simulation_matches_model(
+        ops in proptest::collection::vec(sim_op(), 1..200),
+        lags in sim_lags(),
+        faults in prop_oneof![Just(None), Just(Some(SIM_FAULTS))],
+        seed in any::<u64>(),
+    ) {
+        simulate(ops, lags, faults, seed);
+    }
+}
+
+/// A seed replays the same store requests, so a failing case reproduces
+/// and shrinks.
+#[test]
+fn simulation_replays_exactly() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let ops = proptest::collection::vec(sim_op(), 150)
+        .new_tree(&mut runner)
+        .unwrap()
+        .current();
+    let lags = sim_lags().new_tree(&mut runner).unwrap().current();
+    let faults = Some(SIM_FAULTS);
+    let first = simulate(ops.clone(), lags.clone(), faults, 7);
+    assert!(first.requests > 1000, "{first:?}");
+    assert_eq!(simulate(ops, lags, faults, 7), first);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
