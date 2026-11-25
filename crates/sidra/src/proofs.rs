@@ -7,7 +7,7 @@
 
 use std::ops::Bound;
 
-use crate::hlc::Hlc;
+use crate::hlc::{Hlc, Ts};
 use crate::node::{
     child_bounds, child_index, chunk_by_bytes, first_child, group_starts, last_child, merge_newest,
 };
@@ -289,8 +289,8 @@ fn hlc_is_strictly_monotonic() {
     let t1 = c.now(a);
     let t2 = c.now(b);
     assert!(t2 > t1);
-    let seen: u64 = kani::any();
-    kani::assume(seen < 1 << 60);
+    let seen = Ts(kani::any());
+    kani::assume(seen.0 < 1 << 60);
     c.observe(seen);
     let t3 = c.now(d);
     assert!(t3 > seen && t3 > t2);

@@ -1,11 +1,8 @@
 //! Object layout under the database root:
 //!
 //! - `manifest/{id:020}.mf`: immutable manifests; the highest id is current.
-//!   Writers publish with put-if-absent, which is the only coordination point.
-//! - `wal/{writer}/{seq:020}.wal`: each writer's log, put-if-absent. A sealed
-//!   log keeps its seal forever, so it stays apart from `writers/`, which
-//!   lists only writers that still matter.
-//! - `writers/{writer}/lease`: each writer's liveness and timestamp floor.
+//!   Published with put-if-absent, which fences an older writer.
+//! - `wal/{seq:020}.wal`: the write-ahead log, put-if-absent per slot.
 //! - `seg/{epoch:020}-{seq:020}.seg`: one per checkpoint, holding every node
 //!   that checkpoint wrote, back to back. Nodes are read with ranged GETs.
 //!
@@ -24,9 +21,8 @@ use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
 
 use crate::error::{Error, Result};
 use crate::hedge::{Hedge, Hedger};
-use crate::hlc::WriterId;
 use crate::retry::retry;
-use crate::types::{Epoch, ManifestId, SegmentId};
+use crate::types::{Epoch, ManifestId, SegmentId, WalSeq};
 
 const COALESCE_GAP: u64 = 128 << 10;
 const DELETE_BATCH: usize = 128;
@@ -145,20 +141,8 @@ impl Store {
         self.dir("manifest").join(format!("{:020}.mf", id.0))
     }
 
-    fn writer_dir(&self, writer: WriterId) -> Path {
-        self.dir("writers").join(writer.to_string())
-    }
-
-    fn wal_dir(&self, writer: WriterId) -> Path {
-        self.dir("wal").join(writer.to_string())
-    }
-
-    pub fn wal_path(&self, writer: WriterId, seq: u64) -> Path {
-        self.wal_dir(writer).join(format!("{seq:020}.wal"))
-    }
-
-    pub fn lease_path(&self, writer: WriterId) -> Path {
-        self.writer_dir(writer).join("lease")
+    pub fn wal_path(&self, seq: WalSeq) -> Path {
+        self.dir("wal").join(format!("{:020}.wal", seq.0))
     }
 
     pub fn segment_path(&self, id: SegmentId) -> Path {
@@ -274,13 +258,13 @@ impl Store {
     /// Deletes objects through the store's bulk API where it has one (S3's
     /// DeleteObjects), in small batches sent one at a time. One request per
     /// object swamps the store, and so do huge batches on some servers; either
-    /// stalls writers' log PUTs behind GC. Missing objects count as deleted.
+    /// stalls log PUTs behind GC. Missing objects count as deleted.
     pub async fn delete_all(&self, paths: Vec<Path>) -> Result<()> {
         self.delete_paced(paths, Pace::Unlimited).await
     }
 
     /// Like `delete_all`, at most `pace` objects per second: GC's bursts of
-    /// deletes otherwise compete with writers' log PUTs and stall them.
+    /// deletes otherwise compete with log PUTs and stall them.
     pub async fn delete_paced(&self, paths: Vec<Path>, pace: Pace) -> Result<()> {
         let (batch, gap) = match pace {
             Pace::Unlimited => (DELETE_BATCH, None),
@@ -349,28 +333,12 @@ impl Store {
         Ok(ids)
     }
 
-    pub async fn list_writers(&self) -> Result<Vec<WriterId>> {
-        let listing = retry("list", || async {
-            bump(&self.counters.lists, 1);
-            Ok(self
-                .os
-                .list_with_delimiter(Some(&self.dir("writers")))
-                .await?)
-        })
-        .await?;
-        Ok(listing
-            .common_prefixes
+    pub async fn list_wals(&self) -> Result<Vec<WalSeq>> {
+        let mut seqs: Vec<WalSeq> = self
+            .list_names("wal", None)
+            .await?
             .iter()
-            .filter_map(|p| p.filename().and_then(WriterId::parse))
-            .collect())
-    }
-
-    pub async fn list_wals(&self, writer: WriterId) -> Result<Vec<u64>> {
-        let prefix = self.wal_dir(writer);
-        let metas = self.list(&prefix, None).await?;
-        let mut seqs: Vec<u64> = metas
-            .iter()
-            .filter_map(|m| m.location.filename().and_then(|n| parse_num(n, ".wal")))
+            .filter_map(|n| parse_num(n, ".wal").map(WalSeq))
             .collect();
         seqs.sort();
         Ok(seqs)

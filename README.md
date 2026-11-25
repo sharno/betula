@@ -6,12 +6,12 @@ to outlast the machines that use it.
 
 A copy-on-write Bε-tree key-value store on object storage (S3, RustFS, anything
 `object_store` supports with put-if-absent). No local disk and no coordinator,
-like SlateDB, but with **any number of concurrent writers**.
+like SlateDB: one writer, any number of readers.
 
 ## Quickstart
 
 ```rust
-use sidra::{Db, Freshness, ReadOptions, WriteBatch};
+use sidra::{Db, DbReader, Freshness, ReadOptions, WriteBatch};
 
 let db = Db::open("s3://bucket/mydb").await?;     // also gs://, az://, file://, memory://
 db.put("user:1", "ada").await?;                    // durable when it returns
@@ -21,14 +21,18 @@ batch.put("user:2", "grace").delete("user:3");
 db.write(batch).await?;
 
 let v = db.get("user:1").await?;
-let fresh = db.get_with("user:1", ReadOptions { freshness: Freshness::Latest }).await?;
 let users = db.scan("user:".."user;").collect().await?;  // or .into_stream()
 db.close().await?;
+
+let reader = DbReader::open("s3://bucket/mydb").await?;  // any number, anywhere
+let fresh = reader.get_with("user:1", ReadOptions { freshness: Freshness::Latest }).await?;
 ```
 
-Open the same URL from any number of processes to get any number of
-writers. `DbReader::open(url)` gives a read-only handle. Examples:
-`cargo run --example quickstart -- <url>` and `cargo run --example multi_writer`.
+Opening a writer fences the one already open, if any: its next write or
+checkpoint fails with `WriterLost`. So a restarted or replacement process
+takes over without coordination, and a stalled one can't corrupt anything.
+Examples:
+`cargo run --example quickstart -- <url>` and `cargo run --example follow`.
 
 For more control, use the builder:
 
@@ -52,13 +56,9 @@ warm = "blocking"          # or "background": open ~4x faster, reads warm up aft
 flush_interval = "50ms"    # write latency vs PUTs per second
 [checkpoint]
 bytes = 33554432
-interval = "2s"
-[poll]
-interval = "200ms"         # how fast writers see each other
-max_interval = "2s"        # back-off while idle
-[applier]
-mode = "auto"              # or "standby" (backup), or "never" (write-only)
-steal_after = "10s"
+interval = "2s"            # also how often an idle writer checks it wasn't fenced
+max_bytes = 67108864       # per checkpoint
+max_unapplied_bytes = 536870912  # writes stall past this backlog
 [gc]
 mode = "on"
 retention = "10m"
@@ -70,35 +70,11 @@ initial = "250ms"          # threshold until 64 GETs are measured
 ```
 
 ```sh
-SIDRA_WAL__FLUSH_INTERVAL=20ms SIDRA_APPLIER__MODE=never ./my-service
+SIDRA_WAL__FLUSH_INTERVAL=20ms ./my-service
 ```
 
-#### Writers in other regions
-
-A writer far from the home bucket can put its log in a bucket in its own
-region, so a write costs a local PUT. Manifests, segments and leases stay in
-the home bucket, and the applier pulls the regional log from there.
-
-```toml
-# A writer in eu-west-1; the database lives in us-east-1.
-log = { region = "eu" }
-[applier]
-mode = "standby"               # apply only while the home region can't
-after = "30s"
-[regions]
-eu = "s3://my-db-eu/orders"
-```
-
-A `standby` writer takes the applier role only when work has waited `after`
-with no manifest published, and hands it back at its next checkpoint once a
-live `auto` writer exists. `mode = "never"` keeps a writer out entirely.
-
-Every process that pulls logs (the applier, readers that follow every
-writer, `sidra writers` and `sidra gc`) needs the same `[regions]` table, or
-`Db::builder(..).with_region(..)` in code. One without it fails with
-`InvalidConfig` when it meets a writer logging there. A write is durable in
-its own region first: if that region fails before the applier pulls it, the
-write is unavailable until the region recovers, not lost.
+Readers (`DbReader`) refresh every `refresh_interval` (500 ms): a new
+manifest if there is one, then the log past it.
 
 #### Readers in other regions
 
@@ -128,21 +104,20 @@ RustFS or MinIO).
 | Kind | Meaning |
 |---|---|
 | `Unavailable` | The store failed after retries. Safe to retry (`err.is_retryable()`) |
-| `WriterLost` | Log sealed (presumed dead after its lease lapsed), writer id taken, or a log write's outcome unknown. Open a new writer |
-| `NotApplier` | An applier-only call on a process without the role |
+| `WriterLost` | Fenced by a newer writer, or a log write's outcome unknown. Open a new writer if this process should still write |
 | `Closed` | The handle was closed |
 | `SnapshotExpired` | A snapshot was held past the GC retention |
 | `Corrupt` | Stored data failed validation |
 | `InvalidConfig` | Bad settings or URL |
 
-`db.status()` reports a background failure (such as a sealed log) without
+`db.status()` reports a background failure (such as being fenced) without
 having to write. Call `db.close().await` before exit: dropping a writer warns
 and may lose writes that were only queued.
 
 ### Metrics
 
 `db.metrics()` returns:
-- the applier role and epoch, plus manifest id and age;
+- the writer's epoch, plus manifest id and age;
 - unapplied bytes and how long the oldest has waited;
 - segment and live bytes;
 - batches and log flushes written;
@@ -154,12 +129,12 @@ and may lose writes that were only queued.
 
 ```sh
 cargo install --path crates/sidra-cli      # installs `sidra`
-sidra info    s3://bucket/db               # manifest, applier, tree, space
-sidra writers s3://bucket/db               # leases and unapplied logs
+sidra info    s3://bucket/db               # manifest, writer epoch, tree, space
+sidra log     s3://bucket/db               # log objects, unapplied, fences
 sidra get     s3://bucket/db user:1        # latest acknowledged value
 sidra scan    s3://bucket/db --prefix user: --limit 20
-sidra put     s3://bucket/db user:1 ada    # takes the applier role only if none is running
-sidra delete  s3://bucket/db user:1
+sidra put     s3://bucket/db user:1 ada --take-over   # fences the running writer
+sidra delete  s3://bucket/db user:1 --take-over
 sidra shape   s3://bucket/db               # walks the whole tree
 sidra gc      s3://bucket/db --retention 10m
 ```
@@ -169,34 +144,32 @@ The same operations are available as a library: `sidra::Admin`.
 ## Design
 
 ```
-writer A ─► wal/A/{seq} ─┐
-writer B ─► wal/B/{seq} ─┼─► applier: fold into tree COW ─► one segment + manifest (put-if-absent)
-writer C ─► wal/C/{seq} ─┘
+writer ─► wal/{seq} ─► checkpoint: fold a prefix into tree COW ─► segments + manifest (put-if-absent)
+                 └──► readers: manifest + log past it
 ```
 
-- **Writers never coordinate.** Each write gets a hybrid logical clock
-  timestamp (physical ms, logical counter, writer id) and goes to the
-  writer's own log. A write is acknowledged once its log object is durable.
-  It is visible right away on that writer, and on others after their next
-  poll (p50 ~40 ms, p99 ~90 ms at 100 ms polling).
+- **One writer, fenced on open.** Opening claims the next manifest with
+  writer epoch + 1 (put-if-absent; the last opener wins). It then reads the
+  log forward from the manifest's applied slot and puts a fence record,
+  put-if-absent, in the first empty slot. Every batch an older writer made
+  durable is before the fence, and gets replayed; its next put lands on the
+  fence and fails unacknowledged. Its next checkpoint finds the manifest id
+  taken and stops it too. Last, the opener checks that no newer writer
+  claimed a manifest meanwhile: one stalled long enough could otherwise fence
+  a slot GC already cleared.
+- **One log.** Each write gets a hybrid clock timestamp (physical ms, logical
+  counter) and goes to the next log slot (`wal/{seq}`). A write is
+  acknowledged once its slot is durable, and readable on the writer right
+  away. Timestamps are stamped in log order, and a new writer starts its
+  clock past everything it replayed and the manifest's newest applied
+  timestamp (`last_ts`).
 - **Newest-wins versions.** Wherever two versions of a key meet (memtable,
-  buffer, leaf, reads) the larger timestamp wins. Applying writes in any
-  order gives the same result, so a slow writer's late entries need no
-  special handling.
-- **One applier at a time**, held through the manifest itself. Claiming the
-  role publishes the next manifest with applier epoch + 1 and the claimant's
-  id (put-if-absent), which fences the previous applier. A closing applier
-  releases the role. Another writer takes it over when there's work and the
-  role is free, the applier's lease has expired, or nothing was published
-  for `steal_after`. It folds writers' unapplied entries into the tree,
-  oldest first and at most `checkpoint.max_bytes` (64 MiB) per checkpoint,
-  and records each writer's applied sequence number. A checkpoint that took
-  the whole backlog would grow with it: past `steal_after`, another writer
-  takes the role mid-checkpoint, faces a bigger backlog, and loses it the
-  same way, so nothing gets applied again. Tombstones go only below the
-  oldest entry left for a later checkpoint.
-  Any writer takes the role over when entries sit unapplied too long. Losing
-  the role never affects writing.
+  buffer, leaf, reads) the larger timestamp wins.
+- **Checkpoints apply a prefix.** A checkpoint folds the oldest unapplied
+  batches, at most `checkpoint.max_bytes` (64 MiB), into the tree and
+  publishes the next manifest (put-if-absent) with the last slot applied and
+  the fences in that range. Timestamps grow along the log, so everything
+  left is newer than everything applied.
 - **Bε-tree with append-only buffers.** Internal nodes hold pivots and, for
   each child, a pointer plus a list of buffered message runs. A batch reaching
   a node is split by child and appended as new runs, so only the small
@@ -217,26 +190,14 @@ writer C ─► wal/C/{seq} ─┘
   Past its first leaf, a scan fetches the next sibling leaves in its range
   ahead (2, then 4, then 8), batched into coalesced ranged GETs per segment;
   a scan that ends in its first leaf fetches nothing extra.
-- **Tombstones.** Deletes stay as tombstones until no writer can still
-  produce an older version of the key. Each writer's lease
-  (`writers/{id}/lease`) carries a floor under every timestamp it may still
-  make durable, and the applier drops tombstones below the lowest floor of
-  every writer whose log isn't sealed. Three rules make this safe:
-  - The applier pulls logs from every writer whose lease it read, after
-    reading the leases.
-  - A writer stops counting only once its log is **sealed**: a seal record
-    put-if-absent at its next sequence number. Log slots are consecutive and
-    a writer never skips one, so nothing can land after a seal, and a write
-    still in flight either lands first (and is pulled into the same
-    checkpoint) or finds the seal and fails unacknowledged. The applier
-    seals writers whose lease lapsed; a closing writer seals its own log.
-    Lease expiry only says when to seal, so a delayed request or a skewed
-    clock can't bring back a deleted key.
-  - A rewrite carries the parent's buffered versions for that range down
-    with it, so a rewritten leaf has no older version of its keys above it.
+- **Tombstones.** A delete reaching a leaf goes: no older version of the
+  key can arrive later. Older versions are in the tree or in the applied
+  prefix, and a rewrite carries the parent's buffered versions for that
+  range down with it, so a rewritten leaf has no older version of its keys
+  above it.
 
-  A tombstone usually goes when a flush rewrites its leaf anyway. Once it
-  has been droppable for `purge_tombstones_after` (60 s), a checkpoint
+  A tombstone usually reaches its leaf when a flush rewrites it anyway.
+  Once buffered for `purge_tombstones_after` (60 s), a checkpoint
   rewrites its subtree just to drop it, even with no new writes. A tombstone
   still buffered in a run waits until its buffer has had no writes that
   long, then is carried down: a busy buffer flushes on its own, and forcing
@@ -244,60 +205,47 @@ writer C ─► wal/C/{seq} ─┘
   subtree is due, so due ones are found without loading anything. A
   checkpoint starts no new purge, at any depth, once its purges loaded and
   wrote `purge_bytes_per_checkpoint` (64 MiB), so a mass delete spreads
-  over several checkpoints instead of stalling the applier on one. Loads
+  over several checkpoints instead of stalling the writer on one. Loads
   count: purging a leaf whose keys are all deleted writes nothing.
 - **Inner-node cache.** Internal nodes and runs have their own cache. By
   default, open loads both before returning (`Warm::Blocking`), so reads are
   full speed from the first request. `Warm::Background` returns after the
   internal nodes and streams runs in behind, opening about 4x faster. Once warm, a cold
-  point read is at most one GET. Polling for other writers backs off while
-  nothing changes.
+  point read is at most one GET.
 - **Cleaner.** Segments below 25% live get their live nodes rewritten by the
   next checkpoint. Runs in such a segment are copied in place instead of
   being pushed down. Cleaning at live fraction *t* adds about *t*/(1−*t*) to
   write amplification and keeps space amplification near 1/*t*.
 - **GC.** Once a manifest is past retention, GC deletes the segments that died
-  in it, the previous manifest, and log entries the manifest already holds.
+  in it, the previous manifest, and log slots the manifest already applied,
+  except fences. A fence stays so that a fenced writer's put, however
+  delayed, still finds it.
 
 ## Guarantees and limits
 
 - Writes are durable once acknowledged. Values are per-key last-writer-wins by
-  hybrid timestamp. A writer sees its own writes right away and other
-  writers' within a poll. A batch from one writer is atomic.
-- No compare-and-set or transactions across writers (yet).
+  hybrid timestamp. The writer sees its own writes right away, readers
+  within a refresh. A batch is atomic.
+- One writer at a time. Writes from other processes go through it (an RPC
+  of your own), or each opens the writer in turn, fencing the last.
 - Readers and snapshots must refresh within the GC retention (default
   10 min).
-- Dropping tombstones doesn't depend on clocks. A writer counts until its
-  log is sealed, however late its requests arrive; a writer that starts late
-  with a lagging clock first moves its clock past a bound below which
-  tombstones may already be gone. Clock skew only affects liveness: a
-  writer whose lease looks expired to the applier gets sealed and fails with
-  `WriterLost`, and a live writer with a stale lease holds tombstones back.
-- One writer's unreachable log store (a regional outage) doesn't stall the
-  others: their writes keep getting applied, tombstone collection pauses,
-  and `Freshness::Latest` reads fail rather than miss writes.
-- Writers stall once unapplied entries reach `max_unapplied_bytes`, split
-  evenly among writers with unapplied entries: each stalls when its own
-  exceed its share. Otherwise the applier, which sees room first, refills
-  the backlog before the others notice and starves them. Under sustained
-  overload, writes go at the applier's pace. Each checkpoint frees up to
-  `checkpoint.max_bytes` at once, writers refill it within a second or
-  two, then wait for the next, so a write stalls for up to about one
-  checkpoint. The limit counts every unapplied batch held, so overwrites
-  of one key apply backpressure too. `close()` skips it to make queued
-  writes durable, so it can't hang waiting for an applier.
-- By default every writer pulls every other writer's log to show unapplied
-  writes, which costs about (writers − 1) × log bytes in GETs. With
-  `poll.follow = "manifest_only"` a writer sees others' writes once applied
-  (about a checkpoint interval), unless it reads with `Freshness::Latest`.
-- GC deletes the leases of sealed, fully applied writers whose lease expired
-  over a retention ago, and the applier then drops them from the manifest.
-  The seal object stays forever (a few bytes per writer id ever opened),
-  so a forgotten writer id can never write again.
+- Correctness doesn't depend on clocks. A lagging clock on a new writer
+  is moved past `last_ts` and the replayed log.
+- Writes stall once unapplied batches reach `max_unapplied_bytes`. Under
+  sustained overload, writes go at the checkpoints' pace. Each checkpoint
+  frees up to `checkpoint.max_bytes` at once, so a write stalls for up to
+  about one checkpoint. The limit counts every unapplied batch held, so
+  overwrites of one key apply backpressure too. `close()` skips it to make
+  queued writes durable.
+- Fences stay forever: a few bytes per writer ever opened.
+- A writer stalled past the GC retention mid-checkpoint (between planning
+  and publishing) is assumed not to happen, as for readers: the manifest id
+  it publishes to may have been collected.
 - No merging of underfull leaves (only empty ones are removed), so heavy
   deletes leave sparse leaves until rewritten (see the roadmap).
 - Store requests retry transient failures with capped backoff (8 attempts,
-  50 ms to 5 s). A log write that still fails ends its writer with
+  50 ms to 5 s). A log write that still fails ends the writer with
   `WriterLost`, since whether it landed is unknown.
 - A GET still running after the p95 latency of that store's last 512 GETs
   gets a second copy, and the first answer wins: an object store's slow
@@ -310,9 +258,9 @@ writer C ─► wal/C/{seq} ─┘
 ## Roadmap
 
 Done: LZ4 compression (on by default), lighter cleaning of inner segments,
-paced GC deletes, multi-region (regional writer logs, standby appliers,
-replica readers), heap-merged scans, scan readahead, hedged GETs, purging
-buffered tombstones.
+paced GC deletes, replica readers, heap-merged scans, scan readahead, hedged
+GETs, purging buffered tombstones, one fenced writer (replacing concurrent
+writers with leases and an applier role: tag `multi-writer`).
 
 1. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
 2. **Soak tests:** multi-hour runs against a real store.
@@ -327,42 +275,40 @@ buffered tombstones.
    the gain is fewer leaves (cache, GETs per key), not faster scans.
    Contiguous deletes (TTL, queues) need no merging: their leaves empty and
    go (`--delete-order prefix --delete-pct 90`: 1,308 leaves to 179).
-5. **Optional conditional writes** (compare-and-set) routed through the
-   applier, for workloads that need them.
+5. **Conditional writes** (compare-and-set): the single writer makes them
+   cheap.
+6. **sidra-server:** the writer behind an RPC, for many client processes.
 
 ## Verification
 
 See [`spec/README.md`](spec/README.md):
 - a TLA+ model of the protocol, model-checked with everystate (every protocol
   rule is shown necessary by a counterexample);
+- a Stateright model (`crates/sidra-model`) that drives the crate's own
+  protocol state machines (opening and fencing, the log, partial
+  checkpoints, log GC) through every interleaving of two writers, with
+  lost requests and responses and crashes. Each rule (fence, kept fences,
+  `last_ts`) turned off fails a property; `tests/trace.rs` replays each
+  scenario;
 - Kani bounded proofs of the core functions;
-- a model-based proptest of the whole system with several concurrent writers
-  and late writes;
+- a model-based proptest of the whole system: random writes, reads and
+  checkpoints, writers replaced, crashed part-way through a checkpoint, and
+  fenced while still running (their writes must fail), and readers;
 - the same proptest under injected faults: store requests that fail before
-  applying, responses lost after applying, random delays, writers killed
-  without closing, and appliers killed part-way through a checkpoint.
-  Every acknowledged write must survive, and every read must match the
-  model. (`PROPTEST_CASES=400` for stress runs.)
+  applying, responses lost after applying, and random delays. Every
+  acknowledged write must survive, and every read must match the model.
+  (`PROPTEST_CASES=400` for stress runs.)
 - deterministic simulation: the same proptest on a paused single-threaded
   tokio runtime, so virtual time drives every timer and a seed replays the
   same store requests (checked). Timers are realistic and waits let
-  minutes pass, so lease expiry, takeover, purges and GC run, and a
-  long-lived reader checks GC keeps what it needs. About 15 ms per case:
+  minutes pass, so checkpoints, purges and GC run in the background, and a
+  long-lived reader checks GC keeps what it needs:
   `PROPTEST_CASES=100000 cargo test --release -p sidra --test model
-  simulation`. Planting a bug in the tombstone floor or in GC retention
-  fails it within a few thousand cases.
-- an overload simulation: three writers outpace an applier on a slow store
-  for five virtual minutes. The applier must keep the role and publish
-  regularly, writers must share the backlog fairly and stall rather than
-  fail, and nothing acknowledged may be lost. Without the per-checkpoint
-  cap the role changes hands every `steal_after` and nothing is applied;
-  without the even share, the applier's own writer takes twice the others'
-  share.
-- a targeted test for partial checkpoints: a tombstone applied while an
-  older put to its key waits for a later checkpoint must survive, or the
-  put resurrects. Only group-committed batches with several timestamps
-  reach this; the Stateright model and the simulation don't produce them.
-  The TLA+ model does (`BugPartial`).
+  simulation`.
+- targeted tests: a fenced writer's in-flight log write fails, also after GC
+  collected the log around its fence; concurrent writes on one key under
+  one-batch partial checkpoints end with the newest; an overload simulation
+  where writes outpace checkpoints on a slow store stall rather than fail.
 
 ## Layout
 
@@ -373,6 +319,7 @@ See [`spec/README.md`](spec/README.md):
   bytes per segment equal the bytes of reachable nodes. Further tests cover
   fencing, GC (only referenced segments remain, space amplification is
   bounded), and crash orphans.
+- `crates/sidra-model`: the Stateright model of the protocol.
 - `crates/sidra-bench`: sidra vs SlateDB on an S3 endpoint, with a metered
   object store (request counts, bytes, simulated S3 latency).
   `s3probe` measures the store's raw PUT/GET throughput.
@@ -527,52 +474,33 @@ by the 100 ms log flush interval.
 
 SlateDB's numbers in that table predate the compaction wait and the warmup.
 
-Several writers on one database (500k keys, 64 clients in total, spread
-across them). SlateDB allows only one writer:
-
-| writers | load keys/s | update keys/s | cross-writer visibility p50 / p99 |
-|---:|---:|---:|---|
-| 1 | 20.4k | 20.6k | — |
-| 2 | 20.4k | 26.0k | 37 / 89 ms |
-| 4 | 20.3k | 16.9k | 47 / 92 ms |
-| 8 | 19.7k | 23.0k | 37 / 97 ms |
-
-Capacity, 256 clients × batches of 128, 2M keys:
-
-| | sidra, 4 writers | SlateDB, 1 writer |
-|---|---|---|
-| load keys/s (p99 ms) | 203k (399) | 307k (162) |
-| update keys/s (p99 ms) | 305k (174) | 294k (119) |
-
-Applier saturation, `--latency s3`, 1M keys, then 120 s of random
+Checkpoint saturation, `--latency s3`, 1M keys, then 120 s of random
 overwrites from 1,024 clients (`--ingest-secs 120`), defaults otherwise
 (512 MiB backlog, 64 MiB checkpoints). Before and after loading a
 checkpoint's leaves together:
 
-| | 1 writer | 4 writers (one process) |
+| | before | after |
 |---|---|---|
-| acked MiB/s | 22.0 → 25.3 | 14.9 → 20.3 |
-| write p50 / p99 / p99.9 ms | 337 / 1,337 / 1,659 → 340 / 692 / 1,081 | 267 / 7,348 / 8,897 → 263 / 2,116 / 2,953 |
-| peak unapplied | 295 → 117 MiB | 520 → 474 MiB |
-| checkpoint, cold cache (~200 leaf loads) | 6–8 s → 2–3 s | 7–9 s → 3–4.5 s |
-| checkpoint, warm cache | 0.8–1.2 s (keeps up) | 1.8–3.2 s per 64 MiB |
-| log GETs during ingest | 155 MiB | 8.0 GiB |
+| acked MiB/s | 22.0 | 25.3 |
+| write p50 / p99 / p99.9 ms | 337 / 1,337 / 1,659 | 340 / 692 / 1,081 |
+| peak unapplied | 295 MiB | 117 MiB |
+| checkpoint, cold cache (~200 leaf loads) | 6–8 s | 2–3 s |
+| checkpoint, warm cache | 0.8–1.2 s (keeps up) | |
 
-The applier starts with a cold leaf cache after the reopen phases. A
+The writer starts with a cold leaf cache after the reopen phases. A
 checkpoint flushes a few leaves under each of dozens of inner nodes, so it
 plans its flushes from the root over the cached inner nodes and runs, and
 loads every leaf it will rewrite in one parallel round (about 9 ms per leaf
-instead of 35). Once warm, one writer can't outrun the applier: 37 MiB
-checkpoints in about a second, mostly upload. With four writers the backlog
-nears its limit while the cache is cold, and a write stalls for up to one
-checkpoint. Warm, it applies about 25 MiB/s: each writer also pulls the
-other three's logs (8 GiB of GETs in 120 s), which slows the applier's own
-log pull to 0.3–1.7 s.
+instead of 35). Once warm, writes can't outrun checkpoints: 37 MiB
+checkpoints in about a second, mostly upload.
+
+These tables were measured before the move to one fenced writer, with one
+writer; that path is unchanged.
 
 ```sh
-sidra-bench $B --latency s3 --scans 200 --reads 5000 --ingest-secs 120 --ingest-concurrency 1024 --writers 4
+sidra-bench $B --latency s3 --scans 200 --reads 5000 --ingest-secs 120 --ingest-concurrency 1024
 ```
 
-Bulk loading into an empty tree is limited by the single applier's
+Bulk loading into an empty tree is limited by the writer's
 copy-on-write rewrites. sidra pays for its read advantage in bytes written:
 Bε buffers, plus the cleaner.

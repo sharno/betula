@@ -18,8 +18,7 @@ pub enum Node {
     Run(Arc<Run>),
 }
 
-/// Sorted, one version per key. Tombstones stay until no older write can
-/// still arrive.
+/// Sorted, one version per key, no tombstones.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Leaf {
     pub entries: Vec<(Bytes, Version)>,
@@ -52,9 +51,7 @@ pub struct Child {
     /// Newest version in the subtree (excluding `runs`): a read that already
     /// found something newer stops here.
     pub newest: Option<Ts>,
-    /// Messages buffered for this child, newest run last. A buffered version
-    /// is not necessarily newer than one below it (a late write from a slow
-    /// writer), so reads compare timestamps.
+    /// Messages buffered for this child, newest run last.
     pub runs: Vec<RunRef>,
 }
 
@@ -117,20 +114,16 @@ fn newest_in(entries: &[(Bytes, Version)]) -> Option<Ts> {
 }
 
 impl Node {
-    /// When a checkpoint should rewrite this subtree just to drop its
-    /// tombstones (once this is `purge_tombstones_after` past the tombstone
-    /// floor): a leaf's oldest tombstone, or a buffer's newest version if it
-    /// holds tombstones (`buffer_purge_at`). Buffered tombstones must be
-    /// carried down into their leaf to go, or a range nobody writes to again
-    /// keeps them and the values they delete forever.
+    /// When a checkpoint should flush this subtree's buffers just to drop
+    /// their tombstones (once this is `purge_tombstones_after` old): the
+    /// newest version of a buffer holding tombstones (`buffer_purge_at`).
+    /// Buffered tombstones must be carried down into their leaf to go, or a
+    /// range nobody writes to again keeps them and the values they delete
+    /// forever.
     pub fn purge_at(&self) -> Option<Ts> {
         match self {
-            Node::Leaf(l) => l
-                .entries
-                .iter()
-                .filter(|(_, v)| v.msg == Msg::Delete)
-                .map(|(_, v)| v.ts)
-                .min(),
+            // Leaves hold no tombstones (`apply_to_leaf`).
+            Node::Leaf(_) => None,
             Node::Internal(i) => i
                 .children
                 .iter()
@@ -242,16 +235,15 @@ pub fn merge_versions(a: Vec<(Bytes, Version)>, b: Vec<(Bytes, Version)>) -> Vec
     merge_newest(a, b, |v| v.ts)
 }
 
-/// Applies sorted, key-unique versions to leaf entries. Tombstones older than
-/// `drop_below` are removed: by then no older write for their key can arrive.
+/// Applies sorted, key-unique versions to leaf entries. Tombstones go: a
+/// leaf has nothing below it to shadow, and every later write is newer.
 pub fn apply_to_leaf(
     entries: Vec<(Bytes, Version)>,
     msgs: Vec<(Bytes, Version)>,
-    drop_below: Ts,
 ) -> Vec<(Bytes, Version)> {
     merge_newest(entries, msgs, |v| v.ts)
         .into_iter()
-        .filter(|(_, v)| !(v.msg == Msg::Delete && v.ts < drop_below))
+        .filter(|(_, v)| v.msg != Msg::Delete)
         .collect()
 }
 

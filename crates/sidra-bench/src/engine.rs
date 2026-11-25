@@ -36,8 +36,6 @@ pub struct EngineParams {
     pub clean_inner_below_live: f64,
     /// GC delete rate, or `None` to disable GC.
     pub gc: Option<u32>,
-    /// How often sidra writers poll for each other's entries.
-    pub poll: Duration,
     pub max_runs: usize,
     /// sidra: how long tombstones wait before a checkpoint rewrites their
     /// subtree just to drop them.
@@ -83,9 +81,7 @@ const WARMUP_READ_AHEAD: usize = 1 << 20;
 const WARMUP_FETCH_TASKS: usize = 8;
 
 pub enum Engine {
-    /// Several concurrent writers on one database. The first opened takes
-    /// the applier role and serves reads, so its cache is the warm one.
-    Sidra(Vec<sidra::Db>),
+    Sidra(sidra::Db),
     Slatedb(slatedb::Db, ScanOptions),
 }
 
@@ -103,7 +99,6 @@ impl Engine {
         os: Arc<dyn ObjectStore>,
         path: &str,
         params: &EngineParams,
-        writers: usize,
     ) -> Result<Self> {
         Ok(match kind {
             EngineKind::Sidra => {
@@ -130,10 +125,6 @@ impl Engine {
                         bytes: params.memtable_bytes,
                         ..defaults.checkpoint
                     },
-                    poll: sidra::PollConfig {
-                        interval: params.poll,
-                        ..defaults.poll
-                    },
                     warm: params.warm,
                     hedge: params.hedge,
                     gc: match params.gc {
@@ -152,18 +143,13 @@ impl Engine {
                         clean_inner_below_live: params.clean_inner_below_live,
                         ..sidra::CleanerConfig::default()
                     },
-                    ..defaults
                 };
-                let mut dbs = Vec::with_capacity(writers);
-                for _ in 0..writers.max(1) {
-                    dbs.push(
-                        sidra::Db::builder(path, os.clone())
-                            .with_settings(cfg.clone())
-                            .build()
-                            .await?,
-                    );
-                }
-                Engine::Sidra(dbs)
+                Engine::Sidra(
+                    sidra::Db::builder(path, os)
+                        .with_settings(cfg)
+                        .build()
+                        .await?,
+                )
             }
             EngineKind::Slatedb => {
                 let settings = slatedb::Settings {
@@ -184,19 +170,15 @@ impl Engine {
         })
     }
 
-    /// Writes the pairs atomically through writer `slot` (modulo the writer
-    /// count); returns once the batch is durable.
-    pub async fn write(&self, slot: u64, pairs: Vec<(Bytes, Bytes)>) -> Result<()> {
+    /// Writes the pairs atomically; returns once the batch is durable.
+    pub async fn write(&self, pairs: Vec<(Bytes, Bytes)>) -> Result<()> {
         match self {
-            Engine::Sidra(dbs) => {
+            Engine::Sidra(db) => {
                 let mut batch = sidra::WriteBatch::new();
                 pairs.into_iter().for_each(|(k, v)| {
                     batch.put_bytes(k, v);
                 });
-                dbs[slot as usize % dbs.len()]
-                    .write(batch)
-                    .await
-                    .map(drop)?
+                db.write(batch).await.map(drop)?
             }
             Engine::Slatedb(db, _) => {
                 let batch = pairs
@@ -211,41 +193,31 @@ impl Engine {
         Ok(())
     }
 
-    /// sidra's backlog: unapplied bytes (the most any writer sees), log bytes
-    /// applied so far, and the last checkpoint's duration.
+    /// sidra's backlog: unapplied bytes, log bytes applied so far, and the
+    /// last checkpoint's duration.
     pub fn backlog(&self) -> Option<Backlog> {
         match self {
-            Engine::Sidra(dbs) => {
-                let ms: Vec<_> = dbs.iter().map(|d| d.metrics()).collect();
+            Engine::Sidra(db) => {
+                let m = db.metrics();
                 Some(Backlog {
-                    unapplied: ms
-                        .iter()
-                        .map(|m| m.unapplied_bytes as u64)
-                        .max()
-                        .unwrap_or(0),
-                    applied: ms.iter().map(|m| m.applied_bytes).sum(),
-                    last_checkpoint: ms
-                        .iter()
-                        .filter(|m| m.is_applier)
-                        .find_map(|m| m.last_checkpoint),
+                    unapplied: m.unapplied_bytes as u64,
+                    applied: m.applied_bytes,
+                    last_checkpoint: m.last_checkpoint,
                 })
             }
             Engine::Slatedb(..) => None,
         }
     }
 
-    /// Deletes the keys atomically through writer `slot`.
-    pub async fn delete(&self, slot: u64, keys: Vec<Bytes>) -> Result<()> {
+    /// Deletes the keys atomically.
+    pub async fn delete(&self, keys: Vec<Bytes>) -> Result<()> {
         match self {
-            Engine::Sidra(dbs) => {
+            Engine::Sidra(db) => {
                 let mut batch = sidra::WriteBatch::new();
                 keys.iter().for_each(|k| {
                     batch.delete(k);
                 });
-                dbs[slot as usize % dbs.len()]
-                    .write(batch)
-                    .await
-                    .map(drop)?
+                db.write(batch).await.map(drop)?
             }
             Engine::Slatedb(db, _) => {
                 let batch = keys.iter().fold(slatedb::WriteBatch::new(), |mut b, k| {
@@ -263,8 +235,8 @@ impl Engine {
     /// and how many leaves packing adjacent ones (no splits) would leave.
     pub async fn shape(&self, leaf_max: usize) -> Result<Option<String>> {
         Ok(match self {
-            Engine::Sidra(dbs) => {
-                let s = dbs[0].tree_shape().await?;
+            Engine::Sidra(db) => {
+                let s = db.tree_shape().await?;
                 let underfull = s.leaf_bytes.iter().filter(|b| **b < leaf_max / 4).count();
                 let fill = s.leaf_bytes.iter().sum::<usize>() as f64
                     / (s.leaf_bytes.len().max(1) * leaf_max) as f64;
@@ -297,7 +269,7 @@ impl Engine {
     /// cached, and bloom filters (10 bits per key) skip SSTs without the key.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         Ok(match self {
-            Engine::Sidra(dbs) => dbs[0].get(key).await?,
+            Engine::Sidra(db) => db.get(key).await?,
             Engine::Slatedb(db, _) => db.get(key).await?,
         })
     }
@@ -317,8 +289,8 @@ impl Engine {
     async fn scan_pass(&self, start: Bytes, limit: usize, pass: Pass) -> Result<usize> {
         let mut n = 0;
         match self {
-            Engine::Sidra(dbs) => {
-                let mut it = dbs[0].scan(start..);
+            Engine::Sidra(db) => {
+                let mut it = db.scan(start..);
                 while n < limit && it.next().await?.is_some() {
                     n += 1;
                 }
@@ -345,10 +317,7 @@ impl Engine {
     /// one leaves the tree as it was.
     pub async fn purge(&self) -> Result<()> {
         let root = || match self {
-            Engine::Sidra(dbs) => dbs
-                .iter()
-                .find(|d| d.is_applier())
-                .and_then(|d| d.metrics().tree),
+            Engine::Sidra(db) => db.metrics().tree,
             Engine::Slatedb(..) => None,
         };
         let mut before = root();
@@ -366,19 +335,7 @@ impl Engine {
     /// checkpoint / L0 flush) and waits for background compaction to finish.
     pub async fn settle(&self) -> Result<()> {
         match self {
-            Engine::Sidra(dbs) => {
-                for db in dbs {
-                    db.flush_wal().await?;
-                }
-                let applier = match dbs.iter().find(|d| d.is_applier()) {
-                    Some(d) => d,
-                    None => {
-                        dbs[0].claim_applier().await?;
-                        &dbs[0]
-                    }
-                };
-                applier.checkpoint().await?
-            }
+            Engine::Sidra(db) => db.checkpoint().await?,
             Engine::Slatedb(db, _) => {
                 db.flush_with_options(FlushOptions {
                     flush_type: FlushType::MemTable,
@@ -394,30 +351,12 @@ impl Engine {
         Ok(())
     }
 
-    /// Time from a durable write on one writer until another writer reads it.
-    /// `None` for single-writer engines.
-    pub async fn visibility_lag(&self, key: Bytes, value: Bytes) -> Result<Option<Duration>> {
-        let Engine::Sidra(dbs) = self else {
-            return Ok(None);
-        };
-        let [reader, writer, ..] = dbs.as_slice() else {
-            return Ok(None);
-        };
-        writer.put(key.clone(), value.clone()).await?;
-        let start = std::time::Instant::now();
-        while reader.get(&key).await?.as_ref() != Some(&value) {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        Ok(Some(start.elapsed()))
-    }
-
     pub fn describe(&self) -> String {
         match self {
-            Engine::Sidra(dbs) => {
-                let s = dbs[0].metrics();
+            Engine::Sidra(db) => {
+                let s = db.metrics();
                 format!(
-                    "writers={} manifest={} height={} segments={} live={:.0}%",
-                    dbs.len(),
+                    "manifest={} height={} segments={} live={:.0}%",
                     s.manifest_id.0,
                     s.tree.map_or(0, |t| t.height),
                     s.segments,
@@ -430,15 +369,7 @@ impl Engine {
 
     pub async fn close(self) -> Result<()> {
         match self {
-            Engine::Sidra(dbs) => {
-                // Non-appliers first, so the applier's final checkpoint sees
-                // everything.
-                let (applier, rest): (Vec<_>, Vec<_>) =
-                    dbs.into_iter().partition(|d| d.is_applier());
-                for db in rest.into_iter().chain(applier) {
-                    db.close().await?;
-                }
-            }
+            Engine::Sidra(db) => db.close().await?,
             Engine::Slatedb(db, _) => db.close().await?,
         }
         Ok(())

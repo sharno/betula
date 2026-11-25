@@ -9,26 +9,25 @@ use crate::nodes::Nodes;
 use crate::tree::{self, TreeIter};
 use crate::types::{KeyRange, TreeRoot, Version};
 
-/// A consistent read view: unapplied writer log tails over a tree version.
+/// A consistent read view: log batches not yet applied over a tree version.
 #[derive(Clone)]
 pub struct Snapshot {
-    pub tails: Memtable,
+    pub tail: Memtable,
     pub tree: Option<TreeRoot>,
 }
 
 impl Snapshot {
     pub async fn get(&self, nodes: &Nodes, key: &[u8]) -> Result<Option<Version>> {
         // Reads served from memory never suspend, so a busy reader would hog
-        // its worker thread and starve background tasks (lease renewal, log
-        // flushes) until the lease lapses. Yield once tokio's cooperative
-        // budget is spent.
+        // its worker thread and starve background tasks (log flushes,
+        // checkpoints). Yield once tokio's cooperative budget is spent.
         tokio::task::consume_budget().await;
-        tree::get(nodes, self.tree, key, self.tails.get(key).cloned()).await
+        tree::get(nodes, self.tree, key, self.tail.get(key).cloned()).await
     }
 
     pub fn scan(self, nodes: Arc<Nodes>, range: KeyRange) -> DbIterator {
         DbIterator {
-            tails: MemCursor::new(self.tails, &range),
+            tail: MemCursor::new(self.tail, &range),
             tree: TreeIter::new(nodes, self.tree, range),
             tree_head: None,
         }
@@ -37,9 +36,9 @@ impl Snapshot {
 
 /// Ordered iterator over live key/value pairs in a range.
 pub struct DbIterator {
-    tails: MemCursor,
+    tail: MemCursor,
     tree: TreeIter,
-    /// The tree's next entry, read ahead to compare with the tails'.
+    /// The tree's next entry, read ahead to compare with the tail's.
     tree_head: Option<(Bytes, Version)>,
 }
 
@@ -51,17 +50,17 @@ impl DbIterator {
             if self.tree_head.is_none() {
                 self.tree_head = self.tree.next().await?;
             }
-            let order = match (self.tails.peek(), self.tree_head.as_ref()) {
+            let order = match (self.tail.peek(), self.tree_head.as_ref()) {
                 (None, None) => return Ok(None),
                 (Some(_), None) => Ordering::Less,
                 (None, Some(_)) => Ordering::Greater,
                 (Some((a, _)), Some((b, _))) => a.cmp(b),
             };
             let (key, version) = match order {
-                Ordering::Less => self.tails.pop(),
+                Ordering::Less => self.tail.pop(),
                 Ordering::Greater => self.tree_head.take(),
                 Ordering::Equal => {
-                    let (k, a) = self.tails.pop().expect("peeked");
+                    let (k, a) = self.tail.pop().expect("peeked");
                     let (_, b) = self.tree_head.take().expect("peeked");
                     Some((k, if b.ts > a.ts { b } else { a }))
                 }

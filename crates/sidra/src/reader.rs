@@ -1,27 +1,41 @@
-//! Read-only handle: the latest published tree plus every writer's unapplied
-//! log tail, refreshed periodically. Must refresh more often than the GC
-//! retention, or segments of its tree version may be deleted under it.
+//! Read-only handle: the latest published tree plus the log past it,
+//! refreshed periodically. Must refresh more often than the GC retention, or
+//! segments of its tree version may be deleted under it.
 
 use std::ops::RangeBounds;
 use std::sync::Arc;
-// tokio's, so simulations with paused time control it.
-use tokio::time::Instant;
 
 use bytes::Bytes;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use tokio::task::JoinHandle;
 
-use crate::db::{Clock, Freshness, ReadOptions, SystemClock};
+use crate::db::{Clock, SystemClock};
 use crate::error::Result;
-use crate::follow::{Follower, Scope};
+use crate::follow::Follower;
 use crate::location;
-use crate::logs::{Logs, Region, RegionStores};
 use crate::nodes::Nodes;
 use crate::settings::ReaderSettings;
 use crate::snapshot::DbIterator;
 use crate::store::Store;
 use crate::types::{KeyRange, ManifestId};
+
+/// How current a read must be.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Freshness {
+    /// What this reader has seen: the writer's writes within a refresh
+    /// interval.
+    #[default]
+    Local,
+    /// First pull the newest manifest and the log past it (a few GETs), so
+    /// the read sees every write acknowledged before it started.
+    Latest,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadOptions {
+    pub freshness: Freshness,
+}
 
 struct Shared {
     nodes: Arc<Nodes>,
@@ -34,25 +48,12 @@ pub struct DbReaderBuilder {
     store: Arc<dyn ObjectStore>,
     path: Path,
     settings: ReaderSettings,
-    regions: RegionStores,
     origin: Option<(Arc<dyn ObjectStore>, Path)>,
 }
 
 impl DbReaderBuilder {
     pub fn with_settings(mut self, settings: ReaderSettings) -> Self {
         self.settings = settings;
-        self
-    }
-
-    /// Adds a store holding writers' logs, overriding a URL for the same
-    /// region in settings.
-    pub fn with_region(
-        mut self,
-        region: Region,
-        store: Arc<dyn ObjectStore>,
-        path: impl Into<Path>,
-    ) -> Self {
-        self.regions.insert(region, store, path.into());
         self
     }
 
@@ -65,14 +66,12 @@ impl DbReaderBuilder {
     }
 
     pub async fn build(self) -> Result<DbReader> {
-        let mut regions = RegionStores::from_urls(&self.settings.regions)?;
-        regions.extend(self.regions);
         let origin = match (self.origin, &self.settings.origin) {
             (Some(o), _) => Some(o),
             (None, Some(url)) => Some(location::parse(url)?),
             (None, None) => None,
         };
-        DbReader::start(self.store, self.path, self.settings, regions, origin).await
+        DbReader::start(self.store, self.path, self.settings, origin).await
     }
 }
 
@@ -97,7 +96,6 @@ impl DbReader {
             store,
             path: path.into(),
             settings: ReaderSettings::default(),
-            regions: RegionStores::default(),
             origin: None,
         }
     }
@@ -106,11 +104,9 @@ impl DbReader {
         os: Arc<dyn ObjectStore>,
         path: Path,
         cfg: ReaderSettings,
-        regions: RegionStores,
         origin: Option<(Arc<dyn ObjectStore>, Path)>,
     ) -> Result<Self> {
         let home = Store::new(os, path, cfg.hedge);
-        let logs = Arc::new(Logs::new(home.clone(), regions));
         let nodes = Arc::new(match origin {
             Some((os, path)) => {
                 let origin = home.sibling(os, path);
@@ -118,31 +114,19 @@ impl DbReader {
             }
             None => Nodes::new(home, cfg.cache),
         });
-        let follower = Follower::open(nodes.clone(), logs, cfg.warm, cfg.rewarm, None).await?;
+        let follower = Follower::open(nodes.clone(), cfg.warm, cfg.rewarm).await?;
         let shared = Arc::new(Shared {
             nodes,
             follower,
             clock: Arc::new(SystemClock),
         });
-        shared
-            .follower
-            .refresh(true, Scope::AllWriters, shared.clock.now_ms())
-            .await?;
+        shared.follower.refresh(shared.clock.now_ms()).await?;
         let task = cfg.refresh_interval.map(|every| {
             let shared = shared.clone();
             tokio::spawn(async move {
-                let mut last_discovery = Instant::now();
                 loop {
                     tokio::time::sleep(every).await;
-                    let discover = last_discovery.elapsed() >= cfg.discovery_interval;
-                    if discover {
-                        last_discovery = Instant::now();
-                    }
-                    if let Err(e) = shared
-                        .follower
-                        .refresh(discover, Scope::AllWriters, shared.clock.now_ms())
-                        .await
-                    {
+                    if let Err(e) = shared.follower.refresh(shared.clock.now_ms()).await {
                         tracing::warn!(%e, "reader refresh failed");
                     }
                 }
@@ -151,13 +135,13 @@ impl DbReader {
         Ok(Self { shared, task })
     }
 
-    /// Pulls every writer's durable entries and the newest manifest now.
+    /// Pulls the newest manifest and the log past it now.
     pub async fn refresh(&self) -> Result<()> {
         self.shared
             .follower
-            .refresh(true, Scope::AllWriters, self.shared.clock.now_ms())
-            .await?
-            .complete()
+            .refresh(self.shared.clock.now_ms())
+            .await
+            .map(drop)
     }
 
     pub fn manifest_id(&self) -> ManifestId {

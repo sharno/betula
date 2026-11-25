@@ -19,13 +19,12 @@ use bytes::{Bytes, BytesMut};
 
 use crate::codec;
 use crate::error::{Error, Result};
-use crate::hlc::Ts;
+use crate::hlc::{self, Ts};
 use crate::node::{
     Child, Internal, Leaf, Node, Run, RunRef, apply_to_leaf, buffer_purge_at, chunk_by_bytes,
     group_starts, merge_versions, msgs_bytes,
 };
 use crate::nodes::{Nodes, Segment};
-use crate::protocol::tombstones;
 use crate::types::{KeyRange, Msg, NodePtr, SegmentId, TreeRoot, Version, entry_bytes};
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -41,15 +40,16 @@ pub struct TreeConfig {
     /// A child with more buffered runs than this is flushed, which bounds
     /// the runs a read checks per level.
     pub max_runs_per_child: usize,
-    /// A subtree is rewritten just to drop its tombstones only once they've
-    /// been droppable this long (by timestamp). Younger ones go whenever
-    /// their leaf is rewritten anyway; purging them at once would rewrite
-    /// every leaf a delete reached a second time, a checkpoint later.
+    /// A buffer holding tombstones is flushed down just to drop them only
+    /// once they're this old (by timestamp). Younger ones go whenever their
+    /// buffer flushes anyway; purging them at once would rewrite every leaf
+    /// a delete reached a second time, a checkpoint later.
     #[serde(with = "humantime_serde")]
     pub purge_tombstones_after: std::time::Duration,
     /// Encoded bytes a checkpoint may load and write for purges before it
-    /// starts no more; later checkpoints carry on. Bounds the applier's time after a
-    /// mass delete, which could otherwise rewrite much of the tree at once.
+    /// starts no more; later checkpoints carry on. Bounds a checkpoint's time
+    /// after a mass delete, which could otherwise rewrite much of the tree at
+    /// once.
     pub purge_bytes_per_checkpoint: usize,
 }
 
@@ -97,9 +97,8 @@ fn beats(best: &Option<Version>, bound: Option<Ts>) -> bool {
 }
 
 /// The newest version of `key` in the tree, given the newest found so far
-/// above it (`best`). A late write from a slow writer can sit above a newer
-/// version, so the walk continues down until `best` beats the newest version
-/// of the subtree below, which child pointers record.
+/// above it (`best`). The walk stops once `best` beats the newest version of
+/// the subtree below, which child pointers record.
 pub async fn get(
     nodes: &Nodes,
     root: Option<TreeRoot>,
@@ -584,15 +583,29 @@ pub struct WriteStats {
 /// Applies sorted, key-unique `msgs` to the tree at `root`, writing new nodes
 /// into `out`. Live nodes and runs in `victims` segments are rewritten
 /// too, so those segments can be deleted once nothing else references them.
-/// How one checkpoint writes: where to, what to relocate, which tombstones
-/// may go, and how to encode.
+/// How one checkpoint writes: where to, what to relocate, when it runs, and
+/// how to encode.
 pub struct Checkpoint<'a> {
     pub out: Outputs,
     /// Segments whose live nodes and runs are copied out.
     pub victims: &'a BTreeSet<SegmentId>,
-    /// Tombstones older than this are dropped when their leaf is rewritten.
-    pub drop_tombstones_below: Ts,
+    /// Above every version in the tree and the messages. Tombstones reaching
+    /// a leaf go (nothing older can arrive later), and buffered ones older
+    /// than `purge_tombstones_after` before it are purged.
+    pub now: Ts,
     pub compression: codec::Compression,
+}
+
+/// Buffers holding tombstones with versions below this get flushed down to
+/// drop them.
+pub fn purge_below(now: Ts, purge_after: std::time::Duration) -> Ts {
+    Ts(now.0.saturating_sub(hlc::span(purge_after)))
+}
+
+/// Whether a tree whose summary says `purge_at` has tombstones to purge at
+/// `now`.
+pub fn purge_due(purge_at: Option<Ts>, now: Ts, purge_after: std::time::Duration) -> bool {
+    purge_at.is_some_and(|t| t < purge_below(now, purge_after))
 }
 
 pub async fn apply(
@@ -605,7 +618,7 @@ pub async fn apply(
     let Checkpoint {
         out,
         victims,
-        drop_tombstones_below,
+        now,
         compression,
     } = ck;
     let mut w = Writer {
@@ -613,8 +626,7 @@ pub async fn apply(
         cfg,
         compression,
         victims,
-        drop_below: drop_tombstones_below,
-        purge_below: tombstones::purge_below(drop_tombstones_below, cfg.purge_tombstones_after),
+        purge_below: purge_below(now, cfg.purge_tombstones_after),
         dirty: HashSet::new(),
         inner: Region::new(out.inner),
         leaves: Region::new(out.leaves),
@@ -644,9 +656,7 @@ struct Writer<'a> {
     cfg: &'a TreeConfig,
     compression: codec::Compression,
     victims: &'a BTreeSet<SegmentId>,
-    /// Tombstones older than this are dropped when their leaf is rewritten.
-    drop_below: Ts,
-    /// Subtrees whose oldest tombstone is below this get rewritten to drop it.
+    /// Buffers holding tombstones with versions below this get flushed down.
     purge_below: Ts,
     /// Internal nodes with a victim node or run at or below them.
     dirty: HashSet<NodePtr>,
@@ -761,7 +771,7 @@ impl Writer<'_> {
     ) -> Result<Option<TreeRoot>> {
         let (mut level, mut height) = match root {
             None => {
-                let entries = apply_to_leaf(Vec::new(), msgs, self.drop_below);
+                let entries = apply_to_leaf(Vec::new(), msgs);
                 (self.write_leaves(entries), 0)
             }
             Some(r)
@@ -814,7 +824,7 @@ impl Writer<'_> {
     }
 
     /// Rewrites the node at `ptr` with `msgs` applied, moving any victim
-    /// nodes below it and dropping tombstones that became droppable.
+    /// nodes below it and dropping tombstones that reach leaves.
     fn rewrite(&mut self, ptr: NodePtr, msgs: Vec<(Bytes, Version)>) -> BoxFut<'_, Rewrite> {
         Box::pin(async move {
             debug_assert!(!self.is_ours(ptr), "rewrite of a node from this checkpoint");
@@ -827,11 +837,7 @@ impl Writer<'_> {
                     self.stats.leaves_rewritten += 1;
                     self.stats.leaf_msgs += msgs.len() as u64;
                     self.stats.leaves_moved += u64::from(msgs.is_empty());
-                    Ok(self.write_leaves(apply_to_leaf(
-                        leaf.entries.clone(),
-                        msgs,
-                        self.drop_below,
-                    )))
+                    Ok(self.write_leaves(apply_to_leaf(leaf.entries.clone(), msgs)))
                 }
                 Node::Internal(old) => {
                     let mut node = old.as_ref().clone();
@@ -850,8 +856,7 @@ impl Writer<'_> {
                     // past them. Their runs and new messages come along: every
                     // rewrite carries the buffered versions above a child down
                     // into it, so a rewritten leaf has no older version of its
-                    // keys above it, and a tombstone there can go once no
-                    // writer can still produce an older version. Runs that
+                    // keys above it, and a tombstone reaching it goes. Runs that
                     // merely sit in a victim segment are copied in place.
                     let mut i = 0;
                     while i < node.children.len() {

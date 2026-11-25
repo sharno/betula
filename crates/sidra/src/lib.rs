@@ -1,10 +1,10 @@
 //! sidra: a copy-on-write Bε-tree key-value store on object storage, with
-//! any number of concurrent writers.
+//! one writer and any number of readers.
 //!
 //! ```
 //! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> sidra::Result<()> {
-//! use sidra::{Db, ReadOptions, Freshness, WriteBatch};
+//! use sidra::{Db, WriteBatch};
 //!
 //! // `s3://bucket/path`, `gs://…`, `az://…`, `file:///…` or `memory:///`.
 //! // Credentials come from the usual AWS_* / GOOGLE_* / AZURE_* variables,
@@ -18,10 +18,6 @@
 //!
 //! assert_eq!(db.get("user:1").await?.as_deref(), Some(&b"ada"[..]));
 //!
-//! // See writes other processes acknowledged before this read.
-//! let latest = ReadOptions { freshness: Freshness::Latest };
-//! let _ = db.get_with("user:1", latest).await?;
-//!
 //! let users = db.scan("user:".."user;").collect().await?;
 //! assert_eq!(users.len(), 2);
 //! db.close().await?;
@@ -30,15 +26,13 @@
 //! ```
 //!
 //! How it works:
-//! - Each writer appends timestamped writes (hybrid logical clock) to its own
-//!   log on object storage. Writers never coordinate, and a write is
-//!   acknowledged once its log object is durable.
-//! - One process at a time holds the applier role. It folds every writer's
-//!   log into the tree in batches, writing changed nodes copy-on-write into
-//!   segment objects, and publishes a new manifest with put-if-absent. Any
-//!   writer takes the role over if entries go unapplied.
-//! - Versions merge newest-wins, so the order of application doesn't matter.
-//!   Values are per-key last-writer-wins.
+//! - One writer at a time. It appends timestamped writes to a log on object
+//!   storage and acknowledges a write once its log object is durable.
+//!   Opening a writer fences the previous one.
+//! - The writer folds the log into the tree in checkpoints, writing changed
+//!   nodes copy-on-write into segment objects, and publishes a new manifest
+//!   with put-if-absent.
+//! - Readers ([`DbReader`]) follow the manifest and the log past it.
 //! - Internal nodes buffer messages per child as append-only runs (the Bε
 //!   part). They are cached and loaded on open, so a cold point read costs
 //!   one GET.
@@ -52,7 +46,6 @@ mod gc;
 mod hedge;
 mod hlc;
 mod location;
-mod logs;
 mod manifest;
 mod memtable;
 mod node;
@@ -73,27 +66,22 @@ mod tree;
 mod types;
 mod wal;
 
-pub use admin::{Admin, ManifestInfo, WriterInfo};
+pub use admin::{Admin, LogInfo, ManifestInfo};
 pub use codec::Compression;
 pub use db::{
-    Audit, Clock, Db, DbBuilder, Durability, Freshness, Metrics, ReadOptions, SystemClock,
-    WriteBatch, WriteOptions,
+    Audit, Clock, Db, DbBuilder, Durability, Metrics, SystemClock, WriteBatch, WriteOptions,
 };
 pub use error::{Error, ErrorKind, Result};
 pub use gc::{GcConfig, GcStats};
 pub use hedge::{Fraction, Hedge, HedgeConfig};
-pub use hlc::{Ts, WriterId};
+pub use hlc::Ts;
 pub use location::parse as parse_url;
-pub use logs::{LogHome, Region};
 pub use nodes::{CacheConfig, CacheStats, Warm};
 pub use object_store;
-pub use reader::{DbReader, DbReaderBuilder};
+pub use reader::{DbReader, DbReaderBuilder, Freshness, ReadOptions};
 pub use segments::{CleanerConfig, SegmentKind, SegmentTable, SegmentUsage};
-pub use settings::{
-    ApplierRole, CheckpointConfig, Follow, Gc, LeaseConfig, PollConfig, ReaderSettings, Settings,
-    WalConfig,
-};
+pub use settings::{CheckpointConfig, Gc, ReaderSettings, Settings, WalConfig};
 pub use snapshot::DbIterator;
 pub use store::RequestStats;
 pub use tree::{TreeConfig, TreeShape};
-pub use types::{Epoch, KeyRange, ManifestId, NodePtr, SegmentId, TreeRoot};
+pub use types::{Epoch, KeyRange, ManifestId, NodePtr, SegmentId, TreeRoot, WalSeq};

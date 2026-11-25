@@ -32,15 +32,15 @@ pub struct Counters {
 }
 
 /// Object kinds by path, for write-amplification breakdowns.
-pub const KINDS: usize = 5;
-pub const KIND_NAMES: [&str; KINDS] = ["log", "segment", "manifest", "lease", "other"];
+pub const KINDS: usize = 4;
+pub const KIND_NAMES: [&str; KINDS] = ["log", "segment", "manifest", "other"];
 
 fn kind_of(path: &Path) -> usize {
     let p = path.as_ref();
-    [("/wal/", 0), ("/seg/", 1), ("/manifest/", 2), ("/lease", 3)]
+    [("/wal/", 0), ("/seg/", 1), ("/manifest/", 2)]
         .iter()
         .find(|(pat, _)| p.contains(pat))
-        .map_or(4, |(_, k)| *k)
+        .map_or(3, |(_, k)| *k)
 }
 
 #[derive(Clone, Copy, Debug, Default)]

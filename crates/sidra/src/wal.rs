@@ -1,36 +1,25 @@
-//! Per-writer logs and leases.
+//! The write-ahead log: one object per slot, `wal/{seq}`, written with
+//! put-if-absent at consecutive slots. A writer never skips one, so the log
+//! has no gaps.
 //!
-//! Each writer appends to its own log, `wal/{id}/{seq}`, so writers never
-//! coordinate. Log objects are put-if-absent at consecutive sequence numbers,
-//! and a writer never skips one. So a seal record put at a writer's next
-//! sequence number ends its log for good: no batch can land at or after it,
-//! and the writer's own put there fails. The applier seals a writer it
-//! presumes dead before it stops counting it in the tombstone floor; a
-//! closing writer seals its own log. Seals are never deleted, so a sealed
-//! writer id can't write again however late its requests arrive.
-//!
-//! A writer's lease, `writers/{id}/lease`, says it is alive and gives a floor
-//! under every timestamp it may still write. Expiry is only a hint for when
-//! to seal; safety never depends on clocks.
-//!
-//! Leases always live in the home store; a log may live in a regional store
-//! (see `logs`).
+//! A new writer fences the previous one by putting a fence record in the
+//! first empty slot. The previous writer's next put lands on that slot,
+//! finds it taken, and stops; nothing it writes later can be acknowledged.
+//! GC keeps every fence (see `Manifest::fences`).
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::codec;
 use crate::error::Result;
-use crate::hlc::WriterId;
-use crate::logs::LogHome;
-use crate::settings::Candidacy;
 use crate::store::{CreateOutcome, Store};
-use crate::types::Version;
+use crate::types::{Epoch, Version, WalSeq};
 
-/// Ops in write order. Each op carries its own timestamp.
+/// Ops in write order, each with its own timestamp.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WalBatch {
-    pub writer: WriterId,
+    /// The writer generation that wrote it.
+    pub epoch: Epoch,
     pub ops: Vec<(Bytes, Version)>,
 }
 
@@ -38,107 +27,72 @@ pub struct WalBatch {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WalRecord {
     Batch(WalBatch),
-    /// The end of the log: nothing exists or can be written after it.
-    Seal,
+    /// Writer generation `0` took over here: writers before it can't write
+    /// at or after this slot.
+    Fence(Epoch),
 }
 
-/// Encodes like `WalRecord` without cloning the batch.
+/// Encodes like `WalRecord::Batch` (the first variant, so the same tag)
+/// without cloning the batch.
 #[derive(Serialize)]
 enum RecordRef<'a> {
     Batch(&'a WalBatch),
-    Seal,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum WalWrite {
     Written,
-    /// The log was sealed at this sequence number.
-    Sealed,
-    /// Another process is using this writer id.
-    Taken,
+    /// Something else holds the slot: a newer writer fenced this one.
+    Fenced,
 }
 
-fn decode(store: &Store, writer: WriterId, seq: u64, data: &[u8]) -> Result<WalRecord> {
-    codec::decode(codec::WAL, store.wal_path(writer, seq).as_ref(), data)
+fn decode(store: &Store, seq: WalSeq, data: &[u8]) -> Result<WalRecord> {
+    codec::decode(codec::WAL, store.wal_path(seq).as_ref(), data)
 }
 
 pub async fn write(
     store: &Store,
-    seq: u64,
+    seq: WalSeq,
     batch: &WalBatch,
     compression: codec::Compression,
 ) -> Result<WalWrite> {
     let data = codec::encode(codec::WAL, &RecordRef::Batch(batch), compression);
-    match store
-        .put_create(&store.wal_path(batch.writer, seq), data.clone())
-        .await?
-    {
+    match store.put_create(&store.wal_path(seq), data.clone()).await? {
         CreateOutcome::Created => Ok(WalWrite::Written),
+        // Our own earlier attempt whose response was lost.
         CreateOutcome::Exists(existing) if existing == data => Ok(WalWrite::Written),
-        CreateOutcome::Exists(existing) => match decode(store, batch.writer, seq, &existing)? {
-            WalRecord::Seal => Ok(WalWrite::Sealed),
-            WalRecord::Batch(_) => Ok(WalWrite::Taken),
-        },
+        CreateOutcome::Exists(_) => Ok(WalWrite::Fenced),
     }
 }
 
-/// What a seal attempt at one sequence number found.
+/// What a fence attempt at one slot found.
 #[derive(Debug, PartialEq, Eq)]
-pub enum SealAt {
-    /// The seal is in place (ours, or someone else's).
-    Sealed,
-    /// A batch got there first; the log goes on after it.
-    Batch(WalBatch),
+pub enum FenceAt {
+    /// Our fence is in place.
+    Placed,
+    /// Something got there first.
+    Taken(WalRecord),
 }
 
-/// Puts a seal at `seq` unless something is there already.
-pub async fn seal(store: &Store, writer: WriterId, seq: u64) -> Result<SealAt> {
-    let data = codec::encode(codec::WAL, &RecordRef::Seal, codec::Compression::None);
-    match store.put_create(&store.wal_path(writer, seq), data).await? {
-        CreateOutcome::Created => Ok(SealAt::Sealed),
-        CreateOutcome::Exists(existing) => match decode(store, writer, seq, &existing)? {
-            WalRecord::Seal => Ok(SealAt::Sealed),
-            WalRecord::Batch(b) => Ok(SealAt::Batch(b)),
-        },
+/// Puts a fence for `epoch` at `seq` unless something is there already.
+pub async fn fence(store: &Store, seq: WalSeq, epoch: Epoch) -> Result<FenceAt> {
+    let data = codec::encode(
+        codec::WAL,
+        &WalRecord::Fence(epoch),
+        codec::Compression::None,
+    );
+    match store.put_create(&store.wal_path(seq), data.clone()).await? {
+        CreateOutcome::Created => Ok(FenceAt::Placed),
+        CreateOutcome::Exists(existing) if existing == data => Ok(FenceAt::Placed),
+        CreateOutcome::Exists(existing) => Ok(FenceAt::Taken(decode(store, seq, &existing)?)),
     }
 }
 
-pub async fn read(store: &Store, writer: WriterId, seq: u64) -> Result<Option<WalRecord>> {
+pub async fn read(store: &Store, seq: WalSeq) -> Result<Option<WalRecord>> {
     store
-        .get(&store.wal_path(writer, seq))
+        .get(&store.wal_path(seq))
         .await?
-        .map(|data| decode(store, writer, seq, &data))
-        .transpose()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Lease {
-    pub writer: WriterId,
-    /// Where this writer's log lives. Fixed for the writer's lifetime.
-    pub log: LogHome,
-    /// A standby applier hands the role back while a primary is alive.
-    pub candidacy: Candidacy,
-    /// Every timestamp the writer has not yet made durable is at least this.
-    pub floor_hlc: u64,
-    /// Writer clock. Past it, the applier seals the writer's log.
-    pub expires_at_ms: u64,
-}
-
-pub async fn write_lease(store: &Store, lease: &Lease) -> Result<()> {
-    store
-        .put(
-            &store.lease_path(lease.writer),
-            codec::encode(codec::LEASE, lease, codec::Compression::None),
-        )
-        .await
-}
-
-pub async fn read_lease(store: &Store, writer: WriterId) -> Result<Option<Lease>> {
-    let path = store.lease_path(writer);
-    store
-        .get(&path)
-        .await?
-        .map(|data| codec::decode(codec::LEASE, path.as_ref(), &data))
+        .map(|data| decode(store, seq, &data))
         .transpose()
 }
 
@@ -151,26 +105,22 @@ mod tests {
     #[test]
     fn records_decode_as_encoded() {
         let batch = WalBatch {
-            writer: WriterId(7),
+            epoch: Epoch(3),
             ops: vec![(
                 Bytes::from_static(b"k"),
                 Version {
-                    ts: Ts {
-                        hlc: 1,
-                        writer: WriterId(7),
-                    },
+                    ts: Ts(1),
                     msg: Msg::Delete,
                 },
             )],
         };
-        let decode = |r: &RecordRef| {
-            let data = codec::encode(codec::WAL, r, codec::Compression::Lz4);
-            codec::decode::<WalRecord>(codec::WAL, "t", &data).unwrap()
-        };
+        let decode = |data: Bytes| codec::decode::<WalRecord>(codec::WAL, "t", &data).unwrap();
+        let lz4 = codec::Compression::Lz4;
         assert_eq!(
-            decode(&RecordRef::Batch(&batch)),
+            decode(codec::encode(codec::WAL, &RecordRef::Batch(&batch), lz4)),
             WalRecord::Batch(batch.clone())
         );
-        assert_eq!(decode(&RecordRef::Seal), WalRecord::Seal);
+        let fence = WalRecord::Fence(Epoch(4));
+        assert_eq!(decode(codec::encode(codec::WAL, &fence, lz4)), fence);
     }
 }

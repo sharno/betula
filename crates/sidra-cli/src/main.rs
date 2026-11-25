@@ -2,10 +2,10 @@
 //!
 //! ```sh
 //! sidra info s3://bucket/db
-//! sidra writers s3://bucket/db
+//! sidra log s3://bucket/db
 //! sidra get s3://bucket/db user:1
 //! sidra scan s3://bucket/db --prefix user: --limit 20
-//! sidra put s3://bucket/db user:1 ada
+//! sidra put s3://bucket/db user:1 ada --take-over
 //! sidra gc s3://bucket/db --retention 10m
 //! ```
 //!
@@ -34,11 +34,11 @@ struct Cli {
 enum Cmd {
     /// Current manifest, tree and space usage.
     Info { url: String },
-    /// Writers, their leases, and their unapplied log objects.
-    Writers { url: String },
+    /// Log objects: stored, unapplied, and fences.
+    Log { url: String },
     /// Walks the whole tree (reads every node) and prints its shape.
     Shape { url: String },
-    /// Prints a value (with every writer's latest acknowledged writes).
+    /// Prints a value, the writer's latest acknowledged writes included.
     Get { url: String, key: String },
     /// Prints pairs in key order.
     Scan {
@@ -57,15 +57,31 @@ enum Cmd {
         url: String,
         key: String,
         value: String,
+        #[command(flatten)]
+        take_over: TakeOver,
     },
     /// Deletes a key through a short-lived writer.
-    Delete { url: String, key: String },
+    Delete {
+        url: String,
+        key: String,
+        #[command(flatten)]
+        take_over: TakeOver,
+    },
     /// Deletes data no reader within the retention can need.
     Gc {
         url: String,
         #[arg(long, default_value = "10m", value_parser = humantime::parse_duration)]
         retention: Duration,
     },
+}
+
+/// Opening a writer fences the running one, so edits must say so.
+#[derive(clap::Args)]
+struct TakeOver {
+    /// Fence the database's current writer (it fails from its next write
+    /// or checkpoint on, until reopened).
+    #[arg(long, required = true)]
+    take_over: bool,
 }
 
 fn ago(ms: u64) -> String {
@@ -97,9 +113,7 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// A writer for one-off edits. It takes the applier role only where there
-/// is none (or it stalled), so its edits get applied without disturbing a
-/// healthy deployment.
+/// A writer for one-off edits. It fences the current writer.
 async fn edit_writer(url: &str) -> Result<Db> {
     let (store, path) = sidra::parse_url(url)?;
     let settings = Settings {
@@ -126,10 +140,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             };
             println!("manifest        {} ({})", m.id.0, ago(m.created_at_ms));
-            let applier = m
-                .applier
-                .map_or("none (released)".into(), |w| w.to_string());
-            println!("applier         {applier} (epoch {})", m.applier_epoch.0);
+            println!("writer epoch    {}", m.writer_epoch.0);
             match m.tree {
                 Some(t) => println!("tree            height {}", t.height),
                 None => println!("tree            empty"),
@@ -140,34 +151,13 @@ async fn main() -> Result<()> {
                 m.segments,
                 mib(m.segment_bytes)
             );
-            println!("writers applied {}", m.applied.len());
+            println!("log applied     {}", m.wal_applied);
         }
-        Cmd::Writers { url } => {
-            let writers = Admin::open(&url)?.writers().await?;
-            println!(
-                "{:<18} {:<6} {:<10} {:>6} {:>10}  lease",
-                "writer", "live", "log in", "logs", "unapplied"
-            );
-            for w in writers {
-                let lease = match (w.sealed, w.lease_expires_at_ms) {
-                    (true, _) => "sealed".into(),
-                    (false, None) => "none".into(),
-                    (false, Some(_)) if w.live => "valid".into(),
-                    (false, Some(t)) => format!("expired {}", ago(t)),
-                };
-                let at = match &w.log {
-                    Some(sidra::LogHome::Region(r)) => r.to_string(),
-                    Some(sidra::LogHome::Home) | None => "home".into(),
-                };
-                println!(
-                    "{:<18} {:<6} {:<10} {:>6} {:>10}  {lease}",
-                    w.id.to_string(),
-                    w.live,
-                    at,
-                    w.log_objects,
-                    w.unapplied
-                );
-            }
+        Cmd::Log { url } => {
+            let l = Admin::open(&url)?.log().await?;
+            println!("objects         {}", l.objects);
+            println!("unapplied       {}", l.unapplied);
+            println!("fences          {}", l.fences);
         }
         Cmd::Shape { url } => {
             let s = Admin::open(&url)?.tree_shape().await?;
@@ -215,12 +205,14 @@ async fn main() -> Result<()> {
                 n += 1;
             }
         }
-        Cmd::Put { url, key, value } => {
+        Cmd::Put {
+            url, key, value, ..
+        } => {
             let db = edit_writer(&url).await?;
             db.put(&key, &value).await?;
             db.close().await?;
         }
-        Cmd::Delete { url, key } => {
+        Cmd::Delete { url, key, .. } => {
             let db = edit_writer(&url).await?;
             db.delete(&key).await?;
             db.close().await?;
@@ -228,8 +220,8 @@ async fn main() -> Result<()> {
         Cmd::Gc { url, retention } => {
             let s = Admin::open(&url)?.gc(retention).await?;
             println!(
-                "deleted {} manifests, {} segments, {} log objects, {} writers",
-                s.manifests, s.segments, s.wals, s.writers
+                "deleted {} manifests, {} segments, {} log objects",
+                s.manifests, s.segments, s.wals
             );
         }
     }

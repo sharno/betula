@@ -101,16 +101,6 @@ struct Args {
     inner_cache_mib: u64,
     #[arg(long, default_value_t = 384)]
     leaf_cache_mib: u64,
-    /// Concurrent sidra writers on the database (clients are spread across
-    /// them). SlateDB allows one.
-    #[arg(long, default_value_t = 1)]
-    writers: usize,
-    /// How often sidra writers poll for each other's entries.
-    #[arg(long, default_value_t = 100)]
-    poll_ms: u64,
-    /// Cross-writer visibility samples (sidra, 2+ writers).
-    #[arg(long, default_value_t = 100)]
-    visibility_samples: u64,
     /// Seconds of mixed reads and writes after the other phases (0: skip).
     /// Shows how each engine behaves while background work (compaction,
     /// checkpoints, cleaning) runs alongside traffic.
@@ -118,7 +108,7 @@ struct Args {
     mixed_secs: u64,
     /// Seconds of write-only overload after the update phase (0: skip):
     /// `--ingest-concurrency` clients overwrite random keys in batches of
-    /// `--batch` as fast as they're acked. Finds sidra's applier ceiling and
+    /// `--batch` as fast as they're acked. Finds sidra's checkpoint ceiling and
     /// shows how writers stall beyond it; prints acked and applied MiB/s
     /// and the backlog each second, then times the drain.
     #[arg(long, default_value_t = 0)]
@@ -335,7 +325,7 @@ async fn write_phase(
                 .map(|i| wl.load_order(i + offset))
                 .map(|id| (wl.key(id), wl.value(id, version)))
                 .collect();
-            db.write(b, pairs).await
+            db.write(pairs).await
         }
     })
     .await
@@ -382,7 +372,7 @@ where
             async move {
                 let lo = (b * batch) as usize;
                 let hi = (lo + batch as usize).min(ids.len());
-                db.delete(b, ids[lo..hi].iter().map(|id| wl.key(*id)).collect())
+                db.delete(ids[lo..hi].iter().map(|id| wl.key(*id)).collect())
                     .await
             }
         })
@@ -504,7 +494,7 @@ async fn mixed_phase(
                             .map(|j| wl.random_id(11, i * batch + j))
                             .map(|id| (wl.key(id), wl.value(id, 2 + i % 7)))
                             .collect();
-                        db.write(i, pairs).await?;
+                        db.write(pairs).await?;
                         let us = t.elapsed().as_micros() as u64;
                         writes.record(us)?;
                         timeline[w].1.record(us)?;
@@ -584,7 +574,7 @@ async fn ingest_phase(
                         .map(|id| (wl.key(id), wl.value(id, 2 + i % 7)))
                         .collect();
                     let t = Instant::now();
-                    db.write(i, pairs).await?;
+                    db.write(pairs).await?;
                     hist.record(t.elapsed().as_micros() as u64)?;
                     acked.fetch_add(batch, Ordering::Relaxed);
                 }
@@ -744,7 +734,6 @@ async fn bench_engine(
         clean_below_live: args.clean_below,
         clean_inner_below_live: args.clean_inner_below,
         gc: (!args.no_gc).then_some(args.gc_deletes_per_sec),
-        poll: Duration::from_millis(args.poll_ms),
         max_runs: args.max_runs,
         purge_after: Duration::from_secs(args.purge_secs),
         compression: args.compression,
@@ -763,10 +752,6 @@ async fn bench_engine(
             .with_cache_blocks(true)
             .with_read_ahead_bytes(args.slatedb_read_ahead_kib << 10)
             .with_max_fetch_tasks(args.slatedb_fetch_tasks),
-    };
-    let writers = match kind {
-        EngineKind::Sidra => args.writers,
-        EngineKind::Slatedb => 1,
     };
     let c = args.concurrency;
     let mut phases = Vec::new();
@@ -797,7 +782,7 @@ async fn bench_engine(
         io_mark = now;
     };
 
-    let db = Arc::new(Engine::open(kind, os.clone(), &path, &params, writers).await?);
+    let db = Arc::new(Engine::open(kind, os.clone(), &path, &params).await?);
 
     let (elapsed, hist) = write_phase(db.clone(), wl.clone(), wl.keys, args.batch, c, 0, 0).await?;
     record("load", wl.keys, elapsed, hist, &mut phases);
@@ -810,24 +795,6 @@ async fn bench_engine(
         wl.keys,
         db.describe()
     );
-
-    if writers >= 2 && args.visibility_samples > 0 {
-        let started = Instant::now();
-        let mut hist = Histogram::<u64>::new(3)?;
-        for i in 0..args.visibility_samples {
-            let key = Bytes::from(format!("vis{i:08}"));
-            if let Some(lag) = db.visibility_lag(key, wl.value(i, 9)).await? {
-                hist.record(lag.as_micros() as u64)?;
-            }
-        }
-        record(
-            "visibility",
-            args.visibility_samples,
-            started.elapsed(),
-            hist,
-            &mut phases,
-        );
-    }
 
     let read_phase = |seed: u64, db: Arc<Engine>, version: u64| {
         let wl = wl.clone();
@@ -873,7 +840,7 @@ async fn bench_engine(
         let db = Arc::try_unwrap(db).map_err(|_| anyhow::anyhow!("engine still shared"))?;
         let (elapsed, hist, ()) = timed(db.close()).await?;
         let (elapsed_open, hist_open, db) =
-            timed(Engine::open(kind, os.clone(), &path, &params, writers)).await?;
+            timed(Engine::open(kind, os.clone(), &path, &params)).await?;
         anyhow::Ok(((elapsed, hist), (elapsed_open, hist_open), Arc::new(db)))
     };
     let ((elapsed, hist), (elapsed_open, hist_open), db) = reopen(db).await?;
@@ -930,7 +897,7 @@ async fn bench_engine(
     let db = match args.delete_pct {
         0 => db,
         pct => {
-            let reopen = || Engine::open(kind, os.clone(), &path, &params, writers);
+            let reopen = || Engine::open(kind, os.clone(), &path, &params);
             delete_phases(
                 args,
                 kind,

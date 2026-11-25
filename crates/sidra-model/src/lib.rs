@@ -1,25 +1,26 @@
 //! A Stateright model of sidra's protocol that drives the crate's own state
-//! machines (`sidra::protocol`): writer logs, leases, the tombstone bound,
-//! log sealing, and the applier's checkpoint stages. One actor plays the
-//! object store; the others are processes with independent clocks.
+//! machines (`sidra::protocol`): opening a writer (claiming the manifest,
+//! fencing the log), the writer's log, partial checkpoints, and log GC. One
+//! actor plays the object store; the others are processes with independent
+//! clocks, each opening a writer that fences the one before.
 //!
 //! The data plane is abstract: a checkpoint's tree is one segment object
-//! holding the whole key -> version map.
+//! holding the whole key -> version map, and like a leaf it keeps no
+//! tombstones.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use serde::{Serialize, de::DeserializeOwned};
-use sidra::protocol::checkpoint::{self, Applied, Applying, Plan, Publishing, Scanned};
-use sidra::protocol::follower::{self, Reading, View};
-use sidra::protocol::log::{self, Gate, Inflight, LogWriter, PutOutcome};
-use sidra::protocol::tombstones::Pull;
-use sidra::protocol::{Candidacy, Lease, Manifest, Msg as Op, Version, WalBatch, WalRecord};
-use sidra::{
-    ApplierRole, CleanerConfig, Epoch, LogHome, ManifestId, NodePtr, SegmentId, TreeRoot, Ts,
-    WriterId,
-};
+use sidra::protocol::checkpoint::{self, Applied, Work};
+use sidra::protocol::fence::{self, AfterPlace, AfterRead, Fenced};
+use sidra::protocol::gc::deletable_wals;
+use sidra::protocol::log::{self, Gate, LogWriter, PutOutcome};
+use sidra::protocol::tail::Tail;
+use sidra::protocol::{FenceAt, Manifest, Msg as Op, Version, WalBatch, WalRecord};
+use sidra::{CleanerConfig, Epoch, ManifestId, NodePtr, SegmentId, TreeRoot, Ts, WalSeq};
 use stateright::{Model, Property};
 
 // ---------------------------------------------------------------------------
@@ -32,21 +33,32 @@ pub enum Write {
     Delete(&'static str),
 }
 
+/// Which applied log slots GC deletes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogGc {
+    Off,
+    /// The protocol: applied slots, except fences.
+    KeepFences,
+    /// Every applied slot: the bug keeping fences fixes.
+    DeleteFences,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// One script per process; process 0 holds the applier role.
+    /// One script per process. Each process opens a writer (fencing any
+    /// open one), writes its script, and checkpoints.
     pub scripts: Vec<Vec<Write>>,
     /// Clock readings run from 1 to this.
     pub max_clock: u64,
-    pub lease_ttl: u64,
     /// Checkpoints stop after this manifest id.
     pub max_manifest: u64,
-    /// Writers move their clocks past the tombstone bound before writing
-    /// (the protocol). `false` reproduces the bug that rule fixes.
-    pub observe_bound: bool,
-    /// Writers renew their leases each clock tick. Off, leases run out and
-    /// the applier seals their logs, which also lets the floor rise.
-    pub renew_leases: bool,
+    /// A new writer fences the log before writing (the protocol). `false`
+    /// starts it writing at the first empty slot, unfenced.
+    pub place_fence: bool,
+    /// A new writer's clock observes the manifest's newest applied
+    /// timestamp (the protocol). `false` reproduces the bug that fixes.
+    pub observe_last_ts: bool,
+    pub gc: LogGc,
     /// Faults allowed per run: lost requests, lost responses, crashes.
     pub max_faults: u8,
 }
@@ -58,15 +70,8 @@ pub struct Config {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Path {
     Manifest(u64),
-    Lease(WriterId),
-    Log(WriterId, u64),
+    Log(WalSeq),
     Segment(SegmentId),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Listing {
-    Manifests,
-    Leases,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -74,7 +79,8 @@ pub enum Request {
     Get(Path),
     Put(Path, Vec<u8>),
     PutIfAbsent(Path, Vec<u8>),
-    List(Listing),
+    /// The newest manifest id (a LIST).
+    LatestManifest,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -83,7 +89,7 @@ pub enum Response {
     Done,
     Created,
     Exists(Vec<u8>),
-    Listed(Vec<Path>),
+    Latest(Option<u64>),
     /// The request failed after retries (whether it applied is unknown to
     /// the caller).
     Failed,
@@ -113,139 +119,109 @@ fn store_step(objects: &mut BTreeMap<Path, Vec<u8>>, req: Request) -> Response {
                 Response::Created
             }
         },
-        Request::List(Listing::Manifests) => Response::Listed(
+        Request::LatestManifest => Response::Latest(
             objects
                 .keys()
-                .filter(|p| matches!(p, Path::Manifest(_)))
-                .cloned()
-                .collect(),
-        ),
-        Request::List(Listing::Leases) => Response::Listed(
-            objects
-                .keys()
-                .filter(|p| matches!(p, Path::Lease(_)))
-                .cloned()
-                .collect(),
+                .filter_map(|p| match p {
+                    Path::Manifest(id) => Some(*id),
+                    _ => None,
+                })
+                .max(),
         ),
     }
+}
+
+fn manifest_id(objects: &BTreeMap<Path, Vec<u8>>) -> Option<(u64, Manifest)> {
+    objects
+        .iter()
+        .filter_map(|(p, b)| match p {
+            Path::Manifest(id) => Some((*id, decode::<Manifest>(b))),
+            _ => None,
+        })
+        .max_by_key(|(id, _)| *id)
 }
 
 // ---------------------------------------------------------------------------
 // Processes
 
-/// A process's writer: starting (lease, then the manifest's bound), or
-/// writing.
+/// Opening a writer, one store request at a time.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Phase {
-    NotStarted,
-    /// Lease put sent.
-    Leasing,
-    /// Listing manifests, then reading the newest, to observe its bound.
-    Observing,
-    Ready,
+enum Opening {
+    /// Listing manifests.
+    Listing,
+    /// Reading the newest (`None`: there is none yet).
+    Loading(Option<u64>),
+    /// Publishing the claimed manifest at this id.
+    Claiming(u64, Box<Manifest>),
+    Reading(Claimed, fence::Reading),
+    Placing(Claimed, fence::Placing),
+    /// Fenced; checking no newer writer claimed a manifest meanwhile.
+    Checking(Claimed, Fenced),
 }
 
-/// One checkpoint in progress, one request at a time.
+/// The manifest this writer published on opening.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Claimed {
+    id: ManifestId,
+    manifest: Arc<Manifest>,
+}
+
+/// One checkpoint in progress.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Stage {
     Idle,
-    ListingLeases,
-    GettingLeases {
-        pending: Vec<WriterId>,
-        got: Vec<Lease>,
-        present: BTreeSet<WriterId>,
-    },
-    Pulling {
-        scanned: ScannedBox,
-        queue: Vec<(WriterId, u64)>,
-        current: Option<(WriterId, Reading)>,
-    },
-    Sealing {
-        sealing: checkpoint::Sealing,
-        queue: Vec<WriterId>,
-        current: Option<(WriterId, follower::Sealing)>,
-    },
-    LoadingTree(Applying),
-    PuttingSegment {
-        applying: Applying,
-        seg: SegmentId,
-    },
-    Publishing(Publishing),
+    LoadingTree(Work),
+    PuttingSegment(Work, SegmentId),
+    Publishing(Work, Box<Manifest>),
 }
 
-/// `Scanned` boxed so `Stage` stays small.
-type ScannedBox = Box<Scanned>;
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct Applier {
+struct Writer {
     epoch: Epoch,
-    next_seq: u64,
-    view: View,
-    tracked: follower::Tracked,
+    log: LogWriter<usize>,
+    manifest_id: ManifestId,
+    manifest: Arc<Manifest>,
+    tail: Tail,
+    next_segment: u64,
     stage: Stage,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Phase {
+    NotStarted,
+    Opening(Opening),
+    Open(Box<Writer>),
+    /// Fenced, superseded, or failed: it takes no more writes.
+    Stopped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Proc {
-    me: WriterId,
     clock: u64,
     /// Hybrid clock: the last timestamp handed out or observed.
-    hlc: u64,
-    inflight: Inflight,
+    hlc: Ts,
     phase: Phase,
-    log: LogWriter<usize>,
     script_pos: usize,
     /// Writes handed to the log, by script position, until acknowledged.
     pending: BTreeMap<usize, (Bytes, Version)>,
     /// Acknowledged writes: these must stay visible (unless overwritten by
     /// newer versions).
     pub acked: Vec<(Bytes, Version)>,
-    stopped: bool,
     /// Crashed: takes no more steps; requests it sent may still land.
     crashed: bool,
-    /// Clock reading of the last lease written: one renewal per tick.
-    leased_at: u64,
     /// Checkpoints started (bounded, so the state space is finite).
     attempts: u64,
-    applier: Option<Applier>,
     /// Requests sent, not yet delivered. Delivered in any order.
     outbox: Vec<(Purpose, Request)>,
-    timers: BTreeSet<Timer>,
+    timers: Vec<Timer>,
 }
 
 /// What a store request was for.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Purpose {
-    Lease,
-    LogPut(u64, Arc<WalBatch>),
-    ListManifests,
-    GetManifest(u64),
+    Open,
+    LogPut(WalSeq, Arc<WalBatch>),
     Checkpoint,
-}
-
-impl Proc {
-    fn hlc_now(&mut self) -> u64 {
-        self.hlc = self.clock.max(self.hlc + 1);
-        self.hlc
-    }
-
-    /// The lease floor: a fresh hybrid reading, not stored. A later write
-    /// may then share its value, which is safe: tombstones are dropped
-    /// strictly below the floor.
-    fn floor(&self) -> u64 {
-        self.inflight.floor(self.clock.max(self.hlc + 1))
-    }
-
-    fn lease(&mut self, cfg: &Config) -> Lease {
-        self.leased_at = self.clock;
-        Lease {
-            writer: self.me,
-            log: LogHome::Home,
-            candidacy: Candidacy::Primary,
-            floor_hlc: self.floor(),
-            expires_at_ms: self.clock + cfg.lease_ttl,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -253,162 +229,121 @@ pub enum Timer {
     Clock,
     Start,
     Write,
-    Flush,
-    Lease,
     Checkpoint,
 }
 
-fn writer_of(index: usize) -> WriterId {
-    WriterId(index as u64 + 1)
-}
-
-fn initial_manifest() -> Manifest {
-    Manifest {
-        applier_epoch: Epoch(1),
-        applier: Some(writer_of(0)),
-        ..Manifest::initial(0)
-    }
-}
-
-/// Timers a step arms (a process's requests go straight to its outbox).
-#[derive(Default)]
-pub struct Out {
-    timers: Vec<Timer>,
-}
-
-fn arm(o: &mut Out, timer: Timer) {
-    o.timers.push(timer);
+/// The crate's hybrid clock (`hlc::Hlc`), over a plain value: milliseconds
+/// in the high bits, a counter in the low 16.
+fn physical(clock: u64) -> Ts {
+    Ts(clock << 16)
 }
 
 impl Proc {
-    /// Queues a store request; the model delivers it (atomically with its
-    /// response) whenever it chooses.
-    fn send(&mut self, _o: &mut Out, purpose: Purpose, req: Request) {
+    fn hlc_now(&mut self) -> Ts {
+        self.hlc = physical(self.clock).max(Ts(self.hlc.0 + 1));
+        self.hlc
+    }
+
+    fn observe(&mut self, ts: Ts) {
+        self.hlc = self.hlc.max(ts);
+    }
+
+    fn send(&mut self, purpose: Purpose, req: Request) {
         self.outbox.push((purpose, req));
     }
 
-    /// Runs log effects: puts go to the store, acks mark writes acknowledged.
-    fn log_effects(&mut self, effects: Vec<log::Effect<usize>>, o: &mut Out) {
-        for e in effects {
-            match e {
-                log::Effect::Put { seq, batch } => {
-                    let record = encode(&WalRecord::Batch(batch.as_ref().clone()));
-                    self.send(
-                        o,
-                        Purpose::LogPut(seq, batch),
-                        Request::PutIfAbsent(Path::Log(self.me, seq), record),
-                    );
-                }
-                log::Effect::Durable {
-                    seq, batch, stamps, ..
-                } => {
-                    self.inflight.release(&stamps);
-                    let clock = self.clock;
-                    if let Some(a) = &mut self.applier {
-                        a.view.add_own(seq, batch, clock);
-                    }
-                }
-                log::Effect::Ack { waiters, result } => waiters.into_iter().for_each(|w| {
-                    if let (Some(write), Ok(())) = (self.pending.remove(&w), result) {
-                        self.acked.push(write);
-                    }
-                }),
-                log::Effect::Stopped { stamps, .. } => {
-                    self.inflight.release(&stamps);
-                    self.stopped = true;
+    fn arm(&mut self, timer: Timer) {
+        if !self.timers.contains(&timer) {
+            self.timers.push(timer);
+            self.timers.sort();
+        }
+    }
+
+    fn writer(&mut self) -> Option<&mut Writer> {
+        match &mut self.phase {
+            Phase::Open(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    /// Runs log effects: puts go to the store, durable batches join the
+    /// tail, acks mark writes acknowledged.
+    fn log_effects(&mut self, effects: Vec<log::Effect<usize>>) {
+        effects.into_iter().for_each(|e| match e {
+            log::Effect::Put { seq, batch } => {
+                let record = encode(&WalRecord::Batch(batch.as_ref().clone()));
+                self.send(
+                    Purpose::LogPut(seq, batch),
+                    Request::PutIfAbsent(Path::Log(seq), record),
+                );
+            }
+            log::Effect::Durable { seq, batch, .. } => {
+                let clock = self.clock;
+                if let Some(w) = self.writer() {
+                    w.tail.add(seq, batch, clock);
                 }
             }
-        }
+            log::Effect::Ack { waiters, result } => waiters.into_iter().for_each(|w| {
+                if let (Some(write), Ok(())) = (self.pending.remove(&w), result) {
+                    self.acked.push(write);
+                }
+            }),
+            log::Effect::Stopped { .. } => self.phase = Phase::Stopped,
+        })
     }
 }
 
 /// A process as it starts: its clock at 1 and its start timers armed.
-fn start(index: usize) -> Proc {
-    let me = writer_of(index);
-    let mut timers: BTreeSet<Timer> = [Timer::Clock, Timer::Start].into();
-    if index == 0 {
-        timers.insert(Timer::Checkpoint);
-    }
+fn start() -> Proc {
     Proc {
-        me,
         clock: 1,
-        hlc: 0,
-        inflight: Inflight::default(),
+        hlc: Ts::MIN,
         phase: Phase::NotStarted,
-        // Each write is its own batch (put at once): batching only
-        // multiplies interleavings, not behaviours.
-        log: LogWriter::new(me, 1),
         script_pos: 0,
         pending: BTreeMap::new(),
         acked: Vec::new(),
-        stopped: false,
         crashed: false,
-        leased_at: 0,
         attempts: 0,
-        applier: (index == 0).then(|| Applier {
-            epoch: Epoch(1),
-            next_seq: 0,
-            view: View {
-                manifest_id: ManifestId(1),
-                manifest: Arc::new(initial_manifest()),
-                tails: follower::Tails::default(),
-            },
-            tracked: follower::Tracked::default(),
-            stage: Stage::Idle,
-        }),
         outbox: Vec::new(),
-        timers,
+        timers: vec![Timer::Clock, Timer::Start],
     }
 }
 
 /// Whether firing `timer` would change anything (skipped otherwise, so it
 /// adds no states).
 fn useful(p: &Proc, cfg: &Config, index: usize, timer: &Timer) -> bool {
-    match timer {
-        Timer::Clock => p.clock < cfg.max_clock,
+    match (timer, &p.phase) {
+        (Timer::Clock, _) => p.clock < cfg.max_clock,
         // A process with nothing to write never opens a writer.
-        Timer::Start => p.phase == Phase::NotStarted && !cfg.scripts[index].is_empty(),
-        Timer::Write => {
-            p.phase == Phase::Ready && !p.stopped && p.script_pos < cfg.scripts[index].len()
-        }
-        Timer::Flush => !p.log.idle(),
-        Timer::Lease => {
-            cfg.renew_leases && p.phase == Phase::Ready && !p.stopped && p.clock > p.leased_at
-        }
-        Timer::Checkpoint => {
+        (Timer::Start, Phase::NotStarted) => !cfg.scripts[index].is_empty(),
+        (Timer::Write, Phase::Open(_)) => p.script_pos < cfg.scripts[index].len(),
+        (Timer::Checkpoint, Phase::Open(w)) => {
             p.attempts < cfg.max_manifest
-                && p.applier.as_ref().is_some_and(|a| {
-                    a.stage == Stage::Idle && a.view.manifest_id.0 < cfg.max_manifest
-                })
+                && w.stage == Stage::Idle
+                && w.manifest_id.0 < cfg.max_manifest
+                && !w.tail.is_empty()
         }
+        (Timer::Start | Timer::Write | Timer::Checkpoint, _) => false,
     }
 }
 
-fn fire(p: &mut Proc, cfg: &Config, index: usize, timer: &Timer, o: &mut Out) {
+fn fire(p: &mut Proc, cfg: &Config, index: usize, timer: &Timer) {
     match timer {
         Timer::Clock => {
             p.clock += 1;
-            arm(o, Timer::Clock);
-            arm(o, Timer::Lease);
+            p.arm(Timer::Clock);
         }
         Timer::Start => {
-            p.phase = Phase::Leasing;
-            let lease = p.lease(cfg);
-            p.send(
-                o,
-                Purpose::Lease,
-                Request::Put(Path::Lease(p.me), encode(&lease)),
-            );
+            p.phase = Phase::Opening(Opening::Listing);
+            p.send(Purpose::Open, Request::LatestManifest);
         }
         Timer::Write => {
             let (key, msg) = match &cfg.scripts[index][p.script_pos] {
                 Write::Put(k, v) => (*k, Op::Put(Bytes::from_static(v.as_bytes()))),
                 Write::Delete(k) => (*k, Op::Delete),
             };
-            let hlc = p.hlc_now();
-            p.inflight.register(hlc);
             let version = Version {
-                ts: Ts { hlc, writer: p.me },
+                ts: p.hlc_now(),
                 msg,
             };
             let key = Bytes::from_static(key.as_bytes());
@@ -416,224 +351,232 @@ fn fire(p: &mut Proc, cfg: &Config, index: usize, timer: &Timer, o: &mut Out) {
                 .insert(p.script_pos, (key.clone(), version.clone()));
             let waiter = p.script_pos;
             p.script_pos += 1;
-            let effects = p.log.step(
+            let Some(w) = p.writer() else { return };
+            let effects = w.log.step(
                 log::Event::Write {
-                    hlc,
                     ops: vec![(key, version)],
                     waiter: Some(waiter),
                 },
                 Gate::Open,
             );
-            p.log_effects(effects, o);
-            arm(o, Timer::Write);
-        }
-        Timer::Flush => {
-            let effects = p.log.step(log::Event::Tick, Gate::Open);
-            p.log_effects(effects, o);
-            arm(o, Timer::Flush);
-        }
-        Timer::Lease => {
-            let lease = p.lease(cfg);
-            p.send(
-                o,
-                Purpose::Lease,
-                Request::Put(Path::Lease(p.me), encode(&lease)),
-            );
+            p.log_effects(effects);
+            p.arm(Timer::Write);
         }
         Timer::Checkpoint => {
             p.attempts += 1;
-            if let Some(a) = &mut p.applier {
-                a.stage = Stage::ListingLeases;
-            }
-            p.send(o, Purpose::Checkpoint, Request::List(Listing::Leases));
+            let now = p.hlc_now();
+            let Some(w) = p.writer() else { return };
+            // One batch per checkpoint, so backlogs span checkpoints.
+            let work = checkpoint::plan(
+                &w.tail,
+                &w.manifest,
+                1,
+                &CleanerConfig::default(),
+                Duration::from_secs(60),
+                now,
+            );
+            let Some(work) = work else { return };
+            let req = Request::Get(Path::Segment(match w.manifest.tree {
+                Some(root) => root.ptr.seg,
+                // Nothing stored here: an empty tree.
+                None => SegmentId {
+                    epoch: Epoch(0),
+                    seq: u64::MAX,
+                },
+            }));
+            w.stage = Stage::LoadingTree(work);
+            p.send(Purpose::Checkpoint, req);
         }
     }
 }
 
-fn on_response(p: &mut Proc, cfg: &Config, purpose: Purpose, resp: Response, o: &mut Out) {
-    match (purpose, resp) {
-        // Opening fails: the writer gives up (a new process would get a new
-        // id).
-        (Purpose::Lease | Purpose::ListManifests | Purpose::GetManifest(_), Response::Failed)
-            if p.phase != Phase::Ready =>
-        {
-            p.stopped = true;
-        }
-        (Purpose::Lease, _) if p.phase == Phase::Leasing => {
-            p.phase = Phase::Observing;
-            p.send(o, Purpose::ListManifests, Request::List(Listing::Manifests));
-        }
-        (Purpose::Lease, _) => {}
-        (Purpose::ListManifests, Response::Listed(paths)) => {
-            let newest = paths
-                .iter()
-                .filter_map(|p| match p {
-                    Path::Manifest(id) => Some(*id),
-                    _ => None,
-                })
-                .max()
-                .unwrap_or(0);
-            p.send(
-                o,
-                Purpose::GetManifest(newest),
-                Request::Get(Path::Manifest(newest)),
-            );
-        }
-        (Purpose::GetManifest(_), Response::Got(found)) => {
-            if cfg.observe_bound
-                && let Some(bytes) = found
-            {
-                let m: Manifest = decode(&bytes);
-                p.hlc = p.hlc.max(m.tombstone_bound);
-            }
-            p.phase = Phase::Ready;
-            [Timer::Write, Timer::Lease]
-                .into_iter()
-                .for_each(|t| arm(o, t));
-        }
-        (Purpose::LogPut(seq, batch), resp) => {
+fn on_response(p: &mut Proc, cfg: &Config, purpose: Purpose, resp: Response) {
+    match purpose {
+        Purpose::Open => open_step(p, cfg, resp),
+        Purpose::LogPut(seq, batch) => {
             let outcome = match resp {
                 Response::Created => PutOutcome::Written,
                 Response::Exists(bytes) => match decode::<WalRecord>(&bytes) {
-                    WalRecord::Seal => PutOutcome::Sealed,
                     WalRecord::Batch(b) if b == *batch => PutOutcome::Written,
-                    WalRecord::Batch(_) => PutOutcome::Taken,
+                    WalRecord::Batch(_) | WalRecord::Fence(_) => PutOutcome::Fenced,
                 },
                 _ => PutOutcome::Failed,
             };
-            let effects = p.log.step(log::Event::PutDone { seq, outcome }, Gate::Open);
-            p.log_effects(effects, o);
+            let Some(w) = p.writer() else { return };
+            let effects = w.log.step(log::Event::PutDone { seq, outcome }, Gate::Open);
+            p.log_effects(effects);
         }
-        (Purpose::Checkpoint, resp) => checkpoint_step(p, cfg, resp, o),
-        (Purpose::ListManifests | Purpose::GetManifest(_), _) => {}
+        Purpose::Checkpoint => checkpoint_step(p, resp),
     }
 }
 
-/// Advances the applier's checkpoint by one store response.
-fn checkpoint_step(p: &mut Proc, cfg: &Config, resp: Response, o: &mut Out) {
-    let (me, clock) = (p.me, p.clock);
-    let own_floor = p.floor();
-    let Some(mut a) = p.applier.take() else {
+/// Advances opening by one store response. A failed request is resent.
+fn open_step(p: &mut Proc, cfg: &Config, resp: Response) {
+    let Phase::Opening(opening) = std::mem::replace(&mut p.phase, Phase::Stopped) else {
         return;
     };
-    let cleaner = CleanerConfig::default();
-    let who = checkpoint::Applier {
-        me,
-        epoch: a.epoch,
-        role: ApplierRole::Auto {
-            steal_after: std::time::Duration::from_secs(3600),
-        },
-        cleaner: &cleaner,
-        // The model's tree has no tombstones to purge.
-        purge_after: std::time::Duration::from_secs(60),
-        // One batch per checkpoint, so backlogs span checkpoints.
-        max_bytes: 1,
-    };
-    let stage = std::mem::replace(&mut a.stage, Stage::Idle);
-    let next = |req: Request, stage: Stage, a: &mut Applier, p: &mut Proc, o: &mut Out| {
-        a.stage = stage;
-        p.send(o, Purpose::Checkpoint, req);
-    };
-    match (stage, resp) {
-        (Stage::ListingLeases, Response::Listed(paths)) => {
-            let writers: Vec<WriterId> = paths
-                .iter()
-                .filter_map(|p| match p {
-                    Path::Lease(w) => Some(*w),
-                    _ => None,
-                })
-                .collect();
-            a.tracked.track(writers.iter().copied());
-            let present = writers.iter().copied().collect();
-            advance_leases(&mut a, p, o, writers, Vec::new(), present, own_floor);
+    let clock = p.clock;
+    let (next, req) = match (opening, resp) {
+        (o, Response::Failed) => {
+            let req = opening_request(&o);
+            (o, req)
         }
-        (
-            Stage::GettingLeases {
-                pending,
-                mut got,
-                present,
-            },
-            Response::Got(found),
-        ) => {
-            got.extend(found.map(|b| decode::<Lease>(&b)));
-            advance_leases(&mut a, p, o, pending, got, present, own_floor);
+        (Opening::Listing, Response::Latest(id)) => {
+            let o = Opening::Loading(id);
+            let req = opening_request(&o);
+            (o, req)
         }
-        (
-            Stage::Pulling {
-                scanned,
-                queue,
-                current: Some((w, reading)),
-            },
-            Response::Got(found),
-        ) => {
-            let record = found.map(|b| decode::<WalRecord>(&b));
-            match reading.record(record) {
-                Err(more) => {
-                    let seq = more.next();
-                    next(
-                        Request::Get(Path::Log(w, seq)),
-                        Stage::Pulling {
-                            scanned,
-                            queue,
-                            current: Some((w, more)),
-                        },
-                        &mut a,
-                        p,
-                        o,
-                    );
+        (Opening::Loading(id), Response::Got(found)) => {
+            let current = found.map_or_else(|| Manifest::initial(clock), |b| decode(&b));
+            let o = Opening::Claiming(id.map_or(1, |id| id + 1), Box::new(current.claimed(clock)));
+            let req = opening_request(&o);
+            (o, req)
+        }
+        (Opening::Claiming(id, m), Response::Created) => {
+            let claimed = Claimed {
+                id: ManifestId(id),
+                manifest: Arc::new(*m),
+            };
+            let reading =
+                fence::Reading::new(claimed.manifest.writer_epoch, claimed.manifest.wal_applied);
+            let o = Opening::Reading(claimed, reading);
+            let req = opening_request(&o);
+            (o, req)
+        }
+        // Another writer claimed it first, or one identical to ours (same
+        // clock reading), which can't be told from our own lost response:
+        // start over.
+        (Opening::Claiming(..), Response::Exists(_)) => (Opening::Listing, Request::LatestManifest),
+        (Opening::Reading(claimed, reading), Response::Got(found)) => {
+            match reading.record(found.map(|b| decode(&b))) {
+                Err(_) => return,
+                Ok(AfterRead::More(r)) => {
+                    let o = Opening::Reading(claimed, r);
+                    let req = opening_request(&o);
+                    (o, req)
                 }
-                Ok(read) => {
-                    a.view.absorb(w, read, clock);
-                    advance_pull(&mut a, p, o, *scanned, queue, me, clock);
+                Ok(AfterRead::Place(placing)) if !cfg.place_fence => {
+                    // The bug: start writing at the empty slot, unfenced.
+                    let at = placing.at();
+                    let fenced = match placing.outcome(FenceAt::Placed) {
+                        Ok(AfterPlace::Done(f)) => f,
+                        _ => unreachable!("a placed fence is done"),
+                    };
+                    return opened(p, cfg, claimed, fenced, at);
+                }
+                Ok(AfterRead::Place(placing)) => {
+                    let o = Opening::Placing(claimed, placing);
+                    let req = opening_request(&o);
+                    (o, req)
                 }
             }
         }
-        (
-            Stage::Sealing {
-                sealing,
-                queue,
-                current: Some((w, s)),
-            },
-            resp,
-        ) => {
-            let s = match (s, resp) {
-                (s @ follower::Sealing::Reading(_), Response::Got(found)) => {
-                    s.record(found.map(|b| decode::<WalRecord>(&b)))
-                }
-                (s @ follower::Sealing::Placing { .. }, Response::Created) => s.sealed(),
-                (s @ follower::Sealing::Placing { .. }, Response::Exists(bytes)) => {
-                    match decode(&bytes) {
-                        WalRecord::Batch(b) => s.lost(b),
-                        WalRecord::Seal => s.sealed(),
-                    }
-                }
-                (s, _) => s,
+        (Opening::Placing(claimed, placing), resp) => {
+            let outcome = match resp {
+                Response::Created => FenceAt::Placed,
+                Response::Exists(bytes) => match decode::<WalRecord>(&bytes) {
+                    WalRecord::Fence(e) if e == placing.epoch() => FenceAt::Placed,
+                    record => FenceAt::Taken(record),
+                },
+                _ => unreachable!("a put-if-absent answers created or exists"),
             };
-            advance_seal(&mut a, p, o, sealing, queue, Some((w, s)), clock, who);
+            match placing.outcome(outcome) {
+                Err(_) => return,
+                Ok(AfterPlace::Done(fenced)) => {
+                    let o = Opening::Checking(claimed, fenced);
+                    let req = opening_request(&o);
+                    (o, req)
+                }
+                Ok(AfterPlace::More(r)) => {
+                    let o = Opening::Reading(claimed, r);
+                    let req = opening_request(&o);
+                    (o, req)
+                }
+            }
         }
-        (Stage::LoadingTree(applying), Response::Got(found)) => {
+        (Opening::Checking(claimed, fenced), Response::Got(newer)) => {
+            return match newer {
+                Some(_) => {}
+                None => {
+                    let first = fenced.fence.next();
+                    opened(p, cfg, claimed, fenced, first)
+                }
+            };
+        }
+        (o, resp) => unreachable!("{o:?} got {resp:?}"),
+    };
+    p.phase = Phase::Opening(next);
+    p.send(Purpose::Open, req);
+}
+
+fn opening_request(o: &Opening) -> Request {
+    match o {
+        Opening::Listing => Request::LatestManifest,
+        Opening::Loading(None) => Request::Get(Path::Manifest(0)),
+        Opening::Loading(Some(id)) => Request::Get(Path::Manifest(*id)),
+        Opening::Claiming(id, m) => Request::PutIfAbsent(Path::Manifest(*id), encode(m.as_ref())),
+        Opening::Reading(_, r) => Request::Get(Path::Log(r.next())),
+        Opening::Placing(_, pl) => {
+            Request::PutIfAbsent(Path::Log(pl.at()), encode(&WalRecord::Fence(pl.epoch())))
+        }
+        Opening::Checking(c, _) => Request::Get(Path::Manifest(c.id.next().0)),
+    }
+}
+
+/// The writer is open: replay what the fence read, set the clock past it,
+/// and write from `first` on.
+fn opened(p: &mut Proc, cfg: &Config, claimed: Claimed, fenced: Fenced, first: WalSeq) {
+    let Fenced { read, fence } = fenced;
+    read.batches
+        .iter()
+        .flat_map(|(_, b)| b.ops.iter().map(|(_, v)| v.ts))
+        .chain(cfg.observe_last_ts.then_some(claimed.manifest.last_ts))
+        .for_each(|ts| p.observe(ts));
+    let mut tail = Tail::new(claimed.manifest.wal_applied);
+    tail.absorb(read, p.clock);
+    if cfg.place_fence {
+        tail.add_fence(fence);
+    }
+    let epoch = claimed.manifest.writer_epoch;
+    p.phase = Phase::Open(Box::new(Writer {
+        epoch,
+        // Each write is its own batch (put at once): batching only
+        // multiplies interleavings, not behaviours.
+        log: LogWriter::new(epoch, first, 1),
+        manifest_id: claimed.id,
+        manifest: claimed.manifest,
+        tail,
+        next_segment: 0,
+        stage: Stage::Idle,
+    }));
+    p.arm(Timer::Write);
+    p.arm(Timer::Checkpoint);
+}
+
+/// Advances the writer's checkpoint by one store response.
+fn checkpoint_step(p: &mut Proc, resp: Response) {
+    let clock = p.clock;
+    let Some(w) = p.writer() else { return };
+    let stage = std::mem::replace(&mut w.stage, Stage::Idle);
+    let req = match (stage, resp) {
+        (Stage::LoadingTree(work), Response::Got(found)) => {
             let mut tree: Tree = found.map(|b| decode(&b)).unwrap_or_default();
-            applying.msgs.iter().for_each(|(k, v)| {
-                let newer = tree.get(k).is_none_or(|old| v.ts > old.ts);
-                if newer {
+            work.taken.iter().flat_map(|t| &t.msgs).for_each(|(k, v)| {
+                if tree.get(k).is_none_or(|old| v.ts > old.ts) {
                     tree.insert(k.clone(), v.clone());
                 }
             });
-            tree.retain(|_, v| !(matches!(v.msg, Op::Delete) && v.ts < applying.drop_below));
+            // A leaf keeps no tombstones.
+            tree.retain(|_, v| !matches!(v.msg, Op::Delete));
             let seg = SegmentId {
-                epoch: a.epoch,
-                seq: a.next_seq,
+                epoch: w.epoch,
+                seq: w.next_segment,
             };
-            a.next_seq += 1;
-            next(
-                Request::Put(Path::Segment(seg), encode(&tree)),
-                Stage::PuttingSegment { applying, seg },
-                &mut a,
-                p,
-                o,
-            );
+            w.next_segment += 1;
+            w.stage = Stage::PuttingSegment(work, seg);
+            Request::Put(Path::Segment(seg), encode(&tree))
         }
-        (Stage::PuttingSegment { applying, seg }, Response::Done) => {
+        (Stage::PuttingSegment(work, seg), Response::Done) => {
             let done = Applied {
                 tree: Some(TreeRoot {
                     ptr: NodePtr {
@@ -648,209 +591,64 @@ fn checkpoint_step(p: &mut Proc, cfg: &Config, resp: Response, o: &mut Out) {
                 segments: Default::default(),
                 dead: Vec::new(),
                 segment_watermark: SegmentId {
-                    epoch: a.epoch,
-                    seq: a.next_seq,
+                    epoch: w.epoch,
+                    seq: w.next_segment,
                 },
             };
-            let publishing = applying.applied(who, done, clock);
-            let id = a.view.manifest_id.next();
-            next(
-                Request::PutIfAbsent(Path::Manifest(id.0), encode(&publishing.manifest)),
-                Stage::Publishing(publishing),
-                &mut a,
-                p,
-                o,
-            );
+            let next =
+                checkpoint::next_manifest(&w.manifest, w.epoch, work.taken.as_ref(), done, clock);
+            let req = Request::PutIfAbsent(Path::Manifest(w.manifest_id.next().0), encode(&next));
+            w.stage = Stage::Publishing(work, Box::new(next));
+            req
         }
-        (Stage::Publishing(publishing), Response::Created) => {
-            let id = a.view.manifest_id.next();
-            a.view.install(id, Arc::new(publishing.manifest), clock);
-            a.stage = Stage::Idle;
-            let _ = cfg;
-            arm(o, Timer::Checkpoint);
+        (Stage::Publishing(_, next), Response::Created) => {
+            w.manifest_id = w.manifest_id.next();
+            w.tail.prune(next.wal_applied, clock);
+            w.manifest = Arc::new(*next);
+            p.arm(Timer::Checkpoint);
+            return;
         }
-        // Anything else (a lost publish race can't happen with one
-        // applier) ends the checkpoint.
+        // A newer writer published: this one is fenced.
+        (Stage::Publishing(..), Response::Exists(_)) => {
+            p.phase = Phase::Stopped;
+            return;
+        }
+        // A failed request ends the attempt; the next one starts over.
         (_, _) => {
-            a.stage = Stage::Idle;
-            arm(o, Timer::Checkpoint);
+            p.arm(Timer::Checkpoint);
+            return;
         }
-    }
-    p.applier = Some(a);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn advance_leases(
-    a: &mut Applier,
-    p: &mut Proc,
-    o: &mut Out,
-    mut pending: Vec<WriterId>,
-    got: Vec<Lease>,
-    present: BTreeSet<WriterId>,
-    own_floor: u64,
-) {
-    match pending.pop() {
-        Some(w) => {
-            a.stage = Stage::GettingLeases {
-                pending,
-                got,
-                present,
-            };
-            p.send(o, Purpose::Checkpoint, Request::Get(Path::Lease(w)));
-        }
-        None => {
-            let scanned = Scanned {
-                own_floor,
-                leases: got,
-                present,
-            };
-            let m = a.view.manifest.clone();
-            let queue = a
-                .view
-                .reads(&m, &a.tracked, Some(p.me), follower::Scope::AllWriters);
-            let (me, clock) = (p.me, p.clock);
-            advance_pull(a, p, o, scanned, queue, me, clock);
-        }
-    }
-}
-
-fn advance_pull(
-    a: &mut Applier,
-    p: &mut Proc,
-    o: &mut Out,
-    scanned: Scanned,
-    mut queue: Vec<(WriterId, u64)>,
-    me: WriterId,
-    clock: u64,
-) {
-    match queue.pop() {
-        Some((w, from)) => {
-            a.stage = Stage::Pulling {
-                scanned: Box::new(scanned),
-                queue,
-                current: Some((w, Reading::from(from))),
-            };
-            p.send(o, Purpose::Checkpoint, Request::Get(Path::Log(w, from)));
-        }
-        None => {
-            let sealing = scanned.pulled(&a.view, me, clock, Pull::Complete);
-            let queue = sealing.to_seal.clone();
-            let cleaner = CleanerConfig::default();
-            let who = checkpoint::Applier {
-                me,
-                epoch: a.epoch,
-                role: ApplierRole::Auto {
-                    steal_after: std::time::Duration::from_secs(3600),
-                },
-                cleaner: &cleaner,
-                purge_after: std::time::Duration::from_secs(60),
-                max_bytes: 1,
-            };
-            advance_seal(a, p, o, sealing, queue, None, clock, who);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn advance_seal(
-    a: &mut Applier,
-    p: &mut Proc,
-    o: &mut Out,
-    sealing: checkpoint::Sealing,
-    mut queue: Vec<WriterId>,
-    current: Option<(WriterId, follower::Sealing)>,
-    clock: u64,
-    who: checkpoint::Applier,
-) {
-    let current = match current {
-        Some((w, follower::Sealing::Done(read))) => {
-            a.view.absorb(w, read, clock);
-            None
-        }
-        other => other,
     };
-    let current = current.or_else(|| {
-        queue.pop().map(|w| {
-            let from = a.view.tails.next_seq(w, &a.view.manifest.frontier);
-            (w, follower::Sealing::from(from))
-        })
-    });
-    match current {
-        Some((w, s)) => {
-            let req = match &s {
-                follower::Sealing::Reading(r) => Request::Get(Path::Log(w, r.next())),
-                follower::Sealing::Placing { at, .. } => {
-                    Request::PutIfAbsent(Path::Log(w, *at), encode(&WalRecord::Seal))
-                }
-                follower::Sealing::Done(_) => unreachable!("absorbed above"),
-            };
-            a.stage = Stage::Sealing {
-                sealing,
-                queue,
-                current: Some((w, s)),
-            };
-            p.send(o, Purpose::Checkpoint, req);
-        }
-        None => match sealing.sealed(&a.view, who, clock) {
-            Plan::Nothing => {
-                a.stage = Stage::Idle;
-                arm(o, Timer::Checkpoint);
-            }
-            Plan::Apply(applying) => {
-                let req = match a.view.manifest.tree {
-                    Some(root) => Request::Get(Path::Segment(root.ptr.seg)),
-                    None => Request::Get(Path::Segment(SegmentId {
-                        epoch: Epoch(0),
-                        seq: u64::MAX,
-                    })),
-                };
-                a.stage = Stage::LoadingTree(applying);
-                p.send(o, Purpose::Checkpoint, req);
-            }
-        },
-    }
+    p.send(Purpose::Checkpoint, req);
 }
 
 // ---------------------------------------------------------------------------
 // Properties
 
 /// What a fresh reader sees for every key: the newest manifest's tree plus
-/// every log entry past its frontier (up to the first gap or seal).
+/// every log batch past its applied slot, up to the first empty one.
 pub fn visible(objects: &BTreeMap<Path, Vec<u8>>) -> Tree {
-    let Some((_, m)) = objects
-        .iter()
-        .filter_map(|(p, b)| match p {
-            Path::Manifest(id) => Some((*id, decode::<Manifest>(b))),
-            _ => None,
-        })
-        .max_by_key(|(id, _)| *id)
-    else {
+    let Some((_, m)) = manifest_id(objects) else {
         return Tree::new();
     };
-    let mut tree: Tree = m
+    let tree: Tree = m
         .tree
         .and_then(|r| objects.get(&Path::Segment(r.ptr.seg)))
         .map(|b| decode(b))
         .unwrap_or_default();
-    let writers: BTreeSet<WriterId> = objects
-        .keys()
-        .filter_map(|p| match p {
-            Path::Log(w, _) => Some(*w),
-            _ => None,
+    std::iter::successors(Some(m.wal_applied.next()), |s| Some(s.next()))
+        .map_while(|s| objects.get(&Path::Log(s)).map(|b| decode::<WalRecord>(b)))
+        .filter_map(|r| match r {
+            WalRecord::Batch(b) => Some(b),
+            WalRecord::Fence(_) => None,
         })
-        .collect();
-    for w in writers {
-        let mut seq = m.frontier.get(&w).copied().unwrap_or(0) + 1;
-        while let Some(WalRecord::Batch(b)) = objects.get(&Path::Log(w, seq)).map(|b| decode(b)) {
-            b.ops.into_iter().for_each(|(k, v)| {
-                if tree.get(&k).is_none_or(|old| v.ts > old.ts) {
-                    tree.insert(k, v);
-                }
-            });
-            seq += 1;
-        }
-    }
-    tree
+        .flat_map(|b| b.ops)
+        .fold(tree, |mut tree, (k, v)| {
+            if tree.get(&k).is_none_or(|old| v.ts > old.ts) {
+                tree.insert(k, v);
+            }
+            tree
+        })
 }
 
 /// Newest version per key among `writes`.
@@ -876,6 +674,16 @@ fn covers(seen: &Tree, expected: &BTreeMap<&Bytes, &Version>) -> bool {
     })
 }
 
+fn stored_batches(store: &BTreeMap<Path, Vec<u8>>) -> impl Iterator<Item = WalBatch> + '_ {
+    store
+        .iter()
+        .filter(|(p, _)| matches!(p, Path::Log(_)))
+        .filter_map(|(_, b)| match decode::<WalRecord>(b) {
+            WalRecord::Batch(batch) => Some(batch),
+            WalRecord::Fence(_) => None,
+        })
+}
+
 /// The whole system: the object store and every process.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Sys {
@@ -885,11 +693,11 @@ pub struct Sys {
 }
 
 /// A step: deliver one of a process's requests (the store applies it and
-/// the process handles the response, as one step), or fire one of its
-/// timers. Handling a response touches only the process's own state, so it
-/// commutes with other processes' steps: fusing the two loses no behaviour
-/// (partial-order reduction) and cuts the state space by orders of
-/// magnitude.
+/// the process handles the response, as one step), fire one of its timers,
+/// or collect the log. Handling a response touches only the process's own
+/// state, so it commutes with other processes' steps: fusing the two loses
+/// no behaviour (partial-order reduction) and cuts the state space by
+/// orders of magnitude.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Action {
     Deliver {
@@ -904,6 +712,9 @@ pub enum Action {
     Crash {
         proc: usize,
     },
+    /// Deletes the log slots the newest manifest lets go, as if past the
+    /// retention.
+    Gc,
 }
 
 /// What happens to a delivered request.
@@ -920,6 +731,25 @@ pub struct Checked {
     pub cfg: Config,
 }
 
+/// The log slots GC would delete now.
+fn collectable(cfg: &Config, store: &BTreeMap<Path, Vec<u8>>) -> Vec<WalSeq> {
+    let Some((_, m)) = manifest_id(store) else {
+        return Vec::new();
+    };
+    let stored: Vec<WalSeq> = store
+        .keys()
+        .filter_map(|p| match p {
+            Path::Log(s) => Some(*s),
+            _ => None,
+        })
+        .collect();
+    match cfg.gc {
+        LogGc::Off => Vec::new(),
+        LogGc::KeepFences => deletable_wals(&stored, &m).collect(),
+        LogGc::DeleteFences => stored.into_iter().filter(|s| *s <= m.wal_applied).collect(),
+    }
+}
+
 /// Every acknowledged write is visible or superseded.
 pub fn acknowledged_writes_stay_visible(_: &Checked, s: &Sys) -> bool {
     let acked = newest(
@@ -930,25 +760,25 @@ pub fn acknowledged_writes_stay_visible(_: &Checked, s: &Sys) -> bool {
     covers(&visible(&s.store), &acked)
 }
 
-/// Every batch durable in a log stays visible or superseded, acknowledged
-/// or not: a manifest must not count an entry as applied that its tree
-/// lacks.
+/// Every batch durable in the log stays visible or superseded, acknowledged
+/// or not: a manifest must not count a slot as applied that its tree lacks.
 pub fn durable_writes_stay_visible(_: &Checked, s: &Sys) -> bool {
-    let batches: Vec<WalBatch> = s
-        .store
-        .iter()
-        .filter(|(p, _)| matches!(p, Path::Log(..)))
-        .filter_map(|(_, b)| match decode::<WalRecord>(b) {
-            WalRecord::Batch(batch) => Some(batch),
-            WalRecord::Seal => None,
-        })
-        .collect();
+    let batches: Vec<WalBatch> = stored_batches(&s.store).collect();
     let durable = newest(
         batches
             .iter()
             .flat_map(|b| b.ops.iter().map(|(k, v)| (k, v))),
     );
     covers(&visible(&s.store), &durable)
+}
+
+/// Log order is timestamp order, across writers: a checkpoint applying a
+/// prefix never drops a tombstone that a version left behind is older than.
+pub fn log_order_is_timestamp_order(_: &Checked, s: &Sys) -> bool {
+    let stamps: Vec<Ts> = stored_batches(&s.store)
+        .flat_map(|b| b.ops.into_iter().map(|(_, v)| v.ts))
+        .collect();
+    stamps.windows(2).all(|w| w[0] < w[1])
 }
 
 /// An acknowledged delete's tombstone got dropped (the properties aren't
@@ -961,14 +791,21 @@ fn a_tombstone_gets_dropped(_: &Checked, s: &Sys) -> bool {
         .any(|(k, v)| matches!(v.msg, Op::Delete) && !seen.contains_key(k))
 }
 
+/// A writer got fenced after acknowledging writes.
+fn a_writer_gets_fenced(_: &Checked, s: &Sys) -> bool {
+    s.procs
+        .iter()
+        .any(|p| p.phase == Phase::Stopped && !p.acked.is_empty())
+}
+
 impl Model for Checked {
     type State = Sys;
     type Action = Action;
 
     fn init_states(&self) -> Vec<Sys> {
         vec![Sys {
-            store: [(Path::Manifest(1), encode(&initial_manifest()))].into(),
-            procs: (0..self.cfg.scripts.len()).map(start).collect(),
+            store: BTreeMap::new(),
+            procs: (0..self.cfg.scripts.len()).map(|_| start()).collect(),
             faults: 0,
         }]
     }
@@ -1003,11 +840,13 @@ impl Model for Checked {
                 actions.push(Action::Crash { proc });
             }
         });
+        if !collectable(&self.cfg, &s.store).is_empty() {
+            actions.push(Action::Gc);
+        }
     }
 
     fn next_state(&self, s: &Sys, action: Action) -> Option<Sys> {
         let mut s = s.clone();
-        let mut o = Out::default();
         match action {
             Action::Deliver {
                 proc,
@@ -1028,8 +867,7 @@ impl Model for Checked {
                 }
                 let p = &mut s.procs[proc];
                 if !p.crashed {
-                    on_response(p, &self.cfg, purpose, resp, &mut o);
-                    p.timers.extend(o.timers);
+                    on_response(p, &self.cfg, purpose, resp);
                 }
             }
             Action::Crash { proc } => {
@@ -1040,10 +878,14 @@ impl Model for Checked {
             }
             Action::Fire { proc, timer } => {
                 let p = &mut s.procs[proc];
-                p.timers.remove(&timer);
-                fire(p, &self.cfg, proc, &timer, &mut o);
-                p.timers.extend(o.timers);
+                p.timers.retain(|t| *t != timer);
+                fire(p, &self.cfg, proc, &timer);
             }
+            Action::Gc => collectable(&self.cfg, &s.store)
+                .into_iter()
+                .for_each(|seq| {
+                    s.store.remove(&Path::Log(seq));
+                }),
         }
         Some(s)
     }
@@ -1055,7 +897,9 @@ impl Model for Checked {
                 acknowledged_writes_stay_visible,
             ),
             Property::always("durable writes stay visible", durable_writes_stay_visible),
+            Property::always("log order is timestamp order", log_order_is_timestamp_order),
             Property::sometimes("a tombstone gets dropped", a_tombstone_gets_dropped),
+            Property::sometimes("a writer gets fenced", a_writer_gets_fenced),
         ]
     }
 }
@@ -1066,13 +910,16 @@ impl Checked {
         self.init_states().remove(0)
     }
 
-    /// Fires `timer` on `proc`; panics if it isn't enabled.
-    pub fn fire(&self, s: Sys, proc: usize, timer: Timer) -> Sys {
-        let action = Action::Fire { proc, timer };
+    fn step(&self, s: Sys, action: Action) -> Sys {
         let mut enabled = Vec::new();
         self.actions(&s, &mut enabled);
         assert!(enabled.contains(&action), "not enabled: {action:?}");
         self.next_state(&s, action).expect("a step")
+    }
+
+    /// Fires `timer` on `proc`; panics if it isn't enabled.
+    pub fn fire(&self, s: Sys, proc: usize, timer: Timer) -> Sys {
+        self.step(s, Action::Fire { proc, timer })
     }
 
     /// Delivers `proc`'s oldest request with the given fate.
@@ -1085,9 +932,9 @@ impl Checked {
         self.next_state(&s, action).expect("a step")
     }
 
-    /// Crashes `proc`.
-    pub fn crash(&self, s: Sys, proc: usize) -> Sys {
-        self.next_state(&s, Action::Crash { proc }).expect("a step")
+    /// Collects the log; panics if there's nothing to collect.
+    pub fn gc(&self, s: Sys) -> Sys {
+        self.step(s, Action::Gc)
     }
 
     /// Delivers `proc`'s requests (and the ones they lead to) until it has
@@ -1104,68 +951,66 @@ pub fn model(cfg: Config) -> Checked {
     Checked { cfg }
 }
 
-/// The scenario behind the tombstone-bound rule: an applier, a writer that
-/// deletes a key, and one that starts late (possibly with a lagging clock)
-/// and puts it. The deleter can't be the applier: the applier's clock must
-/// pass the delete's timestamp to publish a bound above it.
-pub fn late_writer(observe_bound: bool) -> Config {
-    Config {
-        // The deleter's later writes give the next checkpoints work: one
-        // publishes a bound above the delete, the next drops its tombstone
-        // (a checkpoint with nothing to apply rewrites nothing).
-        scripts: vec![
-            vec![],
-            vec![
-                Write::Delete("k"),
-                Write::Put("x", "1"),
-                Write::Put("y", "1"),
-            ],
-            vec![Write::Put("k", "b")],
-        ],
-        max_clock: 3,
-        lease_ttl: 1,
-        max_manifest: 4,
-        observe_bound,
-        renew_leases: true,
-        max_faults: 0,
-    }
-}
-
-/// Small enough to search exhaustively (~25M states, ~20 s, ~11 GB): the
-/// applier also writes (a delete), and a second writer puts the same key.
+/// Small enough to search exhaustively: the first writer deletes a key and
+/// writes another, the second (fencing it) puts the first key; GC runs.
 pub fn small() -> Config {
-    Config {
-        scripts: vec![vec![Write::Delete("k")], vec![Write::Put("k", "b")]],
-        max_clock: 3,
-        lease_ttl: 1,
-        max_manifest: 3,
-        observe_bound: true,
-        renew_leases: true,
-        max_faults: 0,
-    }
-}
-
-/// The delayed-write scenario: the applier deletes `k` (then writes more,
-/// so later checkpoints have work); another writer's older put of `k` is
-/// held in flight past its lease.
-pub fn delayed_write() -> Config {
     Config {
         scripts: vec![
             vec![Write::Delete("k"), Write::Put("x", "1")],
-            vec![Write::Put("k", "old")],
+            vec![Write::Put("k", "b")],
         ],
         max_clock: 3,
-        lease_ttl: 1,
         max_manifest: 4,
-        observe_bound: true,
-        renew_leases: true,
+        place_fence: true,
+        observe_last_ts: true,
+        gc: LogGc::KeepFences,
         max_faults: 0,
     }
+}
+
+/// `small` with the protocol rule `rule` broken.
+pub fn without(rule: Rule) -> Config {
+    let cfg = small();
+    match rule {
+        Rule::Fence => Config {
+            place_fence: false,
+            ..cfg
+        },
+        Rule::LastTs => Config {
+            observe_last_ts: false,
+            ..cfg
+        },
+        Rule::KeepFences => Config {
+            gc: LogGc::DeleteFences,
+            ..cfg
+        },
+    }
+}
+
+/// A protocol rule a bug config breaks.
+#[derive(Clone, Copy, Debug)]
+pub enum Rule {
+    /// A new writer fences the log.
+    Fence,
+    /// A new writer's clock passes the manifest's newest timestamp.
+    LastTs,
+    /// GC keeps fences.
+    KeepFences,
 }
 
 impl Sys {
     /// Writes `proc` had acknowledged.
     pub fn acked(&self, proc: usize) -> &[(Bytes, Version)] {
         &self.procs[proc].acked
+    }
+
+    /// Whether `proc`'s writer is open.
+    pub fn is_open(&self, proc: usize) -> bool {
+        matches!(self.procs[proc].phase, Phase::Open(_))
+    }
+
+    /// Whether `proc`'s writer stopped (fenced or superseded).
+    pub fn is_stopped(&self, proc: usize) -> bool {
+        self.procs[proc].phase == Phase::Stopped
     }
 }

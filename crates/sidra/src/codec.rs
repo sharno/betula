@@ -14,7 +14,8 @@ use crate::error::{Error, Result};
 // 6: leases record applier candidacy. 7: manifests carry a tombstone bound.
 // 8: log seals, logs under `wal/`, manifests list sealed writers.
 // 9: runs record whether they hold tombstones; purge summaries cover runs.
-const VERSION: u8 = 9;
+// 10: one writer: a single log with fences, plain hybrid timestamps.
+const VERSION: u8 = 10;
 const HEADER: usize = 6;
 
 #[derive(Copy, Clone, Debug)]
@@ -25,7 +26,6 @@ pub struct Kind {
 pub const MANIFEST: Kind = Kind { magic: *b"SDMF" };
 pub const WAL: Kind = Kind { magic: *b"SDWL" };
 pub const NODE: Kind = Kind { magic: *b"SDND" };
-pub const LEASE: Kind = Kind { magic: *b"SDLS" };
 
 /// Compression of tree nodes and log batches.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

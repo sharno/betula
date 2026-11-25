@@ -4,18 +4,11 @@ use crate::types::SegmentId;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
-    /// The operation needs the applier role, which this process doesn't hold
-    /// (or just lost to another process).
-    #[error("this process is not the applier")]
-    NotApplier,
-    /// This writer's log was sealed: the applier presumed it dead (its lease
-    /// lapsed), or it closed. The write that found the seal is not durable.
-    /// Open a new writer.
-    #[error("writer log sealed")]
-    LogSealed,
-    /// Another process is writing under this writer id.
-    #[error("writer id already in use")]
-    WriterIdTaken,
+    /// A newer writer opened the database, so this one can't write or
+    /// checkpoint anymore. Writes it didn't acknowledge may or may not be
+    /// durable; the newer writer applies those that are.
+    #[error("fenced by a newer writer")]
+    Fenced,
     /// A log write still failed after retries, so whether it landed is
     /// unknown and the writer can't continue its log. Open a new writer;
     /// writes not acknowledged may or may not be durable.
@@ -41,11 +34,9 @@ pub enum ErrorKind {
     /// The object store failed after retries. The operation may succeed if
     /// repeated.
     Unavailable,
-    /// This writer can no longer write (log sealed, writer id taken, or a
-    /// log write failed). Open a new one.
+    /// This writer can no longer write (fenced by a newer one, or a log
+    /// write failed). Open a new one if this process should still write.
     WriterLost,
-    /// The operation needs the applier role, which this process doesn't hold.
-    NotApplier,
     /// The handle was closed.
     Closed,
     /// A read referred to data deleted by GC: the snapshot was held past the
@@ -61,10 +52,7 @@ impl Error {
     pub fn kind(&self) -> ErrorKind {
         match self {
             Error::ObjectStore(_) => ErrorKind::Unavailable,
-            Error::LogSealed | Error::WriterIdTaken | Error::LogWriteFailed(_) => {
-                ErrorKind::WriterLost
-            }
-            Error::NotApplier => ErrorKind::NotApplier,
+            Error::Fenced | Error::LogWriteFailed(_) => ErrorKind::WriterLost,
             Error::Closed => ErrorKind::Closed,
             Error::SnapshotExpired(_) => ErrorKind::SnapshotExpired,
             Error::Corrupt { .. } => ErrorKind::Corrupt,

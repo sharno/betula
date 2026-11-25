@@ -17,9 +17,9 @@ impl Epoch {
     }
 }
 
-/// A checkpoint's output object. The epoch prefix makes ids unique across
-/// writers without coordination, and lets a new writer find a crashed
-/// writer's orphans with one ordered listing.
+/// A checkpoint's output object. The epoch prefix keeps ids unique across
+/// writer generations, and lets a new writer find a crashed writer's orphans
+/// with one ordered listing.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SegmentId {
     pub epoch: Epoch,
@@ -76,6 +76,26 @@ pub struct TreeRoot {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ManifestId(pub u64);
 
+/// A slot in the write-ahead log. Slots are consecutive from 1, and each
+/// holds one batch or one fence.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct WalSeq(pub u64);
+
+impl WalSeq {
+    /// Before the first slot.
+    pub const ZERO: WalSeq = WalSeq(0);
+
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+impl fmt::Display for WalSeq {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl ManifestId {
     pub fn next(self) -> Self {
         Self(self.0 + 1)
@@ -106,9 +126,9 @@ impl Msg {
 }
 
 /// A timestamped mutation. Wherever two versions of a key meet, the larger
-/// timestamp wins, so applying writes in any order gives the same result.
-/// Buffers and leaves hold at most one version per key; deletes are kept as
-/// tombstones until no older write can still arrive.
+/// timestamp wins. Buffers and leaves hold at most one version per key. A
+/// tombstone shadows older versions below it in the tree and goes once it
+/// reaches a leaf.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Version {
     pub ts: Ts,

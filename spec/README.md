@@ -2,7 +2,7 @@
 
 Two layers:
 
-- **`Sidra.tla`**: a TLA+ model of the multi-writer protocol, model-checked
+- **`Sidra.tla`**: a TLA+ model of the single-writer protocol, model-checked
   with [everystate](https://crates.io/crates/everystate), a TLC-compatible
   checker that needs no Java.
 - **`crates/sidra/src/proofs.rs`**: [Kani](https://model-checking.github.io/kani/)
@@ -10,50 +10,61 @@ Two layers:
 
 ## Protocol model (TLA+)
 
-The model covers one key and these actors:
-- writers that start late, stamp writes, flush batches to their own logs,
-  renew leases, and self-fence (losing unacknowledged writes);
-- appliers that read leases, pull logs, and publish a new tree with
-  put-if-absent on the next manifest version. A checkpoint applies only the
-  oldest pulled batches (any oldest-first prefix, at least one; age = a batch's
-  oldest timestamp raised to its log predecessors', ties by writer and seq);
-- GC of log entries the manifest already holds.
+The model covers one key, a WAL of put-if-absent slots, the latest manifest
+(`writer_epoch`, tree, `last_ts`, `wal_applied`, `fences`), and writers.
 
-The tree is a buffer level over a leaf level. Tombstones are dropped below
-the lease floor, and below the oldest timestamp among batches a checkpoint left
-out, when a leaf is rewritten (a flush, or a purge or relocation).
+A writer is a small state machine: `idle` -> `reading` -> `placing` -> `open`,
+or `dead` (fenced or superseded).
+- **Claim**: publish the next manifest with epoch + 1. A conflict retries, so
+  the model takes the step whole.
+- **Read / Place**: read the WAL forward from `wal_applied + 1`, replaying
+  batches. Put `Fence(epoch)` in the first empty slot. A slot taken since the
+  read is read on from. A newer fence supersedes the writer. The put comes
+  later than the read, so the slot may have changed.
+- **Stamp / Land**: stamp one batch (hybrid clock over replayed timestamps and
+  `last_ts`, any clock reading), then put it at the next slot. The puts are
+  apart, so one can land after a newer fence and after GC. A taken slot means
+  fenced: no ack, the writer stops.
+- **Plan / Publish**: take a prefix of the unapplied tail, apply it (leaves
+  drop tombstones), publish manifest id + 1 put-if-absent with `wal_applied`
+  at the end of the prefix, the fences in it, and `last_ts`. A conflict means
+  fenced.
+- **Gc**: delete WAL slots at or below `wal_applied`, except fences.
+- Readers: latest manifest, then the WAL from `wal_applied + 1` to the first
+  empty slot, skipping fences.
 
 | Invariant | Meaning |
 |---|---|
-| `Correct` | A reader (tree plus unapplied log entries) sees exactly the newest durable write: none lost, none resurrected |
-| `TreeFromLogs` | The tree never holds a version that isn't durable |
+| `Correct` | A reader sees the last acknowledged write: none lost (also after GC), none resurrected |
+| `WriterSees` | A current writer's own view (tree plus tail) has every acknowledged write |
+| `NoZombieAck` | No put lands at or after a newer writer's fence |
+| `Monotone` | Acknowledged timestamps strictly increase, across writers |
 
-Each switch turns one protocol rule off. The checker finds a counterexample
-for each, so the invariants are strong enough to catch these bugs:
+Each switch turns one rule off. The checker finds a counterexample for each,
+so the invariants catch these mistakes:
 
-| Config | Rule disabled | Result |
+| Config | What it checks | Result |
 |---|---|---|
-| `Sidra.cfg` | none (2 writers, 1 applier) | pass, 22.5M distinct states |
-| `TwoAppliers.cfg` | none (2 appliers racing) | pass, 146.9M distinct states |
-| `BugDiscovery.cfg` | the checkpoint pulls every writer whose lease it read | violation in 14 steps |
-| `BugCarryDown.cfg` | a leaf rewrite carries the buffered versions above it down | violation in 16 steps |
-| `BugUnfenced.cfg` | manifest publish is put-if-absent | violation in 11 steps |
-| `PartialCap.cfg` | none (partial checkpoints, bounded by `Small`: 2 writes per writer, no expiry or GC) | pass, 3.0M distinct states, 28 s |
-| `BugPartial.cfg` | tombstones are dropped only below the oldest timestamp left out of a partial checkpoint | violation in 17 steps, 20 s |
-| `BugBound.cfg` | tombstones are dropped only below the previous manifest's bound, which new writers move their clocks past | violation in 11 steps |
+| `Sidra.cfg` | none disabled, 2 writers | pass, 663k distinct states, 4 s |
+| `Sidra3.cfg` | none disabled, 3 writers | pass, 6.8M distinct states, 36 s |
+| `BugGcFences.cfg` | GC deletes fences: a delayed put lands in a deleted slot | `Correct`, 15 steps |
+| `BugUnfenced.cfg` | the new writer places no fence: an old put lands after the replay | `WriterSees`, 7 steps |
+| `BugPartial.cfg` | a partial checkpoint sets `wal_applied` past what it applied | `Correct`, 10 steps |
+| `BugClock.cfg` | the new writer ignores `last_ts` | `Monotone`, 13 steps |
+| `BugOverwrite.cfg` | a checkpoint overwrites the manifest instead of put-if-absent | `NoZombieAck`, 15 steps |
+| `GapStalledFence.cfg` | no check after the fence, 3 writers | `Correct`, 23 steps |
 
-Clock readings are unconstrained (any skew), which the model gained after a
-review found the `BugBound` bug: until then it had one global clock, so a
-late writer with a lagging clock couldn't happen. With free clock readings,
-`Sidra.cfg` and `TwoAppliers.cfg` no longer finish within 48 GB of memory;
-`check.sh` runs them only with `FULL=1`. Their state counts above predate partial checkpoints and the clock change; the correct protocol is checked in bounded form by `PartialCap`. The protocol is moving to a
-sans-IO Rust core checked with Stateright, which replaces this model.
+`GapStalledFence` turns off `CheckAfterFence`: after its fence put, the
+opener looks for manifest id + 1 and stops if it exists. Without it, an
+opener reads an empty slot, then stalls past GC retention. Meanwhile an older writer fills the slot,
+a third writer replays and checkpoints past it, and GC deletes it. The
+opener's fence put then lands in the deleted slot, and its later puts land in
+deleted slots: acknowledged, below a newer fence.
 
-`BugDiscovery` reproduced a real bug that randomized testing found once and
-then couldn't reproduce. The applier computed the floor from every writer's
-lease but pulled logs only from writers it already knew. A new writer's older
-`put` then arrived after a newer tombstone for the same key had been dropped,
-and the key came back.
+Partial checkpoints are safe because a checkpoint takes a prefix in slot
+order, and timestamps increase in slot order. Every version left in the WAL is
+newer than everything applied, so dropping a tombstone at a leaf can't
+resurrect an older one.
 
 ```sh
 cargo install everystate --locked
@@ -90,9 +101,9 @@ cd crates/sidra && cargo kani
   (`tests/model.rs`), not by these proofs.
 - Segment GC and the cleaner's relocation are checked only by the accounting
   invariant in the proptest.
-- The model treats a writer's end as atomic (`Expire`: it stops flushing
-  and appliers stop counting it in one step). The code gets this from log
-  seals rather than clocks: an applier stops counting a writer only after a
-  put-if-absent seal at its next log slot, after which no flush can land,
-  and the entries before the seal go into the same checkpoint. Seals
-  themselves aren't modeled. Clock readings are unconstrained.
+- One key. The tree is one version; leaf tombstone drops are modelled, the
+  buffer levels are not.
+- Time is not modelled: GC retention, manifest GC, and a writer stalled past
+  retention at a checkpoint publish (its put-if-absent target manifest could
+  be deleted).
+- One put in flight per writer; no queue of stamped batches.

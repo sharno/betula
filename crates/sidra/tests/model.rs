@@ -1,11 +1,7 @@
-//! Model-based tests: random op sequences over several concurrent writers
-//! against a `BTreeMap`, with tiny nodes so splits, buffer flushes, removals,
-//! relocation and root growth/shrink happen constantly.
-//!
-//! A manual clock, advanced before every write, makes timestamp order equal
-//! call order, so the model is plain sequential last-writer-wins. Queued
-//! (not yet durable) writes and checkpoints that flush only the applier make
-//! late writes from slow writers happen for real.
+//! Model-based tests: random op sequences against a `BTreeMap`, with tiny
+//! nodes so splits, buffer flushes, removals, relocation and root
+//! growth/shrink happen constantly. Writers are replaced, crash mid-
+//! checkpoint, and are fenced while still running; readers follow along.
 //!
 //! `simulation_*` runs the same harness deterministically in virtual time
 //! (see the section below).
@@ -23,9 +19,9 @@ use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use proptest::prelude::*;
 use sidra::{
-    ApplierRole, CacheConfig, CheckpointConfig, CleanerConfig, Clock, Db, DbReader, Durability,
-    Error, ErrorKind, Gc, GcConfig, KeyRange, LeaseConfig, PollConfig, ReaderSettings, SegmentId,
-    Settings, TreeConfig, Ts, WalConfig, Warm, WriteBatch, WriteOptions,
+    CacheConfig, CheckpointConfig, CleanerConfig, Clock, Db, DbReader, Durability, Error,
+    ErrorKind, Freshness, Gc, GcConfig, KeyRange, ReadOptions, ReaderSettings, SegmentId, Settings,
+    TreeConfig, Ts, WalConfig, Warm, WriteBatch, WriteOptions,
 };
 
 #[path = "support/faulty.rs"]
@@ -33,14 +29,16 @@ mod faulty;
 use faulty::{Faults, Faulty, Trace};
 
 const ROOT: &str = "db";
-const WRITERS: usize = 3;
 const HOUR: Duration = Duration::from_secs(3600);
+const LATEST: ReadOptions = ReadOptions {
+    freshness: Freshness::Latest,
+};
 
 struct ManualClock(AtomicU64);
 
 impl ManualClock {
     fn new() -> Arc<Self> {
-        Arc::new(Self(AtomicU64::new(1_000)))
+        Arc::new(Self(AtomicU64::new(1_000_000)))
     }
     fn tick(&self) {
         self.0.fetch_add(1, Ordering::SeqCst);
@@ -82,8 +80,7 @@ impl Clock for VirtualClock {
 /// How time passes in a run.
 #[derive(Clone)]
 enum Time {
-    /// Moves only when the test moves it: a tick before every write makes
-    /// timestamp order equal call order.
+    /// Moves only when the test moves it.
     Manual(Arc<ManualClock>),
     Virtual(Arc<VirtualClock>),
 }
@@ -99,8 +96,6 @@ impl Time {
     fn tick(&self) {
         match self {
             Time::Manual(c) => c.tick(),
-            // Virtual time moves on its own; the model orders writes by the
-            // timestamps they got.
             Time::Virtual(_) => {}
         }
     }
@@ -154,17 +149,6 @@ fn tiny_config() -> Settings {
             max_bytes: 1000,
             max_unapplied_bytes: 1 << 30,
         },
-        poll: PollConfig {
-            interval: Duration::from_millis(5),
-            max_interval: Duration::from_millis(20),
-            discovery_interval: Duration::from_millis(20),
-            follow: sidra::Follow::AllWriters,
-        },
-        lease: LeaseConfig {
-            interval: Duration::from_millis(5),
-            ttl: HOUR,
-        },
-        applier: ApplierRole::Auto { steal_after: HOUR },
         gc: Gc::Off,
         // Clean eagerly so relocation runs constantly.
         cleaner: CleanerConfig {
@@ -174,10 +158,7 @@ fn tiny_config() -> Settings {
         },
         // Exercise the compressed path everywhere in tests.
         compression: sidra::Compression::Lz4,
-        log: sidra::LogHome::Home,
-        regions: BTreeMap::new(),
         warm: Warm::Blocking,
-        rewarm: Warm::Blocking,
         hedge: sidra::Hedge::default(),
     }
 }
@@ -189,19 +170,29 @@ fn reader_config() -> ReaderSettings {
             leaf_bytes: 1024,
         },
         refresh_interval: None,
-        discovery_interval: Duration::from_millis(20),
         warm: Warm::Off,
         rewarm: Warm::Off,
-        regions: BTreeMap::new(),
         origin: None,
         hedge: sidra::Hedge::default(),
     }
 }
 
 async fn open(os: &Arc<dyn ObjectStore>, clock: &Arc<ManualClock>) -> Db {
+    open_with(os, clock, tiny_config()).await
+}
+
+async fn open_with(os: &Arc<dyn ObjectStore>, clock: &Arc<ManualClock>, cfg: Settings) -> Db {
     Db::builder(ROOT, os.clone())
-        .with_settings(tiny_config())
+        .with_settings(cfg)
         .with_clock(clock.clone())
+        .build()
+        .await
+        .unwrap()
+}
+
+async fn reader(os: &Arc<dyn ObjectStore>) -> DbReader {
+    DbReader::builder(ROOT, os.clone())
+        .with_settings(reader_config())
         .build()
         .await
         .unwrap()
@@ -225,28 +216,50 @@ async fn assert_accounting(db: &Db) {
 
 #[derive(Clone, Debug)]
 enum Op {
-    Put(usize, u8, Vec<u8>),
-    PutQueued(usize, u8, Vec<u8>),
-    Delete(usize, u8),
-    Get(usize, u8),
-    Scan(usize, u8, u8),
+    Put(u8, Vec<u8>),
+    PutQueued(u8, Vec<u8>),
+    Delete(u8),
+    Get(u8),
+    Scan(u8, u8),
     Checkpoint,
-    Claim(usize),
-    /// A fresh process replaces the writer, with its clock this many ms
-    /// behind.
-    Reopen(usize, u64),
-    /// The writer dies without closing; an applier dies this many
-    /// microseconds into a checkpoint. Its replacement's clock lags by the
-    /// second value (ms).
-    Crash(usize, u64, u64),
+    /// A fresh writer replaces the current one, which then closes. Its
+    /// clock runs this many ms behind.
+    Reopen(u64),
+    /// The writer dies without closing, this many microseconds into a
+    /// checkpoint. Its replacement's clock lags by the second value (ms).
+    Crash(u64, u64),
+    /// A fresh writer opens while the current one still runs; the old one
+    /// then tries to write and checkpoint, and must fail without effect.
+    Fence(u8, u64),
     ReaderScan,
     /// A read through a long-lived reader that refreshes on its own timer,
     /// so it may still be on an old manifest. It must not fail: GC keeps
     /// what such a reader needs for the retention period.
     StaleGet(u8),
-    /// Time passes (ms) with nothing asked of the writers; their background
-    /// loops (polls, leases, checkpoints, purges, GC) keep running.
+    /// The long-lived reader with `Freshness::Latest` sees every
+    /// acknowledged write.
+    LatestGet(u8),
+    /// Time passes (ms) with nothing asked of the writer; its background
+    /// loops (checkpoints, purges, GC) keep running.
     Wait(u64),
+}
+
+impl Op {
+    /// Whether the op checks reads against the model.
+    fn reads(&self) -> bool {
+        match self {
+            Op::Get(_) | Op::Scan(..) | Op::ReaderScan | Op::LatestGet(_) => true,
+            Op::Put(..)
+            | Op::PutQueued(..)
+            | Op::Delete(_)
+            | Op::Checkpoint
+            | Op::Reopen(_)
+            | Op::Crash(..)
+            | Op::Fence(..)
+            | Op::StaleGet(_)
+            | Op::Wait(_) => false,
+        }
+    }
 }
 
 fn key(k: u8) -> Bytes {
@@ -254,55 +267,50 @@ fn key(k: u8) -> Bytes {
 }
 
 fn op() -> impl Strategy<Value = Op> {
-    let w = 0..WRITERS;
     let value = proptest::collection::vec(any::<u8>(), 0..40);
     prop_oneof![
-        6 => (w.clone(), 0u8..60, value.clone()).prop_map(|(w, k, v)| Op::Put(w, k, v)),
-        3 => (w.clone(), 0u8..60, value).prop_map(|(w, k, v)| Op::PutQueued(w, k, v)),
-        4 => (w.clone(), 0u8..60).prop_map(|(w, k)| Op::Delete(w, k)),
-        2 => (w.clone(), 0u8..60).prop_map(|(w, k)| Op::Get(w, k)),
-        1 => (w.clone(), 0u8..60, 0u8..60).prop_map(|(w, a, b)| Op::Scan(w, a, b)),
+        6 => (0u8..60, value.clone()).prop_map(|(k, v)| Op::Put(k, v)),
+        3 => (0u8..60, value).prop_map(|(k, v)| Op::PutQueued(k, v)),
+        4 => (0u8..60).prop_map(Op::Delete),
+        2 => (0u8..60).prop_map(Op::Get),
+        1 => (0u8..60, 0u8..60).prop_map(|(a, b)| Op::Scan(a, b)),
         2 => Just(Op::Checkpoint),
-        1 => w.clone().prop_map(Op::Claim),
-        1 => (w.clone(), 0u64..300).prop_map(|(w, lag)| Op::Reopen(w, lag)),
-        1 => (w, 0u64..3000, 0u64..300).prop_map(|(w, us, lag)| Op::Crash(w, us, lag)),
+        1 => (0u64..3_000).prop_map(Op::Reopen),
+        1 => (0u64..3000, 0u64..3_000).prop_map(|(us, lag)| Op::Crash(us, lag)),
+        1 => (0u8..60, 0u64..3_000).prop_map(|(k, lag)| Op::Fence(k, lag)),
         1 => Just(Op::ReaderScan),
         1 => (0u8..60).prop_map(Op::StaleGet),
+        1 => (0u8..60).prop_map(Op::LatestGet),
     ]
 }
 
 type Model = BTreeMap<Bytes, Bytes>;
 
-/// Last-writer-wins by timestamp: what every reader must see once all
-/// acknowledged writes are visible, whatever the writers' clock skew.
+/// Last-writer-wins by timestamp. Timestamps grow across writers, so this
+/// is also call order.
 #[derive(Default)]
-struct Lww(BTreeMap<Bytes, (Ts, Option<Bytes>)>);
+struct Lww {
+    map: BTreeMap<Bytes, (Ts, Option<Bytes>)>,
+    last: Option<Ts>,
+}
 
 impl Lww {
     fn apply(&mut self, k: Bytes, ts: Ts, v: Option<Bytes>) {
-        match self.0.get(&k) {
-            Some((old, _)) if *old >= ts => {}
-            _ => {
-                self.0.insert(k, (ts, v));
-            }
-        }
+        assert!(
+            self.last.is_none_or(|l| ts > l),
+            "timestamp {ts} not after {:?}",
+            self.last
+        );
+        self.last = Some(ts);
+        self.map.insert(k, (ts, v));
     }
 
     fn visible(&self) -> Model {
-        self.0
+        self.map
             .iter()
             .filter_map(|(k, (_, v))| v.clone().map(|v| (k.clone(), v)))
             .collect()
     }
-}
-
-/// Per-writer clock lags: often none (exact order), else up to 300 ms, far
-/// more than the gaps between writes, so writers' timestamps interleave.
-fn lags() -> impl Strategy<Value = Vec<u64>> {
-    prop_oneof![
-        1 => Just(vec![0; WRITERS]),
-        3 => proptest::collection::vec(0u64..300, WRITERS),
-    ]
 }
 
 fn model_range(model: &Model, range: &KeyRange) -> Vec<(Bytes, Bytes)> {
@@ -336,17 +344,16 @@ where
     panic!("{what}: still failing after 100 attempts: {last:?}");
 }
 
-/// What a run varies besides its ops and clock lags.
+/// What a run varies besides its ops.
 struct Setup {
     /// `None`: a fault-free store.
     faults: Option<Faults>,
-    /// Seeds faults and writer ids.
     seed: u64,
     time: Time,
     cfg: Settings,
 }
 
-/// Several writers on one store, optionally behind injected faults.
+/// One writer at a time on one store, optionally behind injected faults.
 struct World {
     os: Arc<dyn ObjectStore>,
     /// The store under `os`; it injects faults only when `faults` is set.
@@ -354,165 +361,157 @@ struct World {
     faults: bool,
     time: Time,
     cfg: Settings,
-    seed: u64,
-    /// Writers opened so far, for their ids.
-    opened: AtomicU64,
-    /// How far behind the shared clock each writer slot's clock runs.
-    lags: Vec<u64>,
-    dbs: Vec<Db>,
+    db: Option<Db>,
     /// See `Op::StaleGet`.
     reader: DbReader,
 }
 
 impl World {
-    async fn new(setup: Setup, lags: Vec<u64>) -> Self {
+    async fn new(setup: Setup) -> Self {
         let store = Arc::new(Faulty::new(
             Arc::new(InMemory::new()),
             setup.faults.unwrap_or(Faults::NONE),
             setup.seed,
         ));
-        let reader = until_ok("reader open", || {
-            DbReader::builder(ROOT, store.clone() as Arc<dyn ObjectStore>)
-                .with_settings(ReaderSettings {
-                    refresh_interval: Some(Duration::from_secs(1)),
-                    ..reader_config()
-                })
-                .build()
-        })
-        .await;
+        let os: Arc<dyn ObjectStore> = store.clone();
         let mut w = Self {
-            reader,
-            os: store.clone(),
+            reader: until_ok("reader open", || {
+                DbReader::builder(ROOT, os.clone())
+                    .with_settings(ReaderSettings {
+                        refresh_interval: Some(Duration::from_secs(1)),
+                        ..reader_config()
+                    })
+                    .build()
+            })
+            .await,
+            os,
             store,
             faults: setup.faults.is_some(),
             time: setup.time,
             cfg: setup.cfg,
-            seed: setup.seed,
-            opened: AtomicU64::new(0),
-            lags,
-            dbs: Vec::new(),
+            db: None,
         };
-        for slot in 0..WRITERS {
-            let db = w.open(slot).await;
-            w.dbs.push(db);
-        }
+        w.db = Some(w.open(0).await);
         w
     }
 
-    async fn open(&self, slot: usize) -> Db {
+    fn db(&self) -> &Db {
+        self.db.as_ref().expect("a writer is open")
+    }
+
+    async fn open(&self, lag_ms: u64) -> Db {
         let clock = Arc::new(Skewed {
             base: self.time.clock(),
-            lag_ms: self.lags[slot],
+            lag_ms,
         });
         until_ok("open", || {
-            // A fresh id per attempt: a failed open may have left a lease.
-            let n = self.opened.fetch_add(1, Ordering::Relaxed);
             Db::builder(ROOT, self.os.clone())
                 .with_settings(self.cfg.clone())
                 .with_clock(clock.clone())
-                .with_writer_id(sidra::WriterId(faulty::splitmix(self.seed ^ n)))
                 .build()
         })
         .await
     }
 
-    /// Replaces writer `w` with a fresh one.
-    async fn reopen(&mut self, w: usize) {
-        let fresh = self.open(w).await;
-        let old = std::mem::replace(&mut self.dbs[w], fresh);
+    /// Makes queued writes durable: only acknowledged writes must survive a
+    /// writer being replaced.
+    async fn flush(&mut self) {
+        match self.db().flush_wal().await {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::WriterLost => self.reopen(0).await,
+            Err(e) => panic!("flush: {e}"),
+        }
+    }
+
+    /// Replaces the writer with a fresh one and closes the old one, which
+    /// finds itself fenced (or not, if it had nothing left to do).
+    async fn reopen(&mut self, lag_ms: u64) {
+        let fresh = self.open(lag_ms).await;
+        let old = self.db.replace(fresh).expect("a writer is open");
         match old.close().await {
             Ok(()) => {}
-            // A lost writer, or a store failure while releasing the role.
-            Err(e) if self.faults && (injected(&e) || e.kind() == ErrorKind::WriterLost) => {}
+            Err(e) if e.kind() == ErrorKind::WriterLost => {}
+            Err(e) if self.faults && injected(&e) => {}
             Err(e) => panic!("close: {e}"),
         }
     }
 
     /// Writes until acknowledged, replacing the writer if it's lost (then
     /// the write may have landed already; repeating it is harmless).
-    async fn write(&mut self, w: usize, batch: WriteBatch, opts: WriteOptions) -> Ts {
+    async fn write(&mut self, batch: WriteBatch, opts: WriteOptions) -> Ts {
         for _ in 0..100 {
-            match self.dbs[w].write_with(batch.clone(), opts).await {
+            match self.db().write_with(batch.clone(), opts).await {
                 Ok(ts) => return ts.expect("non-empty batch"),
                 Err(e) if injected(&e) => {}
-                Err(e) if e.kind() == ErrorKind::WriterLost => self.reopen(w).await,
+                Err(e) if e.kind() == ErrorKind::WriterLost => self.reopen(0).await,
                 Err(e) => panic!("write: {e}"),
             }
         }
         panic!("write: still failing");
     }
 
-    /// Kills writer `w` (an applier part-way through a checkpoint) and
-    /// starts a fresh one. Queued writes are flushed first: only
-    /// acknowledged writes must survive a crash.
-    async fn crash(&mut self, w: usize, after: Duration) {
-        match self.dbs[w].flush_wal().await {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::WriterLost => {}
-            Err(e) => panic!("flush: {e}"),
-        }
-        if self.dbs[w].is_applier() {
-            // Cancelling the checkpoint stops it at whatever await it
-            // reached: segments may be uploaded with no manifest.
-            let _ = tokio::time::timeout(after, self.dbs[w].checkpoint()).await;
-        }
-        let fresh = self.open(w).await;
-        drop(std::mem::replace(&mut self.dbs[w], fresh));
+    /// Kills the writer part-way through a checkpoint and opens a fresh one.
+    async fn crash(&mut self, after: Duration, lag_ms: u64) {
+        self.flush().await;
+        // Cancelling the checkpoint stops it at whatever await it reached:
+        // segments may be uploaded with no manifest.
+        let _ = tokio::time::timeout(after, self.db().checkpoint()).await;
+        drop(self.db.take());
+        self.db = Some(self.open(lag_ms).await);
     }
 
-    /// Makes every durable write visible to writer `reader`.
-    async fn sync(&mut self, reader: usize) {
-        for w in 0..self.dbs.len() {
-            match self.dbs[w].flush_wal().await {
-                Ok(()) => {}
-                Err(e) if e.kind() == ErrorKind::WriterLost => self.reopen(w).await,
-                Err(e) => panic!("flush: {e}"),
-            }
-        }
-        until_ok("refresh", || self.dbs[reader].refresh()).await;
+    /// Opens a writer while the current one runs. The old one can't write,
+    /// checkpoint, or change anything after that.
+    async fn fence(&mut self, k: u8, lag_ms: u64) {
+        self.flush().await;
+        let fresh = self.open(lag_ms).await;
+        let old = self.db.replace(fresh).expect("a writer is open");
+        let mut batch = WriteBatch::new();
+        batch.put(key(k), "zombie");
+        let wrote = old.write(batch).await;
+        assert!(
+            matches!(&wrote, Err(e) if e.kind() == ErrorKind::WriterLost || injected(e)),
+            "a fenced writer wrote: {wrote:?}"
+        );
+        let checkpointed = old.checkpoint().await;
+        assert!(
+            matches!(&checkpointed, Err(e) if e.kind() == ErrorKind::WriterLost || injected(e)),
+            "a fenced writer checkpointed: {checkpointed:?}"
+        );
+        drop(old);
     }
-}
 
-/// Runs a checkpoint on whoever holds the applier role, claiming it with
-/// writer 0 if nobody does. A store failure just means no checkpoint.
-async fn checkpoint(dbs: &[Db]) {
-    // Released roles are taken by background claims too, so the claim can
-    // lose a race; then whoever won is the applier.
-    let applier = loop {
-        match dbs.iter().position(Db::is_applier) {
-            Some(i) => break i,
-            None => match dbs[0].claim_applier().await {
-                Ok(true) => break 0,
-                Ok(false) => tokio::task::yield_now().await,
-                Err(e) if injected(&e) => return,
-                Err(e) => panic!("claim: {e}"),
-            },
+    async fn checkpoint(&mut self) {
+        match self.db().checkpoint().await {
+            Ok(()) => assert_accounting(self.db()).await,
+            Err(e) if injected(&e) => {}
+            Err(e) if self.faults && e.kind() == ErrorKind::WriterLost => self.reopen(0).await,
+            Err(e) => panic!("checkpoint: {e}"),
         }
-    };
-    match dbs[applier].checkpoint().await {
-        Ok(()) => assert_accounting(&dbs[applier]).await,
-        // Lost the role to a concurrent claim, or the store failed: fine.
-        Err(Error::NotApplier) => {}
-        Err(e) if injected(&e) => {}
-        Err(e) => panic!("checkpoint: {e}"),
     }
 }
 
 /// Runs `ops`, checking reads against the model as it goes and everything
 /// at the end. Returns the store's request trace.
-async fn run(ops: Vec<Op>, lags: Vec<u64>, setup: Setup) -> Trace {
-    let mut world = World::new(setup, lags).await;
+async fn run(ops: Vec<Op>, setup: Setup) -> Trace {
+    let mut world = World::new(setup).await;
     let mut lww = Lww::default();
+    // Queued writes not yet flushed: they turn visible with the next flush.
+    let mut queued = false;
     for op in ops {
+        if queued && op.reads() {
+            world.flush().await;
+            queued = false;
+        }
         match op {
-            Op::Put(w, k, v) => {
+            Op::Put(k, v) => {
                 world.time.tick();
                 let mut batch = WriteBatch::new();
                 batch.put(key(k), &v);
-                let ts = world.write(w, batch, WriteOptions::default()).await;
+                let ts = world.write(batch, WriteOptions::default()).await;
                 lww.apply(key(k), ts, Some(Bytes::from(v)));
             }
-            Op::PutQueued(w, k, v) => {
+            Op::PutQueued(k, v) => {
                 world.time.tick();
                 let mut batch = WriteBatch::new();
                 batch.put(key(k), &v);
@@ -522,24 +521,22 @@ async fn run(ops: Vec<Op>, lags: Vec<u64>, setup: Setup) -> Trace {
                     true => Durability::AwaitDurable,
                     false => Durability::Queued,
                 };
-                let ts = world.write(w, batch, WriteOptions { durability }).await;
+                let ts = world.write(batch, WriteOptions { durability }).await;
                 lww.apply(key(k), ts, Some(Bytes::from(v)));
+                queued = true;
             }
-            Op::Delete(w, k) => {
+            Op::Delete(k) => {
                 world.time.tick();
                 let mut batch = WriteBatch::new();
                 batch.delete(key(k));
-                let ts = world.write(w, batch, WriteOptions::default()).await;
+                let ts = world.write(batch, WriteOptions::default()).await;
                 lww.apply(key(k), ts, None);
             }
-            Op::Get(w, k) => {
-                world.sync(w).await;
-                let model = lww.visible();
-                let got = until_ok("get", || world.dbs[w].get(key(k))).await;
-                assert_eq!(got, model.get(&key(k)).cloned(), "get {k} via writer {w}");
+            Op::Get(k) => {
+                let got = until_ok("get", || world.db().get(key(k))).await;
+                assert_eq!(got, lww.visible().get(&key(k)).cloned(), "get {k}");
             }
-            Op::Scan(w, a, b) => {
-                world.sync(w).await;
+            Op::Scan(a, b) => {
                 let model = lww.visible();
                 let (lo, hi) = (a.min(b), a.max(b));
                 let ranges = [
@@ -549,54 +546,50 @@ async fn run(ops: Vec<Op>, lags: Vec<u64>, setup: Setup) -> Trace {
                     KeyRange::new(Bound::Included(key(lo)), Bound::Unbounded),
                 ];
                 for r in ranges {
-                    let got = until_ok("scan", || world.dbs[w].scan(r.clone()).collect()).await;
-                    assert_eq!(got, model_range(&model, &r), "scan {r:?} via writer {w}");
+                    let got = until_ok("scan", || world.db().scan(r.clone()).collect()).await;
+                    assert_eq!(got, model_range(&model, &r), "scan {r:?}");
                 }
             }
-            Op::Checkpoint => checkpoint(&world.dbs).await,
-            Op::Claim(w) => match world.dbs[w].claim_applier().await {
-                Ok(_) => {}
-                Err(e) if injected(&e) => {}
-                Err(e) => panic!("claim: {e}"),
-            },
-            Op::Reopen(w, lag) => {
-                world.lags[w] = lag;
-                world.reopen(w).await
+            Op::Checkpoint => world.checkpoint().await,
+            Op::Reopen(lag) => {
+                world.flush().await;
+                world.reopen(lag).await
             }
-            Op::Crash(w, us, lag) => {
-                world.lags[w] = lag;
-                world.crash(w, Duration::from_micros(us)).await
-            }
+            Op::Crash(us, lag) => world.crash(Duration::from_micros(us), lag).await,
+            Op::Fence(k, lag) => world.fence(k, lag).await,
             Op::Wait(ms) => world.time.wait(Duration::from_millis(ms)).await,
             Op::StaleGet(k) => match world.reader.get(key(k)).await {
                 Ok(_) => {}
                 Err(e) if injected(&e) => {}
                 Err(e) => panic!("stale get {k}: {e}"),
             },
+            Op::LatestGet(k) => {
+                world.flush().await;
+                let got = until_ok("latest get", || world.reader.get_with(key(k), LATEST)).await;
+                assert_eq!(got, lww.visible().get(&key(k)).cloned(), "latest get {k}");
+            }
             Op::ReaderScan => {
-                world.sync(0).await;
+                world.flush().await;
                 let model = lww.visible();
-                let reader = until_ok("reader open", || {
+                let fresh = until_ok("reader open", || {
                     DbReader::builder(ROOT, world.os.clone())
                         .with_settings(reader_config())
                         .build()
                 })
                 .await;
-                let got = until_ok("reader scan", || reader.scan(KeyRange::all()).collect()).await;
+                let got = until_ok("reader scan", || fresh.scan(KeyRange::all()).collect()).await;
                 assert_eq!(got, model_range(&model, &KeyRange::all()), "reader scan");
             }
         }
     }
     // Verify without faults: everything acknowledged survived them.
     world.store.set_enabled(false);
-    world.sync(1).await;
+    world.flush().await;
     let model = lww.visible();
-    let all = world.dbs[1].scan(KeyRange::all()).collect().await.unwrap();
+    let all = world.db().scan(KeyRange::all()).collect().await.unwrap();
     assert_eq!(all, model_range(&model, &KeyRange::all()));
-    checkpoint(&world.dbs).await;
-    for db in std::mem::take(&mut world.dbs) {
-        db.close().await.unwrap();
-    }
+    world.checkpoint().await;
+    world.db.take().unwrap().close().await.unwrap();
     let db = world.open(0).await;
     let all = db.scan(KeyRange::all()).collect().await.unwrap();
     assert_eq!(all, model_range(&model, &KeyRange::all()), "after reopen");
@@ -616,10 +609,10 @@ fn cases(default: u32) -> u32 {
 proptest! {
     #![proptest_config(ProptestConfig { cases: cases(48), ..ProptestConfig::default() })]
     #[test]
-    fn matches_model(ops in proptest::collection::vec(op(), 1..250), lags in lags(), seed in any::<u64>()) {
+    fn matches_model(ops in proptest::collection::vec(op(), 1..250), seed in any::<u64>()) {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         let setup = Setup { faults: None, seed, time: Time::Manual(ManualClock::new()), cfg: tiny_config() };
-        rt.block_on(run(ops, lags, setup));
+        rt.block_on(run(ops, setup));
     }
 }
 
@@ -629,7 +622,7 @@ proptest! {
     /// Same, with store requests failing before and after they apply, and
     /// random delays.
     #[test]
-    fn matches_model_under_faults(ops in proptest::collection::vec(op(), 1..150), lags in lags(), seed in any::<u64>()) {
+    fn matches_model_under_faults(ops in proptest::collection::vec(op(), 1..150), seed in any::<u64>()) {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         let faults = Faults {
             fail_before: 0.05,
@@ -637,7 +630,7 @@ proptest! {
             max_delay: Duration::from_millis(1),
         };
         let setup = Setup { faults: Some(faults), seed, time: Time::Manual(ManualClock::new()), cfg: tiny_config() };
-        rt.block_on(run(ops, lags, setup));
+        rt.block_on(run(ops, setup));
     }
 }
 
@@ -645,7 +638,7 @@ proptest! {
 // Deterministic simulation: the same harness on a paused current-thread
 // runtime, so virtual time drives every timer and a seed replays exactly.
 // Timers are realistic (seconds, not hours) and waits let minutes pass, so
-// lease expiry, takeover, purges and GC all happen.
+// background checkpoints, purges and GC all happen.
 
 const SIM_FAULTS: Faults = Faults {
     fail_before: 0.03,
@@ -660,8 +653,6 @@ fn sim_config() -> Settings {
             purge_tombstones_after: Duration::from_secs(5),
             ..tiny.tree
         },
-        // Short next to polls, as with a real store, so writers act many
-        // times before they see each other's progress.
         wal: WalConfig {
             flush_interval: Duration::from_millis(1),
             ..tiny.wal
@@ -669,19 +660,6 @@ fn sim_config() -> Settings {
         checkpoint: CheckpointConfig {
             interval: Duration::from_secs(1),
             ..tiny.checkpoint
-        },
-        poll: PollConfig {
-            interval: Duration::from_millis(200),
-            max_interval: Duration::from_secs(2),
-            discovery_interval: Duration::from_secs(2),
-            ..tiny.poll
-        },
-        lease: LeaseConfig {
-            interval: Duration::from_secs(1),
-            ttl: Duration::from_secs(10),
-        },
-        applier: ApplierRole::Auto {
-            steal_after: Duration::from_secs(30),
         },
         gc: Gc::On(GcConfig {
             interval: Duration::from_secs(5),
@@ -692,8 +670,8 @@ fn sim_config() -> Settings {
     }
 }
 
-/// The model test's ops plus waits: mostly short, sometimes past a lease
-/// timeout or the GC retention.
+/// The model test's ops plus waits: mostly short, sometimes past the GC
+/// retention.
 fn sim_op() -> impl Strategy<Value = Op> {
     prop_oneof![
         20 => op(),
@@ -702,21 +680,8 @@ fn sim_op() -> impl Strategy<Value = Op> {
     ]
 }
 
-/// Clock lags for simulations: up to 3 s, so a slow writer's late writes
-/// still predate tombstones that virtual time has carried down and dropped.
-/// Still well under the lease TTL.
-fn sim_lags() -> impl Strategy<Value = Vec<u64>> {
-    prop_oneof![
-        1 => Just(vec![0; WRITERS]),
-        3 => proptest::collection::vec(0u64..3_000, WRITERS),
-    ]
-}
-
 /// Runs `ops` in a fresh simulated world, on a store that injects `faults`.
-/// Without faults, queued writes stay queued: late writes from slow writers
-/// happen only then (under faults a lost writer may lose them, so they're
-/// awaited).
-fn simulate(ops: Vec<Op>, lags: Vec<u64>, faults: Option<Faults>, seed: u64) -> Trace {
+fn simulate(ops: Vec<Op>, faults: Option<Faults>, seed: u64) -> Trace {
     virtual_runtime().block_on(async {
         let setup = Setup {
             faults,
@@ -724,7 +689,7 @@ fn simulate(ops: Vec<Op>, lags: Vec<u64>, faults: Option<Faults>, seed: u64) -> 
             time: Time::Virtual(VirtualClock::new()),
             cfg: sim_config(),
         };
-        run(ops, lags, setup).await
+        run(ops, setup).await
     })
 }
 
@@ -733,11 +698,10 @@ proptest! {
     #[test]
     fn simulation_matches_model(
         ops in proptest::collection::vec(sim_op(), 1..200),
-        lags in sim_lags(),
         faults in prop_oneof![Just(None), Just(Some(SIM_FAULTS))],
         seed in any::<u64>(),
     ) {
-        simulate(ops, lags, faults, seed);
+        simulate(ops, faults, seed);
     }
 }
 
@@ -752,111 +716,74 @@ fn virtual_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// Writers that outpace the applier stall at the backlog limit instead of
-/// failing, share it fairly, and the applier keeps publishing: a checkpoint
-/// must not grow with the backlog until another writer takes the role
-/// mid-checkpoint, and the next one, over and over.
+/// Writes that outpace checkpoints stall at the backlog limit instead of
+/// failing or growing it, and checkpoints keep publishing.
 #[test]
-fn overload_stalls_writers_while_the_applier_keeps_up() {
+fn overload_stalls_writes_while_checkpoints_keep_up() {
     const LIMIT: usize = 100_000;
     const RUN: Duration = Duration::from_secs(300);
     virtual_runtime().block_on(async {
         let store = Arc::new(Faulty::new(Arc::new(InMemory::new()), Faults::NONE, 0));
-        // Uploading a checkpoint of the whole backlog takes well past
-        // `steal_after` (30 s).
+        // Uploads are slow next to how fast the writes come.
         store.throttle_puts(|p| p.ends_with(".seg"), 800);
         let os: Arc<dyn ObjectStore> = store.clone();
-        let clock = VirtualClock::new();
         let mut cfg = sim_config();
         cfg.checkpoint.max_unapplied_bytes = LIMIT;
-        let open = |w: u64| {
-            Db::builder(ROOT, os.clone())
-                .with_settings(cfg.clone())
-                .with_clock(clock.clone())
-                .with_writer_id(sidra::WriterId(w + 1))
+        let db = Arc::new(
+            Db::builder(ROOT, os)
+                .with_settings(cfg)
+                .with_clock(VirtualClock::new())
                 .build()
-        };
-        let mut dbs = Vec::new();
-        for w in 0..WRITERS as u64 {
-            dbs.push(Arc::new(open(w).await.unwrap()));
-        }
+                .await
+                .unwrap(),
+        );
         let start = tokio::time::Instant::now();
-        let writers = dbs.iter().enumerate().map(|(w, db)| {
+        let tasks = (0..3).map(|t| {
             let db = db.clone();
             tokio::spawn(async move {
-                // Last value written per key, and when each write was acked.
+                // Last value written per key.
                 let mut wrote = BTreeMap::new();
-                let mut acked = Vec::new();
                 for n in 0u32.. {
                     if start.elapsed() >= RUN {
                         break;
                     }
-                    let (k, v) = (format!("w{w}-{:03}", n % 500), format!("{n:0100}"));
-                    // Stalled, not stuck: a livelocked applier hangs here.
+                    let (k, v) = (format!("t{t}-{:03}", n % 500), format!("{n:0100}"));
+                    // Stalled, not stuck.
                     tokio::time::timeout(RUN, db.put(k.clone(), v.clone()))
                         .await
                         .expect("write stalled the whole run")
                         .unwrap();
                     wrote.insert(k, v);
-                    acked.push(start.elapsed());
                 }
-                (wrote, acked)
+                wrote
             })
         });
-        let writers = futures::future::join_all(writers);
-        tokio::pin!(writers);
-        // Sample the backlog and the applier until the writers stop.
+        let tasks = futures::future::join_all(tasks);
+        tokio::pin!(tasks);
         let (mut backlog, mut gap) = (0, Duration::ZERO);
-        let mut epochs = std::collections::BTreeSet::new();
-        let mut last_manifest = (dbs[0].metrics().manifest_id, start.elapsed());
+        let mut last_manifest = (db.metrics().manifest_id, start.elapsed());
         let results = loop {
             tokio::select! {
                 biased;
-                r = &mut writers => break r,
+                r = &mut tasks => break r,
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
-            let m = dbs
-                .iter()
-                .map(|d| d.metrics())
-                .max_by_key(|m| m.manifest_id)
-                .unwrap();
-            backlog = backlog.max(
-                dbs.iter()
-                    .map(|d| d.metrics().unapplied_bytes)
-                    .max()
-                    .unwrap(),
-            );
-            epochs.insert(m.applier_epoch);
+            let m = db.metrics();
+            backlog = backlog.max(m.unapplied_bytes);
             if m.manifest_id != last_manifest.0 {
                 last_manifest = (m.manifest_id, start.elapsed());
             }
             gap = gap.max(start.elapsed() - last_manifest.1);
         };
-        eprintln!("backlog {backlog} B, manifest gap {gap:?}, epochs {epochs:?}");
+        eprintln!("backlog {backlog} B, manifest gap {gap:?}");
         assert!(gap <= Duration::from_secs(15), "no manifest for {gap:?}");
-        assert_eq!(epochs.len(), 1, "the applier role changed hands");
         assert!(backlog <= 2 * LIMIT, "backlog reached {backlog} B");
-        // Each writer gets a fair share: the applier, which sees room
-        // first, doesn't starve the rest.
-        let acks: Vec<usize> = results
-            .iter()
-            .map(|r| r.as_ref().unwrap().1.len())
-            .collect();
-        eprintln!("acks per writer {acks:?}");
-        let (least, most) = (acks.iter().min().unwrap(), acks.iter().max().unwrap());
-        assert!(least * 2 >= *most, "unfair: {acks:?}");
-        // Drains, and nothing acknowledged is lost.
-        for db in &dbs {
-            db.flush_wal().await.unwrap();
-        }
-        let applier = dbs.iter().find(|d| d.is_applier()).expect("an applier");
-        while applier.metrics().unapplied_bytes > 0 {
-            applier.checkpoint().await.unwrap();
-        }
-        for (wrote, _) in results.into_iter().map(Result::unwrap) {
+        db.checkpoint().await.unwrap();
+        assert_eq!(db.metrics().unapplied_bytes, 0);
+        for wrote in results.into_iter().map(Result::unwrap) {
             for (k, v) in wrote {
                 assert_eq!(
-                    applier.get(&k).await.unwrap().as_deref(),
+                    db.get(&k).await.unwrap().as_deref(),
                     Some(v.as_bytes()),
                     "{k}"
                 );
@@ -876,12 +803,14 @@ fn simulation_replays_exactly() {
         .new_tree(&mut runner)
         .unwrap()
         .current();
-    let lags = sim_lags().new_tree(&mut runner).unwrap().current();
     let faults = Some(SIM_FAULTS);
-    let first = simulate(ops.clone(), lags.clone(), faults, 7);
+    let first = simulate(ops.clone(), faults, 7);
     assert!(first.requests > 1000, "{first:?}");
-    assert_eq!(simulate(ops, lags, faults, 7), first);
+    assert_eq!(simulate(ops, faults, 7), first);
 }
+
+// ---------------------------------------------------------------------------
+// Scenarios
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bulk_load_builds_multi_level_tree() {
@@ -903,112 +832,168 @@ async fn bulk_load_builds_multi_level_tree() {
     assert_eq!(all, model_range(&model, &KeyRange::all()));
 }
 
+/// Concurrent writes share one log in timestamp order, so a checkpoint that
+/// applies only a prefix of it never leaves an older write behind a newer
+/// delete it dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_writers_all_land() {
+async fn concurrent_writes_land_in_timestamp_order() {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let clock = ManualClock::new();
-    let dbs: Vec<Arc<Db>> = futures::future::join_all((0..4).map(|_| open(&os, &clock)))
-        .await
-        .into_iter()
-        .map(Arc::new)
-        .collect();
-    assert_eq!(dbs.iter().filter(|d| d.is_applier()).count(), 1);
-    let tasks: Vec<_> = dbs
-        .iter()
-        .enumerate()
-        .map(|(w, db)| {
+    let mut cfg = tiny_config();
+    // One batch per checkpoint, and nothing in the background.
+    cfg.checkpoint.max_bytes = 1;
+    cfg.checkpoint.bytes = 1 << 30;
+    let db = Arc::new(
+        Db::builder(ROOT, os.clone())
+            .with_settings(cfg)
+            .build()
+            .await
+            .unwrap(),
+    );
+    let tasks: Vec<_> = (0..8u32)
+        .map(|t| {
             let db = db.clone();
             tokio::spawn(async move {
-                for i in 0..200u32 {
-                    db.put(format!("w{w}-{i:04}"), format!("{w}:{i}"))
-                        .await
-                        .unwrap();
+                let mut wrote = Vec::new();
+                for i in 0..100u32 {
+                    let mut batch = WriteBatch::new();
+                    let value = match (t + i) % 3 {
+                        0 => None,
+                        _ => Some(format!("{t}:{i}")),
+                    };
+                    match &value {
+                        Some(v) => batch.put("k", v),
+                        None => batch.delete("k"),
+                    };
+                    batch.put(format!("t{t}-{i:03}"), "v");
+                    wrote.push((db.write(batch).await.unwrap().unwrap(), value));
                 }
+                wrote
             })
         })
         .collect();
-    futures::future::try_join_all(tasks).await.unwrap();
-    let applier = dbs.iter().find(|d| d.is_applier()).unwrap();
-    applier.checkpoint().await.unwrap();
-    let reader = DbReader::builder(ROOT, os.clone())
-        .with_settings(reader_config())
-        .build()
+    let wrote: Vec<(Ts, Option<String>)> = futures::future::try_join_all(tasks)
         .await
-        .unwrap();
-    let all = reader.scan(KeyRange::all()).collect().await.unwrap();
-    assert_eq!(all.len(), 800);
-    assert_eq!(
-        reader.get(b"w3-0199").await.unwrap(),
-        Some(Bytes::from("3:199"))
-    );
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect();
+    let (_, last) = wrote.iter().max_by_key(|(ts, _)| *ts).unwrap();
+    db.checkpoint().await.unwrap();
+    assert_eq!(db.get("k").await.unwrap(), last.clone().map(Bytes::from));
+    let fresh = reader(&os).await;
+    assert_eq!(fresh.get("k").await.unwrap(), last.clone().map(Bytes::from));
+    assert_eq!(fresh.scan("t".."u").collect().await.unwrap().len(), 800);
 }
 
+/// A writer that dies without closing leaves durable writes in the log; the
+/// next writer replays and applies them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn applier_failover_applies_the_dead_appliers_writes() {
-    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let clock = ManualClock::new();
-    let mut cfg = tiny_config();
-    cfg.applier = ApplierRole::Auto {
-        steal_after: Duration::from_secs(10),
-    };
-    cfg.checkpoint.bytes = 1 << 30;
-    let a = Db::builder(ROOT, os.clone())
-        .with_settings(cfg.clone())
-        .with_clock(clock.clone())
-        .build()
-        .await
-        .unwrap();
-    let b = Db::builder(ROOT, os.clone())
-        .with_settings(cfg)
-        .with_clock(clock.clone())
-        .build()
-        .await
-        .unwrap();
-    assert!(a.is_applier() && !b.is_applier());
-    clock.tick();
-    a.put("from-a", "1").await.unwrap();
-    clock.tick();
-    b.put("from-b", "2").await.unwrap();
-    // `a` dies without a final checkpoint.
-    drop(a);
-    clock.advance(Duration::from_secs(60));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !b.is_applier() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("b takes over the applier role");
-    b.checkpoint().await.unwrap();
-    let reader = DbReader::builder(ROOT, os)
-        .with_settings(reader_config())
-        .build()
-        .await
-        .unwrap();
-    assert_eq!(reader.get(b"from-a").await.unwrap(), Some(Bytes::from("1")));
-    assert_eq!(reader.get(b"from-b").await.unwrap(), Some(Bytes::from("2")));
-    assert!(b.metrics().unapplied_bytes == 0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stale_applier_is_fenced_but_keeps_writing() {
+async fn a_new_writer_replays_the_previous_writers_log() {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let clock = ManualClock::new();
     let a = open(&os, &clock).await;
-    let b = open(&os, &clock).await;
-    assert!(a.is_applier());
-    assert!(b.claim_applier().await.unwrap());
     clock.tick();
-    a.put("x", "1").await.unwrap();
-    assert!(matches!(a.checkpoint().await, Err(Error::NotApplier)));
-    assert!(!a.is_applier());
+    a.put("applied", "1").await.unwrap();
+    a.checkpoint().await.unwrap();
+    clock.tick();
+    a.put("logged", "2").await.unwrap();
+    clock.tick();
+    a.delete("applied").await.unwrap();
+    drop(a);
+    let b = open(&os, &clock).await;
+    assert_eq!(b.get("logged").await.unwrap().as_deref(), Some(&b"2"[..]));
+    assert_eq!(b.get("applied").await.unwrap(), None);
     b.checkpoint().await.unwrap();
-    b.refresh().await.unwrap();
-    assert_eq!(b.get(b"x").await.unwrap(), Some(Bytes::from("1")));
+    assert_eq!(b.metrics().unapplied_bytes, 0);
+    let fresh = reader(&os).await;
+    assert_eq!(
+        fresh.get("logged").await.unwrap().as_deref(),
+        Some(&b"2"[..])
+    );
+    assert_eq!(fresh.get("applied").await.unwrap(), None);
+}
+
+/// Opening a writer fences the previous one: it can't write, checkpoint, or
+/// stay unaware while idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_a_writer_fences_the_previous_one() {
+    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = ManualClock::new();
+    let mut cfg = tiny_config();
+    // Also how often an idle writer checks for a newer one (real time).
+    cfg.checkpoint.interval = Duration::from_millis(20);
+    let a = open_with(&os, &clock, cfg.clone()).await;
+    let idle = open_with(&os, &clock, cfg.clone()).await;
+    clock.tick();
+    idle.put("x", "1").await.unwrap();
+    let b = open_with(&os, &clock, cfg).await;
+    assert!(b.epoch() > idle.epoch());
+    assert!(matches!(a.put("y", "1").await, Err(Error::Fenced)));
+    assert!(matches!(a.checkpoint().await, Err(Error::Fenced)));
+    assert!(matches!(a.status(), Err(Error::Fenced)));
+    wait_until("an idle writer notices", || idle.status().is_err()).await;
+    assert_eq!(b.get("x").await.unwrap().as_deref(), Some(&b"1"[..]));
+    assert_eq!(b.get("y").await.unwrap(), None);
+}
+
+/// Faulty store with log PUTs held in flight, and a writer on it.
+async fn held_writer() -> (Arc<Faulty>, Arc<ManualClock>, Arc<Db>, Arc<faulty::Hold>) {
+    let faulty = Arc::new(Faulty::new(Arc::new(InMemory::new()), Faults::NONE, 0));
+    let os: Arc<dyn ObjectStore> = faulty.clone();
+    let clock = ManualClock::new();
+    let a = Arc::new(open(&os, &clock).await);
+    let log = faulty.hold_puts(|p| p.ends_with(".wal"), 1);
+    (faulty, clock, a, log)
+}
+
+/// A log write still in flight when a newer writer opens lands on the
+/// fence and fails: nothing is acknowledged that the new writer lacks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_in_flight_write_of_a_fenced_writer_is_not_acknowledged() {
+    let (faulty, clock, a, log) = held_writer().await;
+    let os: Arc<dyn ObjectStore> = faulty.clone();
+    clock.tick();
+    let pending = tokio::spawn({
+        let a = a.clone();
+        async move { a.put("k", "lost").await }
+    });
+    wait_until("log write in flight", || log.arrived() == 1).await;
+    let b = open(&os, &clock).await;
+    log.release();
+    assert!(matches!(pending.await.unwrap(), Err(Error::Fenced)));
+    assert_eq!(b.get("k").await.unwrap(), None);
+}
+
+/// Fences outlive GC: a fenced writer's put that arrives after the log
+/// around it was collected still finds the fence and fails, instead of
+/// landing where no reader looks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fences_survive_gc() {
+    let (faulty, clock, a, log) = held_writer().await;
+    let os: Arc<dyn ObjectStore> = faulty.clone();
+    clock.tick();
+    let pending = tokio::spawn({
+        let a = a.clone();
+        async move { a.put("k", "lost").await }
+    });
+    wait_until("log write in flight", || log.arrived() == 1).await;
+    let b = open(&os, &clock).await;
+    for step in 0..3u32 {
+        clock.advance(Duration::from_secs(120));
+        b.put(format!("z{step}"), "v").await.unwrap();
+        b.checkpoint().await.unwrap();
+    }
+    let stats = b.run_gc(Duration::from_secs(60)).await.unwrap();
+    assert!(stats.wals > 0, "{stats:?}");
+    let log_info = sidra::Admin::new(ROOT, os.clone()).log().await.unwrap();
+    assert_eq!(log_info.fences, 2, "{log_info:?}");
+    log.release();
+    assert!(matches!(pending.await.unwrap(), Err(Error::Fenced)));
+    assert_eq!(b.get("k").await.unwrap(), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tombstones_are_dropped_once_safe() {
+async fn tombstones_go_once_they_reach_leaves() {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let clock = ManualClock::new();
     let db = open(&os, &clock).await;
@@ -1022,35 +1007,31 @@ async fn tombstones_are_dropped_once_safe() {
         db.delete(format!("k{i:04}")).await.unwrap();
     }
     db.checkpoint().await.unwrap();
-    // Push everything down with more checkpoints as floors move past the
-    // deletes.
     for round in 0..20u32 {
         clock.advance(Duration::from_secs(1));
-        clock.tick();
         db.put(format!("z{round:04}"), "v").await.unwrap();
         db.checkpoint().await.unwrap();
     }
     let shape = db.tree_shape().await.unwrap();
-    assert_eq!(shape.tombstones, 0, "{shape:?}");
+    assert_eq!(
+        shape.tombstones + shape.runs_with_tombstones,
+        0,
+        "{shape:?}"
+    );
     assert_eq!(db.scan(KeyRange::all()).collect().await.unwrap().len(), 20);
 }
 
 /// Deletes buffered above a range nobody writes to again still reach their
-/// leaves and go: the applier checkpoints for the purge with no new entries.
+/// leaves and go: the writer checkpoints for the purge with no new writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_tree_purges_buffered_tombstones() {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let clock = ManualClock::new();
     let mut cfg = tiny_config();
     cfg.tree.purge_tombstones_after = Duration::from_secs(10);
-    // Also how often an idle applier retries a purge (real time).
+    // How often an idle writer looks for work (real time).
     cfg.checkpoint.interval = Duration::from_millis(20);
-    let db = Db::builder(ROOT, os.clone())
-        .with_settings(cfg)
-        .with_clock(clock.clone())
-        .build()
-        .await
-        .unwrap();
+    let db = open_with(&os, &clock, cfg).await;
     for i in 0..300u32 {
         clock.tick();
         db.put(format!("k{i:04}"), "v").await.unwrap();
@@ -1068,7 +1049,7 @@ async fn idle_tree_purges_buffered_tombstones() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let after = loop {
         let shape = db.tree_shape().await.unwrap();
-        if shape.runs_with_tombstones == 0 && shape.tombstones == 0 {
+        if shape.runs_with_tombstones == 0 {
             break shape;
         }
         assert!(Instant::now() < deadline, "not purged: {shape:?}");
@@ -1079,9 +1060,8 @@ async fn idle_tree_purges_buffered_tombstones() {
 }
 
 /// A purge bigger than `purge_bytes_per_checkpoint` spreads over more
-/// checkpoints instead of rewriting everything at once.
-/// On paused time, so the background applier interleaves the same way
-/// every run.
+/// checkpoints instead of rewriting everything at once. On paused time, so
+/// the background checkpoints interleave the same way every run.
 #[test]
 fn purge_spreads_over_checkpoints() {
     let unbounded = virtual_runtime().block_on(checkpoints_to_purge(usize::MAX));
@@ -1090,7 +1070,7 @@ fn purge_spreads_over_checkpoints() {
     assert!(bounded > unbounded, "{bounded} vs {unbounded}");
 }
 
-/// Deletes half of 300 keys and counts the idle checkpoints that purge them.
+/// Deletes half of 300 keys and counts the checkpoints that purge them.
 async fn checkpoints_to_purge(budget: usize) -> usize {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let clock = ManualClock::new();
@@ -1104,12 +1084,7 @@ async fn checkpoints_to_purge(budget: usize) -> usize {
     cfg.cleaner.clean_inner_below_live = 0.0;
     cfg.tree.internal_max_bytes = 1 << 20;
     cfg.tree.max_runs_per_child = 64;
-    let db = Db::builder(ROOT, os.clone())
-        .with_settings(cfg)
-        .with_clock(clock.clone())
-        .build()
-        .await
-        .unwrap();
+    let db = open_with(&os, &clock, cfg).await;
     for i in 0..300u32 {
         clock.tick();
         db.put(format!("k{i:04}"), "v").await.unwrap();
@@ -1120,14 +1095,10 @@ async fn checkpoints_to_purge(budget: usize) -> usize {
         db.delete(format!("k{i:04}")).await.unwrap();
     }
     db.checkpoint().await.unwrap();
-    // Every checkpoint counts, the background applier's too.
+    // Every checkpoint counts, the background loop's too.
     let before = db.metrics().checkpoints;
     clock.advance(Duration::from_secs(20));
-    renewed().await;
-    while {
-        let shape = db.tree_shape().await.unwrap();
-        shape.runs_with_tombstones > 0 || shape.tombstones > 0
-    } {
+    while db.tree_shape().await.unwrap().runs_with_tombstones > 0 {
         assert!(
             db.metrics().checkpoints - before < 100,
             "purge makes no progress"
@@ -1138,79 +1109,8 @@ async fn checkpoints_to_purge(budget: usize) -> usize {
     (db.metrics().checkpoints - before) as usize
 }
 
-/// A checkpoint that leaves entries for later (`max_bytes`) must keep
-/// tombstones newer than any of them. Batch `{x@1, del k@4}` is older by its
-/// first entry than `{put k@3}`, so it goes first; if a later checkpoint
-/// dropped the tombstone while the put still waited, the put would show
-/// once applied.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_partial_checkpoint_keeps_tombstones_newer_than_what_it_left() {
-    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let clock = ManualClock::new();
-    let mut cfg = tiny_config();
-    // One batch per checkpoint.
-    cfg.checkpoint.max_bytes = 1;
-    // Writes stay queued until `flush_wal`, so one batch spans several
-    // timestamps; and only `a` applies.
-    let queued = Settings {
-        wal: WalConfig {
-            flush_interval: HOUR,
-            max_bytes: 1 << 20,
-        },
-        applier: ApplierRole::Never,
-        ..cfg.clone()
-    };
-    let open = |cfg: Settings| {
-        Db::builder(ROOT, os.clone())
-            .with_settings(cfg)
-            .with_clock(clock.clone())
-            .build()
-    };
-    let a = open(cfg.clone()).await.unwrap();
-    let (b, c) = (
-        open(queued.clone()).await.unwrap(),
-        open(queued).await.unwrap(),
-    );
-    let queue = |key: &str, put: bool| {
-        let mut batch = WriteBatch::new();
-        match put {
-            true => batch.put(key, "v"),
-            false => batch.delete(key),
-        };
-        (
-            batch,
-            WriteOptions {
-                durability: Durability::Queued,
-            },
-        )
-    };
-    // A log flushes at its first tick: spend b's on a batch of its own.
-    clock.tick();
-    b.put("w", "v").await.unwrap();
-    clock.tick();
-    let (batch, opts) = queue("x", true);
-    b.write_with(batch, opts).await.unwrap();
-    clock.tick();
-    let (batch, opts) = queue("y", true);
-    c.write_with(batch, opts).await.unwrap();
-    clock.tick();
-    a.put("k", "old").await.unwrap();
-    clock.tick();
-    let (batch, opts) = queue("k", false);
-    b.write_with(batch, opts).await.unwrap();
-    b.flush_wal().await.unwrap();
-    c.flush_wal().await.unwrap();
-    // Leases renew with floors past every entry: tombstones may go.
-    clock.advance(Duration::from_secs(20));
-    renewed().await;
-    // Applies b's two batches, then c's (which may drop tombstones), then
-    // a's.
-    a.checkpoint().await.unwrap();
-    assert_eq!(a.get("k").await.unwrap(), None);
-}
-
-async fn segment_objects(os: &Arc<dyn ObjectStore>) -> usize {
-    let prefix = Path::from(format!("{ROOT}/seg"));
+async fn objects(os: &Arc<dyn ObjectStore>, prefix: &str) -> usize {
+    let prefix = Path::from(format!("{ROOT}/{prefix}"));
     os.list(Some(&prefix))
         .try_collect::<Vec<_>>()
         .await
@@ -1234,7 +1134,7 @@ async fn gc_keeps_exactly_the_live_tree() {
         }
         db.checkpoint().await.unwrap();
     }
-    let before = segment_objects(&os).await;
+    let before = objects(&os, "seg").await;
 
     // Within retention nothing is deleted.
     let stats = db.run_gc(Duration::from_secs(60)).await.unwrap();
@@ -1247,29 +1147,31 @@ async fn gc_keeps_exactly_the_live_tree() {
         "{stats:?}"
     );
     assert_accounting(&db).await;
-    let after = segment_objects(&os).await;
+    let after = objects(&os, "seg").await;
     assert!(after < before);
     assert_eq!(
         after,
         db.segment_table().len(),
         "only referenced segments remain"
     );
+    // Only the writer's fence is left of the applied log.
+    assert_eq!(objects(&os, "wal").await, 1);
     // The cleaner keeps space amplification bounded.
     let s = db.metrics();
     assert!(s.live_bytes * 10 >= s.segment_bytes * 4, "{s:?}");
 
     db.close().await.unwrap();
-    let reader = DbReader::builder(ROOT, os)
-        .with_settings(reader_config())
-        .build()
+    let all = reader(&os)
+        .await
+        .scan(KeyRange::all())
+        .collect()
         .await
         .unwrap();
-    let all = reader.scan(KeyRange::all()).collect().await.unwrap();
     assert_eq!(all, model_range(&model, &KeyRange::all()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn orphan_segments_are_deleted_on_claim() {
+async fn orphan_segments_are_deleted_on_open() {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let clock = ManualClock::new();
     let db = open(&os, &clock).await;
@@ -1279,13 +1181,12 @@ async fn orphan_segments_are_deleted_on_claim() {
     }
     db.checkpoint().await.unwrap();
     db.close().await.unwrap();
-    let published = segment_objects(&os).await;
-    // An applier that uploaded a segment but died before publishing.
+    let published = objects(&os, "seg").await;
+    // A writer that uploaded a segment but died before publishing.
     let orphan = Path::from(format!("{ROOT}/seg/{:020}-{:020}.seg", 1, 1_000_000));
     os.put(&orphan, "junk".into()).await.unwrap();
     let db = open(&os, &clock).await;
-    assert!(db.claim_applier().await.unwrap());
-    assert_eq!(segment_objects(&os).await, published);
+    assert_eq!(objects(&os, "seg").await, published);
     assert_eq!(db.get(b"k0042").await.unwrap(), Some(Bytes::from("v42")));
 }
 
@@ -1305,12 +1206,7 @@ async fn paged_scans_match_model() {
         ..TreeConfig::default()
     };
     cfg.checkpoint.bytes = 1 << 30;
-    let db = Db::builder(ROOT, os.clone())
-        .with_settings(cfg)
-        .with_clock(clock.clone())
-        .build()
-        .await
-        .unwrap();
+    let db = open_with(&os, &clock, cfg).await;
     let mut model = Model::new();
     let mut rng = 0x9E37_79B9_7F4A_7C15u64;
     let mut next = move |n: u64| {
@@ -1358,108 +1254,46 @@ async fn paged_scans_match_model() {
     }
 }
 
+/// A reader follows the log past its manifest, across checkpoints and
+/// writer changes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manifest_only_writers_see_others_after_apply() {
+async fn readers_follow_the_log_and_new_manifests() {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let clock = ManualClock::new();
-    let applier = open(&os, &clock).await;
-    let mut cfg = tiny_config();
-    cfg.poll.follow = sidra::Follow::ManifestOnly;
-    cfg.applier = ApplierRole::Never;
-    let quiet = Db::builder(ROOT, os.clone())
-        .with_settings(cfg)
-        .with_clock(clock.clone())
-        .build()
-        .await
-        .unwrap();
+    let r = reader(&os).await;
+    let a = open(&os, &clock).await;
     clock.tick();
-    applier.put("k", "v").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(60)).await;
+    a.put("k", "1").await.unwrap();
+    assert_eq!(r.get("k").await.unwrap(), None, "not refreshed yet");
     assert_eq!(
-        quiet.get("k").await.unwrap(),
-        None,
-        "not pulled before apply"
+        r.get_with("k", LATEST).await.unwrap().as_deref(),
+        Some(&b"1"[..])
     );
-    let fresh = sidra::ReadOptions {
-        freshness: sidra::Freshness::Latest,
-    };
-    assert_eq!(
-        quiet.get_with("k", fresh).await.unwrap().as_deref(),
-        Some(&b"v"[..])
-    );
+    a.checkpoint().await.unwrap();
     clock.tick();
-    applier.put("k2", "v2").await.unwrap();
-    applier.checkpoint().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while quiet.get("k2").await.unwrap().is_none() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("visible once applied");
-    let m = quiet.metrics();
-    assert!(!m.is_applier && m.requests.gets > 0 && m.cache.hits + m.cache.misses > 0);
+    a.put("k", "2").await.unwrap();
+    drop(a);
+    // Past the old writer's log, its replacement's fence, and on.
+    let b = open(&os, &clock).await;
+    clock.tick();
+    b.put("j", "3").await.unwrap();
+    r.refresh().await.unwrap();
+    assert_eq!(r.get("k").await.unwrap().as_deref(), Some(&b"2"[..]));
+    assert_eq!(r.get("j").await.unwrap().as_deref(), Some(&b"3"[..]));
+    b.checkpoint().await.unwrap();
+    r.refresh().await.unwrap();
+    assert_eq!(r.manifest_id(), b.metrics().manifest_id);
+    assert_eq!(r.get("j").await.unwrap().as_deref(), Some(&b"3"[..]));
 }
 
+/// Busy readers on cached data must not starve the log or checkpoints
+/// (cache hits never suspend; reads yield via tokio's cooperative budget).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn closing_applier_hands_over_and_dead_lease_triggers_takeover() {
+async fn busy_readers_do_not_starve_writes() {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let clock = ManualClock::new();
-    let mut cfg = tiny_config();
-    cfg.checkpoint.interval = Duration::from_secs(1);
-    cfg.lease.ttl = Duration::from_secs(5);
-    let build = |cfg: Settings| {
-        Db::builder(ROOT, os.clone())
-            .with_settings(cfg)
-            .with_clock(clock.clone())
-            .build()
-    };
-    // Graceful: a closing applier releases, the next writer with work takes over.
-    let a = build(cfg.clone()).await.unwrap();
-    assert!(a.is_applier());
-    a.close().await.unwrap();
-    let b = build(cfg.clone()).await.unwrap();
-    clock.tick();
-    b.put("k", "v").await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !b.is_applier() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("takes the released role");
-    // Crash: b dies; once its lease expires, c takes over without waiting
-    // the full steal_after.
-    let c = build(cfg).await.unwrap();
-    drop(b);
-    clock.tick();
-    c.put("k2", "v2").await.unwrap();
-    clock.advance(Duration::from_secs(6));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !c.is_applier() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("takes over from a dead applier");
-    c.checkpoint().await.unwrap();
-    assert_eq!(c.get("k").await.unwrap().as_deref(), Some(&b"v"[..]));
-}
-
-/// Busy readers on cached data must not starve lease renewal (cache hits
-/// never suspend; reads yield via tokio's cooperative budget). Without the
-/// yield this test hangs: the starved runtime never runs the put loop either.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn busy_readers_do_not_starve_the_lease() {
-    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let mut cfg = tiny_config();
-    cfg.lease = LeaseConfig {
-        interval: Duration::from_millis(20),
-        ttl: Duration::from_millis(300),
-    };
     let db = Arc::new(
         Db::builder(ROOT, os.clone())
-            .with_settings(cfg)
+            .with_settings(tiny_config())
             .build()
             .await
             .unwrap(),
@@ -1477,108 +1311,14 @@ async fn busy_readers_do_not_starve_the_lease() {
         })
         .collect();
     for i in 0..20 {
-        db.put(format!("k{i}"), "v").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(5), db.put(format!("k{i}"), "v"))
+            .await
+            .expect("a write starved")
+            .unwrap();
     }
     stop.store(true, Ordering::Relaxed);
     futures::future::join_all(readers).await;
     db.status().unwrap();
-}
-
-async fn objects(os: &Arc<dyn ObjectStore>, prefix: &str) -> usize {
-    let prefix = Path::from(format!("{ROOT}/{prefix}"));
-    os.list(Some(&prefix))
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap()
-        .len()
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn regional_logs_are_followed_applied_and_collected() {
-    let home: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let eu_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let eu = sidra::Region::new("eu");
-    let clock = ManualClock::new();
-    let local = open(&home, &clock).await;
-    let remote = Db::builder(ROOT, home.clone())
-        .with_settings(Settings {
-            log: sidra::LogHome::Region(eu.clone()),
-            applier: ApplierRole::Never,
-            ..tiny_config()
-        })
-        .with_region(eu.clone(), eu_store.clone(), ROOT)
-        .with_clock(clock.clone())
-        .build()
-        .await
-        .unwrap();
-    clock.tick();
-    remote.put("from-eu", "1").await.unwrap();
-    clock.tick();
-    local.put("from-home", "2").await.unwrap();
-
-    // The remote writer's log is in its own store, not the home one.
-    let wid = remote.writer_id();
-    assert!(objects(&eu_store, &format!("wal/{wid}")).await > 0);
-    assert_eq!(objects(&home, &format!("wal/{wid}")).await, 0);
-
-    // The applier needs the region to pull it.
-    let blind = Db::builder(ROOT, home.clone())
-        .with_settings(Settings {
-            applier: ApplierRole::Never,
-            ..tiny_config()
-        })
-        .with_clock(clock.clone())
-        .build()
-        .await;
-    assert!(
-        matches!(blind, Err(Error::InvalidConfig(_))),
-        "{:?}",
-        blind.err()
-    );
-
-    // The home writer was opened without the region: give the role to one
-    // that has it.
-    local.close().await.unwrap();
-    let applier = Db::builder(ROOT, home.clone())
-        .with_settings(tiny_config())
-        .with_region(eu.clone(), eu_store.clone(), ROOT)
-        .with_clock(clock.clone())
-        .build()
-        .await
-        .unwrap();
-    assert!(applier.claim_applier().await.unwrap() || applier.is_applier());
-    applier.refresh().await.unwrap();
-    assert_eq!(
-        applier.get("from-eu").await.unwrap().as_deref(),
-        Some(&b"1"[..])
-    );
-    applier.checkpoint().await.unwrap();
-
-    let reader = DbReader::builder(ROOT, home.clone())
-        .with_settings(reader_config())
-        .with_region(eu.clone(), eu_store.clone(), ROOT)
-        .build()
-        .await
-        .unwrap();
-    assert_eq!(
-        reader.get("from-eu").await.unwrap().as_deref(),
-        Some(&b"1"[..])
-    );
-    assert_eq!(
-        reader.get("from-home").await.unwrap().as_deref(),
-        Some(&b"2"[..])
-    );
-
-    // GC deletes applied log objects from the regional store too.
-    clock.tick();
-    applier.checkpoint().await.unwrap();
-    clock.advance(Duration::from_secs(120));
-    let stats = applier.run_gc(Duration::from_secs(60)).await.unwrap();
-    assert!(stats.wals > 0, "{stats:?}");
-    assert_eq!(objects(&eu_store, &format!("wal/{wid}")).await, 0);
-    remote.close().await.unwrap();
-    applier.close().await.unwrap();
 }
 
 async fn wait_until(what: &str, f: impl Fn() -> bool) {
@@ -1589,62 +1329,6 @@ async fn wait_until(what: &str, f: impl Fn() -> bool) {
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting: {what}"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn standby_applies_only_while_no_primary_can() {
-    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let clock = ManualClock::new();
-    let mut cfg = tiny_config();
-    cfg.checkpoint.interval = Duration::from_secs(1);
-    cfg.lease.ttl = Duration::from_secs(5);
-    let standby_cfg = Settings {
-        applier: ApplierRole::Standby {
-            after: Duration::from_secs(30),
-        },
-        ..cfg.clone()
-    };
-    let build = |cfg: Settings| {
-        Db::builder(ROOT, os.clone())
-            .with_settings(cfg)
-            .with_clock(clock.clone())
-            .build()
-    };
-    let p = build(cfg.clone()).await.unwrap();
-    assert!(p.is_applier());
-    let s = build(standby_cfg).await.unwrap();
-    clock.tick();
-    s.put("a", "1").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(!s.is_applier(), "a live primary keeps the role");
-
-    // The primary crashes: the standby takes over after `after`.
-    drop(p);
-    clock.tick();
-    s.put("b", "2").await.unwrap();
-    clock.advance(Duration::from_secs(31));
-    wait_until("standby takes over", || s.is_applier()).await;
-    s.checkpoint().await.unwrap();
-
-    // A primary returns: the standby hands the role back at its next
-    // checkpoint, and the primary takes it.
-    let q = build(cfg).await.unwrap();
-    assert!(!q.is_applier());
-    clock.tick();
-    s.put("c", "3").await.unwrap();
-    s.checkpoint().await.unwrap();
-    assert!(!s.is_applier(), "hands back");
-    clock.tick();
-    q.put("d", "4").await.unwrap();
-    wait_until("primary takes the released role", || q.is_applier()).await;
-    q.checkpoint().await.unwrap();
-    for (k, v) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")] {
-        assert_eq!(
-            q.get(k).await.unwrap().as_deref(),
-            Some(v.as_bytes()),
-            "{k}"
-        );
-    }
 }
 
 /// Copies every object except segments matching `skip`, like bucket
@@ -1704,41 +1388,28 @@ async fn replica_reader_falls_back_to_origin_for_lagging_segments() {
     assert_eq!(all, model_range(&model, &KeyRange::all()));
 }
 
-/// A writer that opens after a tombstone was dropped, with a clock behind
-/// the applier's, must not write a version older than that tombstone:
-/// otherwise its write shows although the delete is newer.
+/// A writer that opens with a clock behind its predecessor's still stamps
+/// newer timestamps, even after the versions that carried the newest ones
+/// are gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn lagging_new_writer_cannot_undercut_a_dropped_tombstone() {
+async fn a_lagging_new_writer_still_stamps_newer_timestamps() {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let clock = ManualClock::new();
-    clock.advance(Duration::from_secs(100));
     let a = open(&os, &clock).await;
     clock.tick();
     a.put("k", "old").await.unwrap();
     clock.tick();
-    let deleted_at = a
-        .write({
-            let mut b = WriteBatch::new();
-            b.delete("k");
-            b
-        })
-        .await
-        .unwrap()
-        .unwrap();
-    // Checkpoint until the tombstone is gone.
-    for round in 0..10u32 {
-        clock.advance(Duration::from_secs(1));
-        clock.tick();
-        a.put(format!("z{round}"), "v").await.unwrap();
-        a.checkpoint().await.unwrap();
-    }
+    let mut batch = WriteBatch::new();
+    batch.delete("k");
+    let deleted_at = a.write(batch).await.unwrap().unwrap();
+    a.checkpoint().await.unwrap();
     assert_eq!(a.tree_shape().await.unwrap().tombstones, 0);
+    a.close().await.unwrap();
 
     let lagging = Db::builder(ROOT, os.clone())
         .with_settings(tiny_config())
         .with_clock(Arc::new(Skewed {
             base: clock.clone(),
-            // Behind by more than everything that happened since the delete.
             lag_ms: 60_000,
         }))
         .build()
@@ -1748,203 +1419,34 @@ async fn lagging_new_writer_cannot_undercut_a_dropped_tombstone() {
     batch.put("k", "late");
     let wrote_at = lagging.write(batch).await.unwrap().unwrap();
     assert!(wrote_at > deleted_at, "{wrote_at:?} <= {deleted_at:?}");
-    lagging.flush_wal().await.unwrap();
-    a.refresh().await.unwrap();
-    // The later write wins, consistently before and after applying.
-    assert_eq!(a.get("k").await.unwrap().as_deref(), Some(&b"late"[..]));
-    a.checkpoint().await.unwrap();
-    assert_eq!(a.get("k").await.unwrap().as_deref(), Some(&b"late"[..]));
 }
 
-/// Two writers on a store whose PUTs can be held in flight: `b` the applier,
-/// `a` a plain writer, both on one clock (so nothing here is clock skew).
-async fn held_pair() -> (Arc<Faulty>, Arc<ManualClock>, Db, Db) {
+/// Faulty store with segment uploads held, so checkpoints can't finish.
+async fn stuck_checkpoints(
+    limit: usize,
+) -> (
+    Arc<faulty::Hold>,
+    Arc<ManualClock>,
+    Db,
+    Arc<dyn ObjectStore>,
+) {
     let faulty = Arc::new(Faulty::new(Arc::new(InMemory::new()), Faults::NONE, 0));
-    let os: Arc<dyn ObjectStore> = faulty.clone();
+    let segments = faulty.hold_puts(|p| p.ends_with(".seg"), usize::MAX);
+    let os: Arc<dyn ObjectStore> = faulty;
     let clock = ManualClock::new();
     let mut cfg = tiny_config();
-    cfg.lease.ttl = Duration::from_secs(5);
-    let build = |cfg: Settings| {
-        Db::builder(ROOT, os.clone())
-            .with_settings(cfg)
-            .with_clock(clock.clone())
-            .build()
-    };
-    let b = build(cfg.clone()).await.unwrap();
-    let a = build(Settings {
-        applier: ApplierRole::Never,
-        ..cfg
-    })
-    .await
-    .unwrap();
-    assert!(b.is_applier());
-    (faulty, clock, a, b)
-}
-
-/// Lets unheld leases renew after the clock jumped (a lease interval is 5 ms).
-async fn renewed() {
-    tokio::time::sleep(Duration::from_millis(50)).await;
-}
-
-fn is_lease_of(w: sidra::WriterId) -> impl Fn(&str) -> bool + Send + Sync + 'static {
-    let w = w.to_string();
-    move |p| p.contains(&w) && p.ends_with("/lease")
-}
-
-fn is_log_of(w: sidra::WriterId) -> impl Fn(&str) -> bool + Send + Sync + 'static {
-    let w = w.to_string();
-    move |p| p.contains(&w) && p.ends_with(".wal")
-}
-
-/// A log write held in flight while its writer's lease runs out must not
-/// land once the applier stopped counting that writer: a newer tombstone for
-/// the key may already be gone, and the late write would resurrect the key.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delayed_log_write_cannot_resurrect_a_dropped_tombstone() {
-    let (faulty, clock, a, b) = held_pair().await;
-    let leases = faulty.hold_puts(is_lease_of(a.writer_id()), usize::MAX);
-    let log = faulty.hold_puts(is_log_of(a.writer_id()), 1);
-    clock.tick();
-    let a = Arc::new(a);
-    let pending = tokio::spawn({
-        let a = a.clone();
-        async move { a.put("k", "old").await }
-    });
-    wait_until("log write in flight", || log.arrived() == 1).await;
-    clock.tick();
-    b.delete("k").await.unwrap();
-    // `a`'s lease runs out; checkpoint until the tombstone is gone.
-    clock.advance(Duration::from_secs(10));
-    for round in 0..5u32 {
-        clock.advance(Duration::from_secs(1));
-        renewed().await;
-        clock.tick();
-        b.put(format!("z{round}"), "v").await.unwrap();
-        b.checkpoint().await.unwrap();
-    }
-    assert_eq!(b.tree_shape().await.unwrap().tombstones, 0);
-
-    log.release();
-    let acked = pending.await.unwrap();
-    let fresh = sidra::ReadOptions {
-        freshness: sidra::Freshness::Latest,
-    };
-    let got = b.get_with("k", fresh).await.unwrap();
-    assert_eq!(
-        got, None,
-        "deleted key resurrected; the late write returned {acked:?}"
-    );
-    assert_eq!(acked.unwrap_err().kind(), ErrorKind::WriterLost);
-    leases.release();
-}
-
-/// A writer whose lease lapsed long enough for GC to forget it must not
-/// acknowledge writes on its return: fresh readers would never see them.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn forgotten_writer_cannot_acknowledge_unreadable_writes() {
-    let (faulty, clock, a, b) = held_pair().await;
-    clock.tick();
-    a.put("first", "1").await.unwrap();
-    b.checkpoint().await.unwrap();
-    let leases = faulty.hold_puts(is_lease_of(a.writer_id()), usize::MAX);
-    // `a`'s lease runs out, then everything ages past the GC retention.
-    for step in [10, 120, 120] {
-        clock.advance(Duration::from_secs(step));
-        renewed().await;
-        clock.tick();
-        b.put(format!("z{step}"), "v").await.unwrap();
-        b.checkpoint().await.unwrap();
-    }
-    clock.advance(Duration::from_secs(120));
-    renewed().await;
-    let stats = b.run_gc(Duration::from_secs(60)).await.unwrap();
-    assert!(stats.writers == 1 && stats.wals > 0, "{stats:?}");
-    renewed().await;
-    clock.tick();
-    b.put("z", "v").await.unwrap();
-    b.checkpoint().await.unwrap();
-
-    // Renewal resumes under the same writer id.
-    leases.release();
-    renewed().await;
-    clock.tick();
-    let acked = a.put("second", "2").await;
-    let reader = DbReader::builder(ROOT, faulty.clone() as Arc<dyn ObjectStore>)
-        .with_settings(reader_config())
-        .build()
-        .await
-        .unwrap();
-    let seen = reader.get("second").await.unwrap();
-    match acked {
-        Ok(()) => assert_eq!(
-            seen.as_deref(),
-            Some(&b"2"[..]),
-            "acknowledged but unreadable"
-        ),
-        Err(e) => assert_eq!(e.kind(), ErrorKind::WriterLost, "{e}"),
-    }
-}
-
-/// A closing writer seals its own log. Once applied and past retention, GC
-/// forgets the writer but keeps the seal, and its writes stay readable.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn closed_writer_is_sealed_then_forgotten() {
-    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let clock = ManualClock::new();
-    let a = open(&os, &clock).await;
-    let c = open(&os, &clock).await;
-    let cid = c.writer_id();
-    clock.tick();
-    c.put("x", "1").await.unwrap();
-    c.close().await.unwrap();
-    a.checkpoint().await.unwrap();
-    let admin = sidra::Admin::new(ROOT, os.clone());
-    let info = |ws: Vec<sidra::WriterInfo>| ws.into_iter().find(|w| w.id == cid);
-    let sealed = info(admin.writers().await.unwrap()).unwrap();
-    assert!(sealed.sealed && sealed.unapplied == 0, "{sealed:?}");
-
-    for _ in 0..2 {
-        clock.advance(Duration::from_secs(120));
-        clock.tick();
-        a.put("z", "v").await.unwrap();
-        a.checkpoint().await.unwrap();
-    }
-    let stats = a.run_gc(Duration::from_secs(60)).await.unwrap();
-    assert_eq!(stats.writers, 1, "{stats:?}");
-    clock.tick();
-    a.put("z", "w").await.unwrap();
-    a.checkpoint().await.unwrap();
-    assert!(info(admin.writers().await.unwrap()).is_none());
-    assert_eq!(
-        objects(&os, &format!("wal/{cid}")).await,
-        1,
-        "the seal stays"
-    );
-    let reader = DbReader::builder(ROOT, os.clone())
-        .with_settings(reader_config())
-        .build()
-        .await
-        .unwrap();
-    assert_eq!(reader.get("x").await.unwrap().as_deref(), Some(&b"1"[..]));
+    cfg.checkpoint.max_unapplied_bytes = limit;
+    let db = open_with(&os, &clock, cfg).await;
+    (segments, clock, db, os)
 }
 
 /// Backpressure counts what memory holds: every unapplied batch, even when
 /// they all overwrite one key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn backlog_limit_counts_repeated_overwrites() {
-    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let clock = ManualClock::new();
-    let mut cfg = tiny_config();
-    cfg.applier = ApplierRole::Never;
-    cfg.checkpoint.max_unapplied_bytes = 2_000;
-    let db = Db::builder(ROOT, os.clone())
-        .with_settings(cfg)
-        .with_clock(clock.clone())
-        .build()
-        .await
-        .unwrap();
+    let (segments, clock, db, _) = stuck_checkpoints(2_000).await;
     let value = vec![1u8; 100];
-    let mut written = 0;
+    let mut written = 0u32;
     for _ in 0..200 {
         clock.tick();
         match tokio::time::timeout(Duration::from_millis(200), db.put("k", &value)).await {
@@ -1961,102 +1463,20 @@ async fn backlog_limit_counts_repeated_overwrites() {
         "{written} overwrites passed a 2,000 B backlog limit"
     );
     assert!(db.metrics().unapplied_bytes >= 2_000);
+    segments.release();
+    db.put("k", "after").await.unwrap();
 }
 
-/// A regional log store going down stalls nothing else: other writers'
-/// writes still get applied, and no tombstone is dropped meanwhile (the
-/// unreachable log might hold an older version of its key).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn regional_outage_does_not_stall_other_writers() {
-    let home: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let outage = Faults {
-        fail_before: 1.0,
-        fail_after: 0.0,
-        max_delay: Duration::ZERO,
-    };
-    let eu_faulty = Arc::new(Faulty::new(Arc::new(InMemory::new()), outage, 1));
-    eu_faulty.set_enabled(false);
-    let eu_store: Arc<dyn ObjectStore> = eu_faulty.clone();
-    let eu = sidra::Region::new("eu");
-    let clock = ManualClock::new();
-    let build = |settings: Settings| {
-        Db::builder(ROOT, home.clone())
-            .with_settings(settings)
-            .with_region(eu.clone(), eu_store.clone(), ROOT)
-            .with_clock(clock.clone())
-            .build()
-    };
-    let applier = build(tiny_config()).await.unwrap();
-    let remote = build(Settings {
-        log: sidra::LogHome::Region(eu.clone()),
-        applier: ApplierRole::Never,
-        ..tiny_config()
-    })
-    .await
-    .unwrap();
-    clock.tick();
-    remote.put("from-eu", "1").await.unwrap();
-    clock.tick();
-    applier.put("doomed", "x").await.unwrap();
-    applier.checkpoint().await.unwrap();
-
-    eu_faulty.set_enabled(true);
-    clock.tick();
-    applier.delete("doomed").await.unwrap();
-    clock.tick();
-    applier.put("from-home", "2").await.unwrap();
-    for _ in 0..3 {
-        clock.advance(Duration::from_secs(1));
-        applier.checkpoint().await.unwrap();
-    }
-    let m = applier.metrics();
-    assert_eq!(
-        m.unapplied_bytes, 0,
-        "home writes applied despite the outage"
-    );
-    assert_eq!(
-        applier.get("from-home").await.unwrap().as_deref(),
-        Some(&b"2"[..])
-    );
-    assert!(
-        applier.tree_shape().await.unwrap().tombstones > 0,
-        "tombstone kept while a log is unreachable"
-    );
-    // Reads that promise every write say so instead of missing some.
-    assert!(applier.refresh().await.unwrap_err().is_retryable());
-
-    eu_faulty.set_enabled(false);
-    applier.refresh().await.unwrap();
-    assert_eq!(
-        applier.get("from-eu").await.unwrap().as_deref(),
-        Some(&b"1"[..])
-    );
-    remote.close().await.unwrap();
-    applier.close().await.unwrap();
-}
-
-/// `close()` terminates under backpressure with no applier to relieve it,
-/// and still makes the queued write durable.
+/// `close()` writes out a queued write past backpressure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_flushes_queued_writes_past_backpressure() {
-    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let clock = ManualClock::new();
-    let mut cfg = tiny_config();
-    cfg.applier = ApplierRole::Never;
-    cfg.checkpoint.max_unapplied_bytes = 2_000;
-    let db = Db::builder(ROOT, os.clone())
-        .with_settings(cfg)
-        .with_clock(clock.clone())
-        .build()
-        .await
-        .unwrap();
+    let (segments, clock, db, os) = stuck_checkpoints(2_000).await;
     let value = vec![1u8; 100];
-    for i in 0u32.. {
-        if db.metrics().unapplied_bytes >= 2_000 {
-            break;
-        }
+    let mut written = 0u32;
+    while db.metrics().unapplied_bytes < 2_000 {
         clock.tick();
-        db.put(i.to_be_bytes(), &value).await.unwrap();
+        db.put(written.to_be_bytes(), &value).await.unwrap();
+        written += 1;
     }
     clock.tick();
     let mut batch = WriteBatch::new();
@@ -2065,97 +1485,20 @@ async fn close_flushes_queued_writes_past_backpressure() {
         durability: Durability::Queued,
     };
     db.write_with(batch, queued).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), db.close())
-        .await
-        .expect("close hung under backpressure")
-        .unwrap();
-
-    let applier = open(&os, &clock).await;
-    applier.checkpoint().await.unwrap();
-    assert_eq!(
-        applier.get("queued").await.unwrap().as_deref(),
-        Some(&b"q"[..])
-    );
-    applier.close().await.unwrap();
-}
-
-/// Once GC forgets a regional writer (lease and log gone), handles that
-/// followed it stop polling its region: an outage there no longer fails
-/// reads that promise every write.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn forgotten_regional_writer_is_no_longer_polled() {
-    let home: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let outage = Faults {
-        fail_before: 1.0,
-        fail_after: 0.0,
-        max_delay: Duration::ZERO,
-    };
-    let eu_faulty = Arc::new(Faulty::new(Arc::new(InMemory::new()), outage, 1));
-    eu_faulty.set_enabled(false);
-    let eu_store: Arc<dyn ObjectStore> = eu_faulty.clone();
-    let eu = sidra::Region::new("eu");
-    let clock = ManualClock::new();
-    let build = |settings: Settings| {
-        Db::builder(ROOT, home.clone())
-            .with_settings(settings)
-            .with_region(eu.clone(), eu_store.clone(), ROOT)
-            .with_clock(clock.clone())
-            .build()
-    };
-    let applier = build(tiny_config()).await.unwrap();
-    let reader = DbReader::builder(ROOT, home.clone())
-        .with_settings(reader_config())
-        .with_region(eu.clone(), eu_store.clone(), ROOT)
-        .build()
-        .await
-        .unwrap();
-    let remote = build(Settings {
-        log: sidra::LogHome::Region(eu.clone()),
-        applier: ApplierRole::Never,
-        ..tiny_config()
+    let closing = tokio::spawn(db.close());
+    // The queued write goes out before any checkpoint frees room.
+    wait_until("queued write durable", || {
+        futures::executor::block_on(sidra::Admin::new(ROOT, os.clone()).log())
+            // The writes, the queued one, and the writer's fence.
+            .is_ok_and(|l| l.unapplied == written as usize + 2)
     })
-    .await
-    .unwrap();
-    let wid = remote.writer_id();
-    clock.tick();
-    remote.put("from-eu", "1").await.unwrap();
-    remote.close().await.unwrap();
-
-    // Both handles follow the regional writer.
-    applier.refresh().await.unwrap();
-    reader.refresh().await.unwrap();
-    assert_eq!(
-        reader.get("from-eu").await.unwrap().as_deref(),
-        Some(&b"1"[..])
-    );
-    applier.checkpoint().await.unwrap();
-
-    // Past retention, GC deletes its log, then its lease.
-    clock.advance(Duration::from_secs(120));
-    applier.put("later", "2").await.unwrap();
-    applier.checkpoint().await.unwrap();
-    clock.advance(Duration::from_secs(120));
-    let stats = applier.run_gc(Duration::from_secs(60)).await.unwrap();
-    assert_eq!(stats.writers, 1, "{stats:?}");
-    assert_eq!(objects(&eu_store, &format!("writers/{wid}")).await, 0);
-    assert_eq!(objects(&home, &format!("writers/{wid}")).await, 0);
-
-    // Its region goes down, before and after the frontier drops it.
-    eu_faulty.set_enabled(true);
-    applier.refresh().await.unwrap();
-    reader.refresh().await.unwrap();
-    clock.tick();
-    applier.put("after", "3").await.unwrap();
-    applier.checkpoint().await.unwrap();
-    applier.refresh().await.unwrap();
-    reader.refresh().await.unwrap();
-    assert_eq!(
-        reader.get("after").await.unwrap().as_deref(),
-        Some(&b"3"[..])
-    );
-    assert_eq!(
-        reader.get("from-eu").await.unwrap().as_deref(),
-        Some(&b"1"[..])
-    );
-    applier.close().await.unwrap();
+    .await;
+    segments.release();
+    tokio::time::timeout(Duration::from_secs(5), closing)
+        .await
+        .expect("close hung")
+        .unwrap()
+        .unwrap();
+    let db = open(&os, &clock).await;
+    assert_eq!(db.get("queued").await.unwrap().as_deref(), Some(&b"q"[..]));
 }

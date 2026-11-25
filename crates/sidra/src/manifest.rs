@@ -1,42 +1,37 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::codec;
 use crate::error::{Error, Result};
-use crate::hlc::WriterId;
+use crate::hlc::Ts;
 use crate::segments::SegmentTable;
 use crate::store::{CreateOutcome, Store};
-use crate::types::{Epoch, ManifestId, SegmentId, TreeRoot};
-
-/// Last applied log sequence number per writer.
-pub type Frontier = std::collections::BTreeMap<WriterId, u64>;
-
-/// Writers whose log is sealed right after their `frontier` entry: fully
-/// applied, so they hold no tombstone back and need no more polling.
-pub type Sealed = std::collections::BTreeSet<WriterId>;
+use crate::types::{Epoch, ManifestId, SegmentId, TreeRoot, WalSeq};
 
 /// One published database version.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Manifest {
-    /// Bumped by every process that takes the applier role. Publishing with
-    /// put-if-absent fences the previous applier.
-    pub applier_epoch: Epoch,
-    /// The writer holding the applier role, or `None` once it released it
-    /// (on close). Others take over when it's `None` or its lease expired.
-    pub applier: Option<WriterId>,
+    /// Bumped by every writer that opens the database. Publishing with
+    /// put-if-absent fences the previous writer's checkpoints; its fence in
+    /// the log fences its writes.
+    pub writer_epoch: Epoch,
     pub tree: Option<TreeRoot>,
-    /// Writer log entries at or below these sequence numbers are in `tree`.
-    pub frontier: Frontier,
-    pub sealed: Sealed,
+    /// The newest timestamp applied. A new writer's clock starts past it and
+    /// past the log it replays, so timestamps grow across writers even when
+    /// the versions that carried them are gone.
+    pub last_ts: Ts,
+    /// Log slots up to here are in `tree`.
+    pub wal_applied: WalSeq,
+    /// Every fence at or below `wal_applied`. GC never deletes them: a
+    /// fenced writer may still have a put for that slot in flight, which
+    /// would land on an empty slot and be acknowledged without anyone ever
+    /// reading it.
+    pub fences: BTreeSet<WalSeq>,
     /// First segment id the publishing writer had not used. Segments at or
     /// above it that exist in storage are orphans of a writer that died
     /// before publishing.
     pub segment_watermark: SegmentId,
-    /// Writers move their clocks past this before writing (after writing
-    /// their lease), and the next checkpoint drops only tombstones below it.
-    /// That keeps a writer whose lease the applier hasn't seen yet, possibly
-    /// with a lagging clock, from writing a version older than a tombstone
-    /// already dropped. Never decreases.
-    pub tombstone_bound: u64,
     /// Every segment this tree references, with its live bytes.
     pub segments: SegmentTable,
     /// Segments the previous tree referenced and this one doesn't. Deleted by
@@ -48,37 +43,25 @@ pub struct Manifest {
 impl Manifest {
     pub fn initial(now_ms: u64) -> Self {
         Self {
-            applier_epoch: Epoch(0),
-            applier: None,
+            writer_epoch: Epoch(0),
             tree: None,
-            frontier: Frontier::new(),
-            sealed: Sealed::new(),
+            last_ts: Ts::MIN,
+            wal_applied: WalSeq::ZERO,
+            fences: BTreeSet::new(),
             segment_watermark: SegmentId {
                 epoch: Epoch(0),
                 seq: 0,
             },
-            tombstone_bound: 0,
             segments: SegmentTable::new(),
             dead: Vec::new(),
             created_at_ms: now_ms,
         }
     }
 
-    /// The same tree claimed by `by` with the next applier epoch.
-    pub fn fenced(&self, by: WriterId, now_ms: u64) -> Self {
+    /// The same tree claimed by the next writer generation.
+    pub fn claimed(&self, now_ms: u64) -> Self {
         Self {
-            applier_epoch: self.applier_epoch.next(),
-            applier: Some(by),
-            dead: Vec::new(),
-            created_at_ms: now_ms,
-            ..self.clone()
-        }
-    }
-
-    /// The same tree with the applier role given up.
-    pub fn released(&self, now_ms: u64) -> Self {
-        Self {
-            applier: None,
+            writer_epoch: self.writer_epoch.next(),
             dead: Vec::new(),
             created_at_ms: now_ms,
             ..self.clone()
@@ -89,6 +72,9 @@ impl Manifest {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Publish {
     Published,
+    /// The id holds this exact manifest already: our own earlier attempt
+    /// whose response was lost, or another writer's identical one.
+    Matched,
     /// Another writer published this id first.
     Conflict,
 }
@@ -122,8 +108,7 @@ pub async fn publish(store: &Store, id: ManifestId, manifest: &Manifest) -> Resu
         .await?
     {
         CreateOutcome::Created => Ok(Publish::Published),
-        // Our own earlier attempt whose response was lost.
-        CreateOutcome::Exists(existing) if existing == data => Ok(Publish::Published),
+        CreateOutcome::Exists(existing) if existing == data => Ok(Publish::Matched),
         CreateOutcome::Exists(_) => Ok(Publish::Conflict),
     }
 }
