@@ -23,6 +23,7 @@ use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 
 use crate::error::{Error, Result};
+use crate::hedge::{Hedge, Hedger};
 use crate::hlc::WriterId;
 use crate::retry::retry;
 use crate::types::{Epoch, ManifestId, SegmentId};
@@ -35,6 +36,7 @@ pub struct Store {
     os: Arc<dyn ObjectStore>,
     root: Path,
     counters: Arc<Counters>,
+    hedger: Arc<Hedger>,
 }
 
 /// Object store requests made by one handle.
@@ -46,6 +48,7 @@ struct Counters {
     put_bytes: AtomicU64,
     lists: AtomicU64,
     deletes: AtomicU64,
+    hedges: AtomicU64,
 }
 
 /// Object store requests made by a handle since it opened.
@@ -57,6 +60,9 @@ pub struct RequestStats {
     pub put_bytes: u64,
     pub lists: u64,
     pub deletes: u64,
+    /// Second copies of slow GETs (see `Hedge`); also counted in `gets`
+    /// when they complete.
+    pub hedges: u64,
 }
 
 fn bump(c: &AtomicU64, n: u64) {
@@ -79,11 +85,12 @@ pub enum CreateOutcome {
 }
 
 impl Store {
-    pub fn new(os: Arc<dyn ObjectStore>, root: impl Into<Path>) -> Self {
+    pub fn new(os: Arc<dyn ObjectStore>, root: impl Into<Path>, hedge: Hedge) -> Self {
         Self {
             os,
             root: root.into(),
             counters: Arc::default(),
+            hedger: Arc::new(Hedger::new(hedge)),
         }
     }
 
@@ -93,6 +100,7 @@ impl Store {
             os,
             root: root.into(),
             counters: self.counters.clone(),
+            hedger: Arc::new(self.hedger.fresh()),
         }
     }
 
@@ -106,7 +114,17 @@ impl Store {
             put_bytes: l(&c.put_bytes),
             lists: l(&c.lists),
             deletes: l(&c.deletes),
+            hedges: l(&c.hedges),
         }
+    }
+
+    /// Runs one GET, hedged.
+    async fn hedged<T, E, F, Fut>(&self, op: F) -> std::result::Result<T, E>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    {
+        self.hedger.run(&self.counters.hedges, op).await
     }
 
     fn got(&self, b: &Bytes) {
@@ -149,16 +167,18 @@ impl Store {
     }
 
     pub async fn get(&self, path: &Path) -> Result<Option<Bytes>> {
-        retry("get", || async {
-            match self.os.get(path).await {
-                Ok(r) => {
-                    let b = r.bytes().await?;
-                    self.got(&b);
-                    Ok(Some(b))
+        retry("get", || {
+            self.hedged(|| async {
+                match self.os.get(path).await {
+                    Ok(r) => {
+                        let b = r.bytes().await?;
+                        self.got(&b);
+                        Ok(Some(b))
+                    }
+                    Err(object_store::Error::NotFound { .. }) => Ok(None),
+                    Err(e) => Err(e.into()),
                 }
-                Err(object_store::Error::NotFound { .. }) => Ok(None),
-                Err(e) => Err(e.into()),
-            }
+            })
         })
         .await
     }
@@ -168,15 +188,17 @@ impl Store {
         path: &Path,
         range: std::ops::Range<u64>,
     ) -> Result<Option<Bytes>> {
-        retry("get range", || async {
-            match self.os.get_range(path, range.clone()).await {
-                Ok(b) => {
-                    self.got(&b);
-                    Ok(Some(b))
+        retry("get range", || {
+            self.hedged(|| async {
+                match self.os.get_range(path, range.clone()).await {
+                    Ok(b) => {
+                        self.got(&b);
+                        Ok(Some(b))
+                    }
+                    Err(object_store::Error::NotFound { .. }) => Ok(None),
+                    Err(e) => Err(e.into()),
                 }
-                Err(object_store::Error::NotFound { .. }) => Ok(None),
-                Err(e) => Err(e.into()),
-            }
+            })
         })
         .await
     }
@@ -193,10 +215,15 @@ impl Store {
         retry("get ranges", || async {
             let fetched = object_store::coalesce_ranges(
                 ranges,
-                |r| async move {
-                    let b = self.os.get_range(path, r).await?;
-                    self.got(&b);
-                    Ok(b)
+                |r| {
+                    self.hedged(move || {
+                        let r = r.clone();
+                        async move {
+                            let b = self.os.get_range(path, r).await?;
+                            self.got(&b);
+                            Ok(b)
+                        }
+                    })
                 },
                 COALESCE_GAP,
             )

@@ -114,6 +114,7 @@ fn tiny_config() -> Settings {
         regions: BTreeMap::new(),
         warm: Warm::Blocking,
         rewarm: Warm::Blocking,
+        hedge: sidra::Hedge::default(),
     }
 }
 
@@ -129,6 +130,7 @@ fn reader_config() -> ReaderSettings {
         rewarm: Warm::Off,
         regions: BTreeMap::new(),
         origin: None,
+        hedge: sidra::Hedge::default(),
     }
 }
 

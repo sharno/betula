@@ -648,7 +648,7 @@ impl Db {
         regions: RegionStores,
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
-        let home = Store::new(os, path);
+        let home = Store::new(os, path, cfg.hedge);
         let logs = Arc::new(Logs::new(home.clone(), regions));
         let own_log = logs.at(&cfg.log)?.clone();
         let nodes = Arc::new(Nodes::new(home, cfg.cache));

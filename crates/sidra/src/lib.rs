@@ -49,6 +49,7 @@ mod db;
 mod error;
 mod follow;
 mod gc;
+mod hedge;
 mod hlc;
 mod location;
 mod logs;
@@ -80,6 +81,7 @@ pub use db::{
 };
 pub use error::{Error, ErrorKind, Result};
 pub use gc::{GcConfig, GcStats};
+pub use hedge::{Fraction, Hedge, HedgeConfig};
 pub use hlc::{Ts, WriterId};
 pub use location::parse as parse_url;
 pub use logs::{LogHome, Region};

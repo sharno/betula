@@ -108,7 +108,7 @@ impl DbReader {
         regions: RegionStores,
         origin: Option<(Arc<dyn ObjectStore>, Path)>,
     ) -> Result<Self> {
-        let home = Store::new(os, path);
+        let home = Store::new(os, path, cfg.hedge);
         let logs = Arc::new(Logs::new(home.clone(), regions));
         let nodes = Arc::new(match origin {
             Some((os, path)) => {

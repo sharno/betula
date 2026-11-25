@@ -74,6 +74,9 @@ struct Args {
     /// before returning.
     #[arg(long)]
     warm_background: bool,
+    /// sidra: second copies of GETs slower than the recent p95.
+    #[arg(long, value_enum, default_value_t = HedgeArg::On)]
+    hedge: HedgeArg,
     /// SlateDB: bytes per block fetch in scans. SlateDB's own default reads
     /// one block per request. No setting wins every scan: 4 KiB / 1 task is
     /// best for warm 100-key scans, 256 KiB / 8 for cold 10,000-key ones;
@@ -149,6 +152,12 @@ fn splitmix(mut x: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum HedgeArg {
+    On,
+    Off,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -613,6 +622,10 @@ async fn bench_engine(
         poll: Duration::from_millis(args.poll_ms),
         max_runs: args.max_runs,
         compression: args.compression,
+        hedge: match args.hedge {
+            HedgeArg::On => sidra::Hedge::default(),
+            HedgeArg::Off => sidra::Hedge::Off,
+        },
         warm: if args.warm_background {
             sidra::Warm::Background
         } else {

@@ -167,14 +167,16 @@ impl ObjectStore for Metered {
         let head = options.head;
         let result = self.inner.get_opts(location, options).await?;
         let bytes = result.range.end - result.range.start;
-        // After the call, so the delay covers the bytes actually returned.
-        self.pause(Op::Read, if head { 0 } else { bytes }).await;
+        // Counted before the delay: a hedged copy dropped mid-delay was
+        // still sent, and S3 bills it.
         if head {
             Self::add(&self.counters.heads, 1);
         } else {
             Self::add(&self.counters.gets, 1);
             Self::add(&self.counters.get_bytes, bytes);
         }
+        // After the call, so the delay covers the bytes actually returned.
+        self.pause(Op::Read, if head { 0 } else { bytes }).await;
         Ok(result)
     }
 

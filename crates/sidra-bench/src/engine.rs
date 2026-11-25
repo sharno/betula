@@ -41,6 +41,7 @@ pub struct EngineParams {
     pub max_runs: usize,
     pub compression: crate::CompressionArg,
     pub warm: sidra::Warm,
+    pub hedge: sidra::Hedge,
     /// How SlateDB scans fetch and cache blocks.
     pub slatedb_scan: ScanOptions,
 }
@@ -122,6 +123,7 @@ impl Engine {
                         ..defaults.poll
                     },
                     warm: params.warm,
+                    hedge: params.hedge,
                     gc: match params.gc {
                         Some(rate) => sidra::Gc::On(sidra::GcConfig {
                             max_deletes_per_sec: rate,

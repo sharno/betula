@@ -84,7 +84,7 @@ impl Admin {
             inner_bytes: 64 << 20,
             leaf_bytes: 16 << 20,
         };
-        let home = Store::new(store, path);
+        let home = Store::new(store, path, crate::Hedge::default());
         Self {
             logs: Logs::new(home.clone(), regions.clone()),
             nodes: Nodes::new(home, cache),

@@ -62,6 +62,10 @@ steal_after = "10s"
 [gc]
 mode = "on"
 retention = "10m"
+[hedge]
+mode = "on"                # a GET slower than the recent p95 gets a second copy
+percentile = 0.95
+max_extra = 0.1            # at most 10% more GETs
 ```
 
 ```sh
@@ -273,12 +277,17 @@ writer C ─► wal/C/{seq} ─┘
 - Store requests retry transient failures with capped backoff (8 attempts,
   50 ms to 5 s). A log write that still fails ends its writer with
   `WriterLost`, since whether it landed is unknown.
+- A GET still running after the p95 latency of that store's last 512 GETs
+  gets a second copy, and the first answer wins: an object store's slow
+  tail is one slow server or connection, which the copy rarely shares. A
+  budget caps copies at 10% of GETs, so a store that slows down as a whole
+  doesn't get twice the load. PUTs aren't hedged.
 
 ## Roadmap
 
 Done: LZ4 compression (on by default), lighter cleaning of inner segments,
 paced GC deletes, multi-region (regional writer logs, standby appliers,
-replica readers), heap-merged scans, scan readahead.
+replica readers), heap-merged scans, scan readahead, hedged GETs.
 
 1. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
 2. **Soak tests:** multi-hour runs against a real store.
@@ -411,30 +420,30 @@ up to 2× between runs; the table keeps its best run.
 
 With simulated S3 latency (`--latency s3`, see above) instead of a fixed
 20 ms; same setup, SlateDB scan settings picked the same way. Cold scans show
-latency percentiles, because one stall can set the length of a short phase:
+p50 / p99 / p99.9 ms and scans/s, because one stall can set the length of a
+short phase. The middle column is sidra before hedged GETs (`--hedge off`):
 
-| | sidra | SlateDB 0.18 |
-|---|---|---|
-| warm point reads/s | **895k** | 323k |
-| cold point reads/s (p99 / p99.9 ms) | **60k (34 / 101)** | 2.6k (122 / 281) |
-| warm 100-key scans/s | **70.5k** | 47.5k [4/1] |
-| cold 100-key scans: p50 / p99 / p99.9 ms (scans/s) | **0.06 / 125** / 1,362 (1.1k) | 13 / 158 / **191 (2.1k)** [256/8] |
-| warm 1,000-key scans/s | **6.8k** | 5.0k [64/4] |
-| cold 1,000-key scans: p50 / p99 / p99.9 ms (scans/s) | **0.13 / 147** / 1,434 (1.2k) | 24 / 184 / **238 (2.0k)** [256/8] |
-| warm 10,000-key scans/s | **669** | 505 [64/4] |
-| cold 10,000-key scans: p50 / p99 / p99.9 ms (scans/s) | **1.4 / 295 / 1,525 (293)** | 138 / 419 / 2,163 (231) [256/8] |
-| warm sparse scans/s, 90% deleted | **105k** | 2.8k [4/1] |
-| cold sparse scans: p50 / p99 / p99.9 ms (scans/s) | **0.17 / 153 / 278 (3.1k)** | 34 / 271 / 590 (1.5k) [256/8] |
-| mixed reads/s, 40 clients, 5 min | **1.18M** | 1.7k |
-| mixed write p99 / p99.9 ms | **366 / 586** | 402 / 1,790 |
+| | sidra | sidra, no hedging | SlateDB 0.18 |
+|---|---|---|---|
+| warm point reads/s | **870k** | 895k | 323k |
+| cold point reads/s (p99 / p99.9 ms) | **70k (32 / 86)** | 60k (34 / 101) | 2.6k (122 / 281) |
+| warm 100-key scans/s | **65.5k** | 70.5k | 47.5k [4/1] |
+| cold 100-key scans | **0.24 / 107 / 139 (3.6k)** | 0.06 / 125 / 1,362 (1.1k) | 13 / 158 / 191 (2.1k) [256/8] |
+| warm 1,000-key scans/s | **6.6k** | 6.8k | 5.0k [64/4] |
+| cold 1,000-key scans | **0.13 / 130 / 167 (4.0k)** | 0.13 / 147 / 1,434 (1.2k) | 24 / 184 / 238 (2.0k) [256/8] |
+| warm 10,000-key scans/s | **662** | 669 | 505 [64/4] |
+| cold 10,000-key scans | **1.9 / 273 / 306 (1,055)** | 1.4 / 295 / 1,525 (293) | 138 / 419 / 2,163 (231) [256/8] |
+| warm sparse scans/s, 90% deleted | **107k** | 105k | 2.8k [4/1] |
+| cold sparse scans | **0.16 / 140 / 189 (3.8k)** | 0.17 / 153 / 278 (3.1k) | 34 / 271 / 590 (1.5k) [256/8] |
+| mixed reads/s, 40 clients, 5 min | **1.16M** | 1.18M | 1.7k |
+| mixed write p99 / p99.9 ms | **322 / 498** | 366 / 586 | 402 / 1,790 |
 
-Most cold scans in sidra hit leaves that earlier scans loaded, so its median
-stays below a millisecond. But a stalled GET holds every scan waiting on the
-leaves in its batch, and a cold phase makes only about 1,000 GETs, so one
-stall sets the phase's length: sidra's cold scans/s fall below SlateDB's.
-Sidra doesn't hedge reads yet; a second GET after about the p95 latency
-would cut this tail. SlateDB's mixed reads mostly miss its cache, so S3
-latency takes them from 184k to 1.7k/s.
+Without hedging, a stalled GET held every scan waiting on the leaves in its
+batch, and a cold phase makes only about 1,000 GETs, so one stall set the
+phase's length. Hedging takes cold-scan p99.9 from 1.4–1.5 s to 139–306 ms
+and throughput up 3–4×, for 0–4% more GETs. Warm phases make no GETs, so
+their differences are run-to-run noise. SlateDB's mixed reads mostly miss
+its cache, so S3 latency takes them from 184k to 1.7k/s.
 
 Commands (SlateDB alone with `--engines slatedb --slatedb-read-ahead-kib N
 --slatedb-fetch-tasks N`):
@@ -445,7 +454,8 @@ sidra-bench $B --concurrency 40 --mixed-read-pct 20 --mixed-secs 900
 sidra-bench $B --concurrency 40 --mixed-read-pct 20 --mixed-secs 300 --values text --compression lz4
 sidra-bench $B --latency 20ms --scan-len 100 --scans 2000              # also 1000; 10000 with --scans 500
 sidra-bench $B --latency 20ms --scan-len 100 --scans 2000 --delete-pct 90
-# --latency s3: the two scan commands above with s3 in place of 20ms, and
+# --latency s3: the two scan commands above with s3 in place of 20ms (and
+# --hedge off for the middle column), and
 sidra-bench $B --latency s3 --concurrency 40 --mixed-read-pct 20 --mixed-secs 300
 ```
 

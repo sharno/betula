@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::codec::Compression;
 use crate::error::{Error, Result};
 use crate::gc::GcConfig;
+use crate::hedge::Hedge;
 use crate::logs::{LogHome, Region};
 use crate::nodes::{CacheConfig, Warm};
 use crate::segments::CleanerConfig;
@@ -65,6 +66,8 @@ pub struct Settings {
     /// soon as it is seen. Every writer doing this costs GETs proportional to
     /// writers × checkpoint size, so writers default to loading on first use.
     pub rewarm: Warm,
+    /// Second copies of GETs slower than the recent p95.
+    pub hedge: Hedge,
 }
 
 impl Default for Settings {
@@ -84,6 +87,7 @@ impl Default for Settings {
             regions: BTreeMap::new(),
             warm: Warm::Blocking,
             rewarm: Warm::Off,
+            hedge: Hedge::default(),
         }
     }
 }
@@ -107,6 +111,8 @@ pub struct ReaderSettings {
     /// into its own region), the URL of the original. Segments that haven't
     /// replicated yet are read from it.
     pub origin: Option<String>,
+    /// Second copies of GETs slower than the recent p95.
+    pub hedge: Hedge,
 }
 
 impl Default for ReaderSettings {
@@ -119,6 +125,7 @@ impl Default for ReaderSettings {
             rewarm: Warm::Background,
             regions: BTreeMap::new(),
             origin: None,
+            hedge: Hedge::default(),
         }
     }
 }
@@ -348,6 +355,14 @@ mod tests {
         assert!(matches!(s.gc, Gc::Off));
         assert_eq!(s.warm, Warm::Background);
         assert_eq!(s.tree.max_fanout, TreeConfig::default().max_fanout);
+    }
+
+    #[test]
+    fn hedge_percentile_outside_0_to_1_is_rejected() {
+        let toml = "[hedge]\nmode = \"on\"\npercentile = 1.5";
+        assert!(Settings::from_toml(toml).is_err());
+        let toml = "[hedge]\nmode = \"on\"\npercentile = 0.99";
+        assert!(Settings::from_toml(toml).is_ok());
     }
 
     #[test]
