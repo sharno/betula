@@ -667,6 +667,11 @@ type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 /// New messages for a node, split by child.
 type Parts = Vec<Vec<(Bytes, Version)>>;
 
+/// A child's node and its runs.
+fn with_runs(c: &Child) -> impl Iterator<Item = NodePtr> + '_ {
+    std::iter::once(c.ptr).chain(c.runs.iter().map(|r| r.ptr))
+}
+
 fn split_by_child(pivots: &[Bytes], msgs: Vec<(Bytes, Version)>) -> Parts {
     let mut parts: Parts = vec![Vec::new(); pivots.len() + 1];
     let mut child = 0;
@@ -834,7 +839,10 @@ impl Writer<'_> {
                     // Flush children while over budget. Choosing before
                     // writing runs means a child that is about to be flushed
                     // gets its new messages directly, without a run.
-                    while let Some(i) = self.pick_flush(&node, &parts) {
+                    let flush = self.flush_set(&node, &parts);
+                    self.preload(&node, &parts, &flush).await?;
+                    // From the right, so splices don't shift the rest.
+                    for &i in flush.iter().rev() {
                         self.flush_child(&mut node, &mut parts, i).await?;
                     }
                     // Rewrite children whose subtree holds victims or droppable
@@ -908,35 +916,102 @@ impl Writer<'_> {
         self.stats.merges_any += any;
     }
 
-    /// The child to flush next: one that would exceed the run limit, else the
-    /// one with the most pending bytes when the node is over budget.
-    fn pick_flush(&self, node: &Internal, parts: &Parts) -> Option<usize> {
+    /// The children to flush: any that would exceed the run limit, then the
+    /// ones with the most pending bytes until the node is within budget. A
+    /// flushed child's replacements start with nothing pending, so the whole
+    /// set is known before the first flush.
+    fn flush_set(&self, node: &Internal, parts: &Parts) -> BTreeSet<usize> {
         let pending: Vec<usize> = node
             .children
             .iter()
             .zip(parts)
             .map(|(c, p)| c.pending_bytes() + msgs_bytes(p))
             .collect();
-        let too_many_runs = node.children.iter().zip(parts).position(|(c, p)| {
-            c.runs.len() + usize::from(!p.is_empty()) > self.cfg.max_runs_per_child
+        let too_many_runs: BTreeSet<usize> = node
+            .children
+            .iter()
+            .zip(parts)
+            .enumerate()
+            .filter(|(_, (c, p))| {
+                c.runs.len() + usize::from(!p.is_empty()) > self.cfg.max_runs_per_child
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let mut largest: Vec<usize> = (0..pending.len())
+            .filter(|i| !too_many_runs.contains(i))
+            .collect();
+        largest.sort_by_key(|i| std::cmp::Reverse(pending[*i]));
+        let left: usize = largest.iter().map(|i| pending[*i]).sum();
+        let over_budget = largest.into_iter().scan(left, |left, i| {
+            (*left > self.cfg.internal_max_bytes).then(|| {
+                *left -= pending[i];
+                i
+            })
         });
-        let over_budget = pending.iter().sum::<usize>() > self.cfg.internal_max_bytes;
-        too_many_runs.or_else(|| {
-            over_budget
-                .then(|| {
-                    pending
-                        .iter()
-                        .enumerate()
-                        .max_by_key(|(_, b)| **b)
-                        .map(|(i, _)| i)
-                })
-                .flatten()
-        })
+        too_many_runs.iter().copied().chain(over_budget).collect()
     }
 
-    /// Merges child `i`'s runs and new messages into it.
+    /// Loads, together, what this rewrite will load one at a time: the
+    /// children it flushes or moves, with their runs. At the root it also
+    /// plans the flushes below, as far as cached inner nodes and runs tell:
+    /// a checkpoint flushes a few leaves under each of many inner nodes, and
+    /// with a cold leaf cache each load is a store round trip. Deeper
+    /// rewrites then find their nodes cached.
+    async fn preload(&self, node: &Internal, parts: &Parts, flush: &BTreeSet<usize>) -> Result<()> {
+        let moved = node
+            .children
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| !flush.contains(i) && self.subtree_needs_move(c))
+            .flat_map(|(_, c)| with_runs(c));
+        let ptrs: Vec<NodePtr> = self
+            .planned_loads(node, parts, flush, self.depth == 0)
+            .into_iter()
+            .chain(moved)
+            .collect();
+        self.nodes.load_many(&ptrs).await.map(drop)
+    }
+
+    /// The nodes and runs flushing `flush` loads, and with `deep`, the ones
+    /// the flushes below them load. Stops where a node or run isn't cached:
+    /// what it holds is unknown until loaded.
+    fn planned_loads(
+        &self,
+        node: &Internal,
+        parts: &Parts,
+        flush: &BTreeSet<usize>,
+        deep: bool,
+    ) -> Vec<NodePtr> {
+        flush
+            .iter()
+            .flat_map(|&i| {
+                let child = &node.children[i];
+                let below = deep
+                    .then(|| self.planned_below(child, &parts[i]))
+                    .flatten()
+                    .unwrap_or_default();
+                with_runs(child).chain(below)
+            })
+            .collect()
+    }
+
+    fn planned_below(&self, child: &Child, part: &[(Bytes, Version)]) -> Option<Vec<NodePtr>> {
+        let Some(Node::Internal(inner)) = self.nodes.cached(child.ptr) else {
+            return None;
+        };
+        let msgs = child.runs.iter().try_fold(part.to_vec(), |msgs, r| {
+            match self.nodes.cached(r.ptr)? {
+                Node::Run(run) => Some(merge_versions(msgs, run.entries.clone())),
+                _ => None,
+            }
+        })?;
+        let parts = split_by_child(&inner.pivots, msgs);
+        let flush = self.flush_set(&inner, &parts);
+        Some(self.planned_loads(&inner, &parts, &flush, true))
+    }
+
     /// Flushes child `i` to purge its subtree. The outermost purge counts
-    /// what it and the purges nested in it write.
+    /// what it, and the purges nested in it, loaded and wrote.
     async fn purge_child(
         &mut self,
         node: &mut Internal,
@@ -966,6 +1041,7 @@ impl Writer<'_> {
         s.loaded_bytes + s.leaf_bytes + s.internal_bytes + s.run_bytes
     }
 
+    /// Merges child `i`'s runs and new messages into it.
     async fn flush_child(
         &mut self,
         node: &mut Internal,

@@ -173,6 +173,11 @@ impl Nodes {
         self.cache_for(&node).insert(ptr, node);
     }
 
+    /// The node at `ptr` if it is cached; never loads.
+    pub fn cached(&self, ptr: NodePtr) -> Option<Node> {
+        self.inner.get(&ptr).or_else(|| self.leaves.get(&ptr))
+    }
+
     pub async fn load(&self, ptr: NodePtr) -> Result<Node> {
         if let Some(n) = self.inner.get(&ptr).or_else(|| self.leaves.get(&ptr)) {
             self.hits.fetch_add(1, Ordering::Relaxed);

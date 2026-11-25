@@ -66,6 +66,7 @@ retention = "10m"
 mode = "on"                # a GET slower than the recent p95 gets a second copy
 percentile = 0.95
 max_extra = 0.1            # at most 10% more GETs
+initial = "250ms"          # threshold until 64 GETs are measured
 ```
 
 ```sh
@@ -301,6 +302,8 @@ writer C ─► wal/C/{seq} ─┘
 - A GET still running after the p95 latency of that store's last 512 GETs
   gets a second copy, and the first answer wins: an object store's slow
   tail is one slow server or connection, which the copy rarely shares. A
+  process that just opened uses `hedge.initial` (250 ms) until it has 64
+  GETs: its cache is cold, so a stall in its first GETs hurts most. A
   budget caps copies at 10% of GETs, so a store that slows down as a whole
   doesn't get twice the load. PUTs aren't hedged.
 
@@ -324,12 +327,7 @@ buffered tombstones.
    the gain is fewer leaves (cache, GETs per key), not faster scans.
    Contiguous deletes (TTL, queues) need no merging: their leaves empty and
    go (`--delete-order prefix --delete-pct 90`: 1,308 leaves to 179).
-5. **Parallel loads in checkpoints:** a checkpoint loads each child it
-   flushes on its own, one after another. With a cold cache and S3
-   latency that is about 35 ms per leaf, and 64 MiB checkpoints take 6–8 s
-   instead of 1–2 s (see Applier saturation). Prefetch the children a node
-   will flush, together with their runs.
-6. **Optional conditional writes** (compare-and-set) routed through the
+5. **Optional conditional writes** (compare-and-set) routed through the
    applier, for workloads that need them.
 
 ## Verification
@@ -363,7 +361,8 @@ See [`spec/README.md`](spec/README.md):
 - a targeted test for partial checkpoints: a tombstone applied while an
   older put to its key waits for a later checkpoint must survive, or the
   put resurrects. Only group-committed batches with several timestamps
-  reach this; the model and the simulation don't produce them.
+  reach this; the Stateright model and the simulation don't produce them.
+  The TLA+ model does (`BugPartial`).
 
 ## Layout
 
@@ -547,25 +546,28 @@ Capacity, 256 clients × batches of 128, 2M keys:
 
 Applier saturation, `--latency s3`, 1M keys, then 120 s of random
 overwrites from 1,024 clients (`--ingest-secs 120`), defaults otherwise
-(512 MiB backlog, 64 MiB checkpoints):
+(512 MiB backlog, 64 MiB checkpoints). Before and after loading a
+checkpoint's leaves together:
 
 | | 1 writer | 4 writers (one process) |
 |---|---|---|
-| acked MiB/s | 22.0 | 14.9 |
-| write p50 / p99 / p99.9 ms | 337 / 1,337 / 1,659 | 267 / 7,348 / 8,897 |
-| peak unapplied | 295 MiB | 520 MiB |
-| checkpoint, cold cache | 6–8 s per 64 MiB (150–210 leaf loads) | 7–9 s per 64 MiB |
-| checkpoint, warm cache | 0.8 s per 37 MiB (keeps up) | 1.5–2.7 s per 64 MiB |
-| log GETs during ingest | 158 MiB | 5,978 MiB |
+| acked MiB/s | 22.0 → 25.3 | 14.9 → 20.3 |
+| write p50 / p99 / p99.9 ms | 337 / 1,337 / 1,659 → 340 / 692 / 1,081 | 267 / 7,348 / 8,897 → 263 / 2,116 / 2,953 |
+| peak unapplied | 295 → 117 MiB | 520 → 474 MiB |
+| checkpoint, cold cache (~200 leaf loads) | 6–8 s → 2–3 s | 7–9 s → 3–4.5 s |
+| checkpoint, warm cache | 0.8–1.2 s (keeps up) | 1.8–3.2 s per 64 MiB |
+| log GETs during ingest | 155 MiB | 8.0 GiB |
 
-The applier starts with a cold leaf cache after the reopen phases and
-loads leaves one at a time, about 35 ms each, so for the first 40–60 s it
-applies 8–9 MiB/s. Once warm, one writer can't outrun it: 37 MiB
-checkpoints in 0.8 s, about 45 MiB/s, mostly upload. With four writers
-the backlog sits at its limit while the cache is cold, and writes stall
-for one checkpoint at a time (p99 7.3 s). Warm, it applies about 30 MiB/s:
-each writer also pulls the other three's logs (6 GiB of GETs in 120 s),
-which slows the applier's own log pull to 0.2–1.3 s.
+The applier starts with a cold leaf cache after the reopen phases. A
+checkpoint flushes a few leaves under each of dozens of inner nodes, so it
+plans its flushes from the root over the cached inner nodes and runs, and
+loads every leaf it will rewrite in one parallel round (about 9 ms per leaf
+instead of 35). Once warm, one writer can't outrun the applier: 37 MiB
+checkpoints in about a second, mostly upload. With four writers the backlog
+nears its limit while the cache is cold, and a write stalls for up to one
+checkpoint. Warm, it applies about 25 MiB/s: each writer also pulls the
+other three's logs (8 GiB of GETs in 120 s), which slows the applier's own
+log pull to 0.3–1.7 s.
 
 ```sh
 sidra-bench $B --latency s3 --scans 200 --reads 5000 --ingest-secs 120 --ingest-concurrency 1024 --writers 4
