@@ -68,6 +68,10 @@ pub struct HedgeConfig {
     pub max_extra: Fraction,
     /// Number of recent GETs the percentile is taken over.
     pub window: NonZeroUsize,
+    /// Threshold until enough GETs are measured. A process that just opened
+    /// has a cold cache, so its first GETs are the ones a stall hurts most.
+    #[serde(with = "humantime_serde")]
+    pub initial: Duration,
 }
 
 impl Default for HedgeConfig {
@@ -76,6 +80,8 @@ impl Default for HedgeConfig {
             percentile: Fraction(0.95),
             max_extra: Fraction(0.1),
             window: DEFAULT_WINDOW,
+            // Above an S3 GET's p99 in-region, so it mostly catches stalls.
+            initial: Duration::from_millis(250),
         }
     }
 }
@@ -83,7 +89,7 @@ impl Default for HedgeConfig {
 // Checked at compile time.
 const DEFAULT_WINDOW: NonZeroUsize = NonZeroUsize::new(512).unwrap();
 
-/// GETs measured before the first threshold.
+/// GETs measured before the threshold follows them.
 const MIN_SAMPLES: usize = 64;
 /// GETs between threshold updates.
 const UPDATE_EVERY: usize = 32;
@@ -102,18 +108,12 @@ pub enum Hedger {
 }
 
 #[derive(Debug)]
-enum Threshold {
-    Learning,
-    Ready(Duration),
-}
-
-#[derive(Debug)]
 pub struct Tracker {
     /// The latest `window` GET latencies, oldest first.
     recent: VecDeque<Duration>,
     since_update: usize,
-    threshold: Threshold,
-    /// Second copies allowed now; each GET earns `max_extra`.
+    threshold: Duration,
+    /// Second copies allowed now; each GET earns `max_extra`. Starts full.
     budget: f64,
 }
 
@@ -126,8 +126,8 @@ impl Hedger {
                 tracker: Mutex::new(Tracker {
                     recent: VecDeque::with_capacity(config.window.get()),
                     since_update: 0,
-                    threshold: Threshold::Learning,
-                    budget: 0.0,
+                    threshold: config.initial,
+                    budget: BURST,
                 }),
             },
         }
@@ -156,17 +156,9 @@ impl Hedger {
         let wait = {
             let mut t = tracker.lock();
             t.budget = (t.budget + config.max_extra.get()).min(BURST);
-            match t.threshold {
-                Threshold::Learning => None,
-                Threshold::Ready(d) => Some(d),
-            }
+            t.threshold
         };
         let record = |d: Duration| tracker.lock().record(d, config);
-        let Some(wait) = wait else {
-            let r = first.await;
-            record(start.elapsed());
-            return r;
-        };
         let first = match select(first, pin!(tokio::time::sleep(wait))).await {
             Either::Left((r, _)) => {
                 record(start.elapsed());
@@ -218,7 +210,7 @@ impl Tracker {
         if self.recent.len() >= MIN_SAMPLES && self.since_update >= UPDATE_EVERY {
             self.since_update = 0;
             if let Some(p) = percentile(&self.recent, config.percentile) {
-                self.threshold = Threshold::Ready(p);
+                self.threshold = p;
             }
         }
     }
@@ -279,13 +271,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn slow_gets_are_hedged_after_learning() {
+    async fn slow_gets_are_hedged_at_the_recent_p95() {
         let hedger = Hedger::new(Hedge::default());
         let (calls, hedges, took) = run_gets(&hedger, 1000, 100).await;
-        // The threshold is set after 64 GETs; the slow ones at 99, 199, ...
-        // are all hedged at 10 ms, so none waits its 5 s.
+        // The threshold follows the GETs after 64 of them; the slow ones at
+        // 99, 199, ... are all hedged at 10 ms, so none waits its 5 s.
         assert_eq!((calls, hedges), (1010, 10));
         assert_eq!(took, ms(990 * 10 + 10 * 20));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_hedger_hedges_from_the_first_get() {
+        let hedger = Hedger::new(Hedge::default());
+        // Every first copy stalls; the initial threshold cuts each to 260 ms.
+        let (calls, hedges, took) = run_gets(&hedger, 5, 1).await;
+        assert_eq!((calls, hedges), (10, 5));
+        assert_eq!(took, ms(5 * (250 + 10)));
     }
 
     #[tokio::test(start_paused = true)]
