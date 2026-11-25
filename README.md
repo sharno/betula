@@ -294,12 +294,13 @@ replica readers), heap-merged scans, scan readahead, hedged GETs.
 3. **Fewer bytes written:** buffers account for most write amplification
    (about 1.8x of message bytes in mixed traffic). Measure and try skipping
    buffer levels for dense batches.
-4. **Merging underfull nodes:** after a flush rewrites a leaf below about a
-   quarter full, merge it with a sibling (flushing the sibling's runs too) or
-   rebalance the pair; the same for internal nodes by child count. Today
-   only empty leaves go, so delete-heavy workloads (TTL expiry, queues)
-   leave sparse leaves: slower cold scans, a larger cached upper tree, more
-   bytes. `sidra-bench --delete-pct 90` measures it.
+4. **Purging buffered tombstones:** a delete stays in its run until a later
+   flush carries it down. Purging tracks only tombstones in leaves, and an
+   idle applier runs no checkpoint, so a range nobody writes to again (TTL
+   expiry, a consumed queue) keeps its tombstones and dead values forever:
+   after `--delete-pct 90` leaves stay 56% full. Then measure whether
+   merging underfull leaves pays (`--delete-order spread|prefix`, and the
+   checkpoint log's `leaves_underfull` / `merges_free` / `merges_any`).
 5. **Optional conditional writes** (compare-and-set) routed through the
    applier, for workloads that need them.
 

@@ -526,6 +526,9 @@ impl Shared {
                     leaves_rewritten = plan.stats.leaves_rewritten,
                     leaf_msgs = plan.stats.leaf_msgs,
                     leaves_moved = plan.stats.leaves_moved,
+                    leaves_underfull = plan.stats.leaves_underfull,
+                    merges_free = plan.stats.merges_free,
+                    merges_any = plan.stats.merges_any,
                     // Phase durations in ms: leases, log pull, tree rewrite
                     // (including node loads), segment upload, publish.
                     lease_ms = leased.as_millis(),

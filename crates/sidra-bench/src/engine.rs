@@ -39,6 +39,9 @@ pub struct EngineParams {
     /// How often sidra writers poll for each other's entries.
     pub poll: Duration,
     pub max_runs: usize,
+    /// sidra: how long tombstones wait before a checkpoint rewrites their
+    /// subtree just to drop them.
+    pub purge_after: Duration,
     pub compression: crate::CompressionArg,
     pub warm: sidra::Warm,
     pub hedge: sidra::Hedge,
@@ -103,7 +106,7 @@ impl Engine {
                         internal_max_bytes: params.internal_bytes,
                         max_fanout: params.fanout,
                         max_runs_per_child: params.max_runs,
-                        ..defaults.tree
+                        purge_tombstones_after: params.purge_after,
                     },
                     cache: sidra::CacheConfig {
                         inner_bytes: params.inner_cache_bytes,
@@ -224,13 +227,34 @@ impl Engine {
     }
 
     /// Tree shape (sidra only): walks every node.
-    pub async fn shape(&self) -> Result<Option<String>> {
+    /// Also leaf fill against `leaf_max`: leaves below a quarter, mean fill,
+    /// and how many leaves packing adjacent ones (no splits) would leave.
+    pub async fn shape(&self, leaf_max: usize) -> Result<Option<String>> {
         Ok(match self {
             Engine::Sidra(dbs) => {
                 let s = dbs[0].tree_shape().await?;
+                let underfull = s.leaf_bytes.iter().filter(|b| **b < leaf_max / 4).count();
+                let fill = s.leaf_bytes.iter().sum::<usize>() as f64
+                    / (s.leaf_bytes.len().max(1) * leaf_max) as f64;
+                let packed = s
+                    .leaf_bytes
+                    .iter()
+                    .fold((0usize, usize::MAX), |(n, open), b| {
+                        match open.checked_add(*b) {
+                            Some(sum) if sum <= leaf_max => (n, sum),
+                            _ => (n + 1, *b),
+                        }
+                    })
+                    .0;
                 Some(format!(
-                    "internal {} leaves {} runs {} tombstones {}",
-                    s.internal, s.leaves, s.runs, s.tombstones
+                    "internal {} leaves {} runs {} tombstones {} underfull leaves {} mean fill {:.0}% packed leaves {}",
+                    s.internal,
+                    s.leaves,
+                    s.runs,
+                    s.tombstones,
+                    underfull,
+                    100.0 * fill,
+                    packed
                 ))
             }
             Engine::Slatedb(..) => None,

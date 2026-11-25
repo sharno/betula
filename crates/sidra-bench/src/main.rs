@@ -89,6 +89,10 @@ struct Args {
     /// sidra: buffered runs per child before it is flushed.
     #[arg(long, default_value_t = 16)]
     max_runs: usize,
+    /// sidra: seconds before tombstones are purged on their own. The delete
+    /// phase waits this long after deleting, so scans see the purged tree.
+    #[arg(long, default_value_t = 60)]
+    purge_secs: u64,
     #[arg(long, default_value_t = 16)]
     memtable_mib: usize,
     /// sidra cache split. Defaults total 640 MiB, the same as SlateDB's
@@ -117,6 +121,10 @@ struct Args {
     /// cold after a reopen). Shows the cost of sparse leaves.
     #[arg(long, default_value_t = 0)]
     delete_pct: u64,
+    /// Which keys `--delete-pct` deletes: spread evenly, or the lowest ones
+    /// (a contiguous range, like TTL expiry or a consumed queue).
+    #[arg(long, value_enum, default_value_t = DeleteOrder::Spread)]
+    delete_order: DeleteOrder,
     /// Keep each run's database in the bucket (deleted after the run by
     /// default: runs add up to hundreds of GB).
     #[arg(long)]
@@ -152,6 +160,12 @@ fn splitmix(mut x: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum DeleteOrder {
+    Spread,
+    Prefix,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -320,8 +334,11 @@ async fn write_phase(
 
 /// Whether key `id` is deleted by the delete phase: `pct` out of every 100
 /// consecutive ids, so every leaf loses about the same share.
-fn doomed(id: u64, pct: u64) -> bool {
-    id % 100 < pct
+fn doomed(id: u64, keys: u64, pct: u64, order: DeleteOrder) -> bool {
+    match order {
+        DeleteOrder::Spread => id % 100 < pct,
+        DeleteOrder::Prefix => id < keys * pct / 100,
+    }
 }
 
 /// Deletes `pct`% of keys, settles, then scans the survivors warm and (after
@@ -339,7 +356,14 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<Engine>>,
 {
-    let ids: Arc<Vec<u64>> = Arc::new((0..wl.keys).filter(|id| doomed(*id, pct)).collect());
+    if let Some(shape) = db.shape(args.leaf_kib << 10).await? {
+        eprintln!("[{}] before deletes: {shape}", kind.name());
+    }
+    let ids: Arc<Vec<u64>> = Arc::new(
+        (0..wl.keys)
+            .filter(|id| doomed(*id, wl.keys, pct, args.delete_order))
+            .collect(),
+    );
     let (c, batch) = (args.concurrency, args.batch);
     let (elapsed, hist) = {
         let (db, ids) = (db.clone(), ids.clone());
@@ -358,21 +382,36 @@ where
     record("delete", ids.len() as u64, elapsed, hist);
     let (elapsed, hist, ()) = timed(db.settle()).await?;
     record("settle", 1, elapsed, hist);
-    if let Some(shape) = db.shape().await? {
+    if let Some(shape) = db.shape(args.leaf_kib << 10).await? {
         eprintln!("[{}] after deletes: {shape}", kind.name());
+    }
+    // Once the tombstones are old enough, a checkpoint pushes them down into
+    // their leaves and drops them: the tree a later reader sees.
+    tokio::time::sleep(Duration::from_secs(args.purge_secs + 1)).await;
+    let (elapsed, hist, ()) = timed(db.settle()).await?;
+    record("purge", 1, elapsed, hist);
+    if let Some(shape) = db.shape(args.leaf_kib << 10).await? {
+        eprintln!("[{}] after purge: {shape}", kind.name());
     }
 
     let survivors = wl.keys - ids.len() as u64;
     ensure!(survivors > 0, "--delete-pct leaves no keys");
+    let first_survivor = (0..wl.keys)
+        .find(|id| !doomed(*id, wl.keys, pct, args.delete_order))
+        .expect("some key survives");
     let len = args.scan_len.min(survivors as usize);
-    // Scans start where at least `len` survivors follow.
-    let span = (len as u64 * 100).div_ceil(100 - pct) + 100;
+    // Scans start among the survivors, where at least `len` of them follow.
+    let span = match args.delete_order {
+        DeleteOrder::Spread => (len as u64 * 100).div_ceil(100 - pct) + 100,
+        DeleteOrder::Prefix => len as u64,
+    };
+    let starts = wl.keys - first_survivor - span + 1;
     let scans = |seed: u64, db: Arc<Engine>| {
         let wl = wl.clone();
         run_ops(args.scans, c, move |i| {
             let (db, wl) = (db.clone(), wl.clone());
             async move {
-                let start = wl.random_id(seed, i).min(wl.keys.saturating_sub(span));
+                let start = first_survivor + wl.random_id(seed, i) % starts;
                 let n = db.scan(wl.key(start), len).await?;
                 ensure!(n == len, "scan returned {n}, expected {len}");
                 Ok(())
@@ -399,7 +438,7 @@ where
         "deleted key still present"
     );
     ensure!(
-        db.get(&wl.key(pct)).await?.is_some(),
+        db.get(&wl.key(first_survivor)).await?.is_some(),
         "surviving key missing"
     );
     Ok(db)
@@ -621,6 +660,7 @@ async fn bench_engine(
         gc: (!args.no_gc).then_some(args.gc_deletes_per_sec),
         poll: Duration::from_millis(args.poll_ms),
         max_runs: args.max_runs,
+        purge_after: Duration::from_secs(args.purge_secs),
         compression: args.compression,
         hedge: match args.hedge {
             HedgeArg::On => sidra::Hedge::default(),

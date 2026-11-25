@@ -9,7 +9,7 @@
 //! previous version.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, BinaryHeap, HashSet, binary_heap::PeekMut};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, binary_heap::PeekMut};
 use std::future::Future;
 use std::ops::{Bound, Range};
 use std::pin::Pin;
@@ -139,6 +139,8 @@ pub struct TreeShape {
     pub runs: usize,
     /// Tombstones still held in leaves.
     pub tombstones: usize,
+    /// Logical bytes of each leaf, in key order.
+    pub leaf_bytes: Vec<usize>,
     /// Every reachable node and run.
     pub nodes: Vec<NodePtr>,
 }
@@ -161,6 +163,7 @@ pub async fn shape(nodes: &Nodes, root: Option<TreeRoot>) -> Result<TreeShape> {
                 }
                 Node::Leaf(l) => {
                     shape.leaves += 1;
+                    shape.leaf_bytes.push(msgs_bytes(&l.entries));
                     shape.tombstones += l
                         .entries
                         .iter()
@@ -556,6 +559,13 @@ pub struct WriteStats {
     /// Leaves rewritten with no messages: moved by the cleaner or purged of
     /// tombstones.
     pub leaves_moved: u64,
+    /// Leaves written below a quarter of `leaf_max_bytes` (diagnostic, for
+    /// sizing node merging): how many, how many have an adjacent leaf this
+    /// checkpoint also wrote that both would fit in, and how many have any
+    /// adjacent leaf they'd fit with (untouched ones judged by encoded size).
+    pub leaves_underfull: u64,
+    pub merges_free: u64,
+    pub merges_any: u64,
 }
 
 /// Applies sorted, key-unique `msgs` to the tree at `root`, writing new nodes
@@ -603,6 +613,7 @@ pub async fn apply(
         freed: Vec::new(),
         stats: WriteStats::default(),
         depth: 0,
+        leaf_sizes: HashMap::new(),
     };
     if let Some(r) = root.filter(|_| !victims.is_empty()) {
         w.mark_dirty(r.ptr, r.height).await?;
@@ -636,6 +647,8 @@ struct Writer<'a> {
     stats: WriteStats,
     /// Depth of the node being rewritten (0: root).
     depth: usize,
+    /// Logical bytes of the leaves this checkpoint wrote.
+    leaf_sizes: HashMap<NodePtr, usize>,
 }
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -826,6 +839,7 @@ impl Writer<'_> {
                             child.runs.push(run);
                         }
                     }
+                    self.count_underfull(&node);
                     if node.children.is_empty() {
                         Ok(Rewrite::Removed)
                     } else {
@@ -834,6 +848,33 @@ impl Writer<'_> {
                 }
             }
         })
+    }
+
+    /// Counts the underfull leaves this checkpoint wrote under `node`, and
+    /// which could merge into a neighbor (see `WriteStats`).
+    fn count_underfull(&mut self, node: &Internal) {
+        let max = self.cfg.leaf_max_bytes;
+        let written = |c: &Child| self.leaf_sizes.get(&c.ptr).copied();
+        let (underfull, free, any) = node
+            .children
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| written(c).filter(|s| *s < max / 4).map(|s| (i, s)))
+            .map(|(i, s)| {
+                let neighbors = || {
+                    [i.checked_sub(1), i.checked_add(1)]
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|j| node.children.get(j))
+                };
+                let free = neighbors().any(|n| written(n).is_some_and(|b| s + b <= max));
+                let any = neighbors().any(|n| s + written(n).unwrap_or(n.ptr.len as usize) <= max);
+                (1, u64::from(free), u64::from(any))
+            })
+            .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+        self.stats.leaves_underfull += underfull;
+        self.stats.merges_free += free;
+        self.stats.merges_any += any;
     }
 
     /// The child to flush next: one that would exceed the run limit, else the
@@ -933,6 +974,16 @@ impl Writer<'_> {
         }
     }
 
+    fn write_leaf(&mut self, node: Node) -> Child {
+        let bytes = match &node {
+            Node::Leaf(l) => msgs_bytes(&l.entries),
+            Node::Internal(_) | Node::Run(_) => 0,
+        };
+        let child = self.write_child(node);
+        self.leaf_sizes.insert(child.ptr, bytes);
+        child
+    }
+
     fn is_ours(&self, ptr: NodePtr) -> bool {
         ptr.seg == self.inner.id || ptr.seg == self.leaves.id
     }
@@ -982,10 +1033,10 @@ impl Writer<'_> {
         });
         let (_, first) = leaves.next().expect("non-empty entries yield a chunk");
         let rest: Vec<_> = leaves.collect();
-        let first = self.write_child(first);
+        let first = self.write_leaf(first);
         let rest = rest
             .into_iter()
-            .map(|(low, n)| (low, self.write_child(n)))
+            .map(|(low, n)| (low, self.write_leaf(n)))
             .collect();
         Rewrite::Nodes { first, rest }
     }
