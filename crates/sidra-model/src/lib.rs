@@ -33,16 +33,6 @@ pub enum Write {
     Delete(&'static str),
 }
 
-/// Which applied log slots GC deletes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LogGc {
-    Off,
-    /// The protocol: applied slots, except fences.
-    KeepFences,
-    /// Every applied slot: the bug keeping fences fixes.
-    DeleteFences,
-}
-
 #[derive(Clone, Debug)]
 pub struct Config {
     /// One script per process. Each process opens a writer (fencing any
@@ -52,13 +42,8 @@ pub struct Config {
     pub max_clock: u64,
     /// Checkpoints stop after this manifest id.
     pub max_manifest: u64,
-    /// A new writer fences the log before writing (the protocol). `false`
-    /// starts it writing at the first empty slot, unfenced.
-    pub place_fence: bool,
-    /// A new writer's clock observes the manifest's newest applied
-    /// timestamp (the protocol). `false` reproduces the bug that fixes.
-    pub observe_last_ts: bool,
-    pub gc: LogGc,
+    /// A protocol rule turned off, to show it's needed.
+    pub broken: Option<Rule>,
     /// Faults allowed per run: lost requests, lost responses, crashes.
     pub max_faults: u8,
 }
@@ -193,6 +178,8 @@ enum Phase {
     Open(Box<Writer>),
     /// Fenced, superseded, or failed: it takes no more writes.
     Stopped,
+    /// Takes no more steps; requests it sent may still land.
+    Crashed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -207,8 +194,6 @@ pub struct Proc {
     /// Acknowledged writes: these must stay visible (unless overwritten by
     /// newer versions).
     pub acked: Vec<(Bytes, Version)>,
-    /// Crashed: takes no more steps; requests it sent may still land.
-    crashed: bool,
     /// Checkpoints started (bounded, so the state space is finite).
     attempts: u64,
     /// Requests sent, not yet delivered. Delivered in any order.
@@ -302,7 +287,6 @@ fn start() -> Proc {
         script_pos: 0,
         pending: BTreeMap::new(),
         acked: Vec::new(),
-        crashed: false,
         attempts: 0,
         outbox: Vec::new(),
         timers: vec![Timer::Clock, Timer::Start],
@@ -347,18 +331,19 @@ fn fire(p: &mut Proc, cfg: &Config, index: usize, timer: &Timer) {
                 msg,
             };
             let key = Bytes::from_static(key.as_bytes());
-            p.pending
-                .insert(p.script_pos, (key.clone(), version.clone()));
             let waiter = p.script_pos;
-            p.script_pos += 1;
-            let Some(w) = p.writer() else { return };
+            let Phase::Open(w) = &mut p.phase else {
+                unreachable!("`useful` fires writes only on an open writer")
+            };
             let effects = w.log.step(
                 log::Event::Write {
-                    ops: vec![(key, version)],
+                    ops: vec![(key.clone(), version.clone())],
                     waiter: Some(waiter),
                 },
                 Gate::Open,
             );
+            p.pending.insert(waiter, (key, version));
+            p.script_pos += 1;
             p.log_effects(effects);
             p.arm(Timer::Write);
         }
@@ -455,14 +440,10 @@ fn open_step(p: &mut Proc, cfg: &Config, resp: Response) {
                     let req = opening_request(&o);
                     (o, req)
                 }
-                Ok(AfterRead::Place(placing)) if !cfg.place_fence => {
-                    // The bug: start writing at the empty slot, unfenced.
+                Ok(AfterRead::Place(placing)) if cfg.broken == Some(Rule::Fence) => {
+                    // Start writing at the empty slot, unfenced.
                     let at = placing.at();
-                    let fenced = match placing.outcome(FenceAt::Placed) {
-                        Ok(AfterPlace::Done(f)) => f,
-                        _ => unreachable!("a placed fence is done"),
-                    };
-                    return opened(p, cfg, claimed, fenced, at);
+                    return opened(p, cfg, claimed, placing.placed(), at);
                 }
                 Ok(AfterRead::Place(placing)) => {
                     let o = Opening::Placing(claimed, placing);
@@ -530,11 +511,11 @@ fn opened(p: &mut Proc, cfg: &Config, claimed: Claimed, fenced: Fenced, first: W
     read.batches
         .iter()
         .flat_map(|(_, b)| b.ops.iter().map(|(_, v)| v.ts))
-        .chain(cfg.observe_last_ts.then_some(claimed.manifest.last_ts))
+        .chain((cfg.broken != Some(Rule::LastTs)).then_some(claimed.manifest.last_ts))
         .for_each(|ts| p.observe(ts));
     let mut tail = Tail::new(claimed.manifest.wal_applied);
     tail.absorb(read, p.clock);
-    if cfg.place_fence {
+    if cfg.broken != Some(Rule::Fence) {
         tail.add_fence(fence);
     }
     let epoch = claimed.manifest.writer_epoch;
@@ -614,10 +595,14 @@ fn checkpoint_step(p: &mut Proc, resp: Response) {
             return;
         }
         // A failed request ends the attempt; the next one starts over.
-        (_, _) => {
+        (
+            Stage::LoadingTree(_) | Stage::PuttingSegment(..) | Stage::Publishing(..),
+            Response::Failed,
+        ) => {
             p.arm(Timer::Checkpoint);
             return;
         }
+        (stage, resp) => unreachable!("{stage:?} got {resp:?}"),
     };
     p.send(Purpose::Checkpoint, req);
 }
@@ -743,10 +728,9 @@ fn collectable(cfg: &Config, store: &BTreeMap<Path, Vec<u8>>) -> Vec<WalSeq> {
             _ => None,
         })
         .collect();
-    match cfg.gc {
-        LogGc::Off => Vec::new(),
-        LogGc::KeepFences => deletable_wals(&stored, &m).collect(),
-        LogGc::DeleteFences => stored.into_iter().filter(|s| *s <= m.wal_applied).collect(),
+    match cfg.broken {
+        Some(Rule::KeepFences) => stored.into_iter().filter(|s| *s <= m.wal_applied).collect(),
+        Some(Rule::Fence | Rule::LastTs) | None => deletable_wals(&stored, &m).collect(),
     }
 }
 
@@ -824,7 +808,7 @@ impl Model for Checked {
                     fate,
                 })
             }));
-            if p.crashed {
+            if p.phase == Phase::Crashed {
                 return;
             }
             actions.extend(
@@ -866,14 +850,14 @@ impl Model for Checked {
                     s.faults += 1;
                 }
                 let p = &mut s.procs[proc];
-                if !p.crashed {
+                if p.phase != Phase::Crashed {
                     on_response(p, &self.cfg, purpose, resp);
                 }
             }
             Action::Crash { proc } => {
                 s.faults += 1;
                 let p = &mut s.procs[proc];
-                p.crashed = true;
+                p.phase = Phase::Crashed;
                 p.timers.clear();
             }
             Action::Fire { proc, timer } => {
@@ -961,34 +945,21 @@ pub fn small() -> Config {
         ],
         max_clock: 3,
         max_manifest: 4,
-        place_fence: true,
-        observe_last_ts: true,
-        gc: LogGc::KeepFences,
+        broken: None,
         max_faults: 0,
     }
 }
 
 /// `small` with the protocol rule `rule` broken.
 pub fn without(rule: Rule) -> Config {
-    let cfg = small();
-    match rule {
-        Rule::Fence => Config {
-            place_fence: false,
-            ..cfg
-        },
-        Rule::LastTs => Config {
-            observe_last_ts: false,
-            ..cfg
-        },
-        Rule::KeepFences => Config {
-            gc: LogGc::DeleteFences,
-            ..cfg
-        },
+    Config {
+        broken: Some(rule),
+        ..small()
     }
 }
 
 /// A protocol rule a bug config breaks.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rule {
     /// A new writer fences the log.
     Fence,

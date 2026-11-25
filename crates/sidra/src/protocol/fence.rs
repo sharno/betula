@@ -94,15 +94,18 @@ impl Placing {
         self.read.end
     }
 
+    /// The fence is in place.
+    pub fn placed(self) -> Fenced {
+        let fence = self.read.end;
+        Fenced {
+            read: self.read,
+            fence,
+        }
+    }
+
     pub fn outcome(self, outcome: FenceAt) -> Result<AfterPlace, Superseded> {
         match outcome {
-            FenceAt::Placed => {
-                let fence = self.read.end;
-                Ok(AfterPlace::Done(Fenced {
-                    read: self.read,
-                    fence,
-                }))
-            }
+            FenceAt::Placed => Ok(AfterPlace::Done(self.placed())),
             FenceAt::Taken(record) => {
                 check(self.epoch, Some(&record))?;
                 let scan = Scan::resume(self.read).found(record);
