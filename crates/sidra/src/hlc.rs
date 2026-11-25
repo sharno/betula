@@ -40,6 +40,17 @@ impl Ts {
 
 pub(crate) const LOGICAL_BITS: u32 = 16;
 
+/// The hybrid-clock value at physical time `ms`, below any timestamp taken
+/// in that millisecond.
+pub fn at_ms(ms: u64) -> u64 {
+    ms << LOGICAL_BITS
+}
+
+/// A duration in hybrid-clock units.
+pub fn span(d: std::time::Duration) -> u64 {
+    at_ms(u64::try_from(d.as_millis()).unwrap_or(u64::MAX >> LOGICAL_BITS))
+}
+
 #[derive(Debug, Default)]
 pub struct Hlc {
     last: AtomicU64,
@@ -48,7 +59,7 @@ pub struct Hlc {
 impl Hlc {
     /// A timestamp greater than every one handed out or observed before.
     pub fn now(&self, physical_ms: u64) -> u64 {
-        let physical = physical_ms << LOGICAL_BITS;
+        let physical = at_ms(physical_ms);
         let prev = self
             .last
             .try_update(Ordering::AcqRel, Ordering::Acquire, |last| {

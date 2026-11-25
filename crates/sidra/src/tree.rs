@@ -21,11 +21,12 @@ use crate::codec;
 use crate::error::{Error, Result};
 use crate::hlc::Ts;
 use crate::node::{
-    Child, Internal, Leaf, Node, Run, RunRef, apply_to_leaf, chunk_by_bytes, group_starts,
-    merge_versions, msgs_bytes,
+    Child, Internal, Leaf, Node, Run, RunRef, apply_to_leaf, buffer_purge_at, chunk_by_bytes,
+    group_starts, merge_versions, msgs_bytes,
 };
 use crate::nodes::{Nodes, Segment};
-use crate::types::{KeyRange, NodePtr, SegmentId, TreeRoot, Version, entry_bytes};
+use crate::protocol::tombstones;
+use crate::types::{KeyRange, Msg, NodePtr, SegmentId, TreeRoot, Version, entry_bytes};
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -64,12 +65,6 @@ impl TreeConfig {
     fn leaf_split_target(&self) -> usize {
         self.leaf_max_bytes * 3 / 4
     }
-}
-
-/// A duration in hybrid-clock units (milliseconds above the logical bits).
-fn hlc_span(d: std::time::Duration) -> u64 {
-    let bits = crate::hlc::LOGICAL_BITS;
-    u64::try_from(d.as_millis()).unwrap_or(u64::MAX >> bits) << bits
 }
 
 fn corrupt(ptr: NodePtr, what: &str) -> Error {
@@ -139,6 +134,8 @@ pub struct TreeShape {
     pub runs: usize,
     /// Tombstones still held in leaves.
     pub tombstones: usize,
+    /// Runs holding tombstones.
+    pub runs_with_tombstones: usize,
     /// Logical bytes of each leaf, in key order.
     pub leaf_bytes: Vec<usize>,
     /// Every reachable node and run.
@@ -159,6 +156,12 @@ pub async fn shape(nodes: &Nodes, root: Option<TreeRoot>) -> Result<TreeShape> {
                     shape.internal += 1;
                     shape.nodes.extend(i.run_ptrs());
                     shape.runs += i.run_ptrs().count();
+                    shape.runs_with_tombstones += i
+                        .children
+                        .iter()
+                        .flat_map(|c| &c.runs)
+                        .filter(|r| r.tombstones)
+                        .count();
                     next.extend(i.children.iter().map(|c| c.ptr));
                 }
                 Node::Leaf(l) => {
@@ -601,12 +604,7 @@ pub async fn apply(
         compression,
         victims,
         drop_below: drop_tombstones_below,
-        purge_below: Ts {
-            hlc: drop_tombstones_below
-                .hlc
-                .saturating_sub(hlc_span(cfg.purge_tombstones_after)),
-            ..drop_tombstones_below
-        },
+        purge_below: tombstones::purge_below(drop_tombstones_below, cfg.purge_tombstones_after),
         dirty: HashSet::new(),
         inner: Region::new(out.inner),
         leaves: Region::new(out.leaves),
@@ -669,8 +667,19 @@ fn split_by_child(pivots: &[Bytes], msgs: Vec<(Bytes, Version)>) -> Parts {
 }
 
 impl Writer<'_> {
-    fn needs_purge(&self, child: &Child) -> bool {
-        child.oldest_tombstone.is_some_and(|t| t < self.purge_below)
+    /// Whether the child's subtree, its runs, and `part` (messages headed
+    /// for it in this checkpoint, which count as one more run) hold
+    /// tombstones due for purging. Counting `part` matters when a purge
+    /// carries a parent's runs down: their tombstones go on down now rather
+    /// than sit in a new run until the next checkpoint.
+    fn needs_purge(&self, child: &Child, part: &[(Bytes, Version)]) -> bool {
+        let part = part.iter().map(|(_, v)| (v.ts, v.msg == Msg::Delete));
+        let runs = child.runs.iter().map(|r| (r.newest, r.tombstones));
+        buffer_purge_at(runs.chain(part))
+            .into_iter()
+            .chain(child.purge_at)
+            .min()
+            .is_some_and(|t| t < self.purge_below)
     }
 
     /// Whether the child or its subtree holds a node that must move out of a
@@ -735,7 +744,7 @@ impl Writer<'_> {
                 if msgs.is_empty()
                     && !self.victims.contains(&r.ptr.seg)
                     && !self.dirty.contains(&r.ptr)
-                    && !r.oldest_tombstone.is_some_and(|t| t < self.purge_below) =>
+                    && !r.purge_at.is_some_and(|t| t < self.purge_below) =>
             {
                 return Ok(Some(r));
             }
@@ -748,7 +757,7 @@ impl Writer<'_> {
                 Rewrite::Nodes { first, rest } if rest.is_empty() => {
                     break TreeRoot {
                         ptr: first.ptr,
-                        oldest_tombstone: first.oldest_tombstone,
+                        purge_at: first.purge_at,
                         newest: first.newest,
                         height,
                     };
@@ -770,7 +779,7 @@ impl Writer<'_> {
             let only = &node.children[0];
             root = TreeRoot {
                 ptr: only.ptr,
-                oldest_tombstone: only.oldest_tombstone,
+                purge_at: only.purge_at,
                 newest: only.newest,
                 height: root.height - 1,
             };
@@ -819,7 +828,7 @@ impl Writer<'_> {
                     let mut i = 0;
                     while i < node.children.len() {
                         let child = &node.children[i];
-                        if self.subtree_needs_move(child) || self.needs_purge(child) {
+                        if self.subtree_needs_move(child) || self.needs_purge(child, &parts[i]) {
                             self.flush_child(&mut node, &mut parts, i).await?;
                         } else {
                             if self.runs_need_move(child) {
@@ -954,21 +963,23 @@ impl Writer<'_> {
             .map(|(_, v)| v.ts)
             .max()
             .expect("runs are written only for non-empty parts");
+        let tombstones = entries.iter().any(|(_, v)| v.msg == Msg::Delete);
         let run = Arc::new(Run { entries });
         RunRef {
             ptr: self.write(Node::Run(run.clone())),
             bytes,
             newest,
+            tombstones,
             resolved: OnceLock::from(run),
         }
     }
 
     fn write_child(&mut self, node: Node) -> Child {
-        let oldest_tombstone = node.oldest_tombstone();
+        let purge_at = node.purge_at();
         let newest = node.newest();
         Child {
             ptr: self.write(node),
-            oldest_tombstone,
+            purge_at,
             newest,
             runs: Vec::new(),
         }

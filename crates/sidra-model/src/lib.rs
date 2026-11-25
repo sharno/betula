@@ -524,6 +524,8 @@ fn checkpoint_step(p: &mut Proc, cfg: &Config, resp: Response, o: &mut Out) {
             steal_after: std::time::Duration::from_secs(3600),
         },
         cleaner: &cleaner,
+        // The model's tree has no tombstones to purge.
+        purge_after: std::time::Duration::from_secs(60),
     };
     let stage = std::mem::replace(&mut a.stage, Stage::Idle);
     let next = |req: Request, stage: Stage, a: &mut Applier, p: &mut Proc, o: &mut Out| {
@@ -637,7 +639,7 @@ fn checkpoint_step(p: &mut Proc, cfg: &Config, resp: Response, o: &mut Out) {
                         offset: 0,
                         len: 0,
                     },
-                    oldest_tombstone: None,
+                    purge_at: None,
                     newest: None,
                     height: 0,
                 }),
@@ -739,6 +741,7 @@ fn advance_pull(
                     steal_after: std::time::Duration::from_secs(3600),
                 },
                 cleaner: &cleaner,
+                purge_after: std::time::Duration::from_secs(60),
             };
             advance_seal(a, p, o, sealing, queue, None, clock, who);
         }

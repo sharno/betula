@@ -229,8 +229,13 @@ writer C ─► wal/C/{seq} ─┘
   - A rewrite carries the parent's buffered versions for that range down
     with it, so a rewritten leaf has no older version of its keys above it.
 
-  Child pointers record each subtree's oldest tombstone, so leaves whose
-  tombstones became droppable are found without loading leaves.
+  A tombstone usually goes when a flush rewrites its leaf anyway. Once it
+  has been droppable for `purge_tombstones_after` (60 s), a checkpoint
+  rewrites its subtree just to drop it, even with no new writes. A tombstone
+  still buffered in a run waits until its buffer has had no writes that
+  long, then is carried down: a busy buffer flushes on its own, and forcing
+  it early would cost its batching. Child pointers summarize when each
+  subtree is due, so due ones are found without loading anything.
 - **Inner-node cache.** Internal nodes and runs have their own cache. By
   default, open loads both before returning (`Warm::Blocking`), so reads are
   full speed from the first request. `Warm::Background` returns after the
@@ -287,20 +292,22 @@ writer C ─► wal/C/{seq} ─┘
 
 Done: LZ4 compression (on by default), lighter cleaning of inner segments,
 paced GC deletes, multi-region (regional writer logs, standby appliers,
-replica readers), heap-merged scans, scan readahead, hedged GETs.
+replica readers), heap-merged scans, scan readahead, hedged GETs, purging
+buffered tombstones.
 
 1. **Snapshots and clones:** pin a manifest. Nearly free with copy-on-write.
 2. **Soak tests:** multi-hour runs against a real store.
 3. **Fewer bytes written:** buffers account for most write amplification
    (about 1.8x of message bytes in mixed traffic). Measure and try skipping
    buffer levels for dense batches.
-4. **Purging buffered tombstones:** a delete stays in its run until a later
-   flush carries it down. Purging tracks only tombstones in leaves, and an
-   idle applier runs no checkpoint, so a range nobody writes to again (TTL
-   expiry, a consumed queue) keeps its tombstones and dead values forever:
-   after `--delete-pct 90` leaves stay 56% full. Then measure whether
-   merging underfull leaves pays (`--delete-order spread|prefix`, and the
-   checkpoint log's `leaves_underfull` / `merges_free` / `merges_any`).
+4. **Merging underfull leaves:** after deleting 90% of keys spread evenly
+   and purging, leaves average 9% full: 1,310 leaves where 120 would do.
+   96% of the underfull leaves a checkpoint writes have a neighbour it also
+   rewrote that both fit in, so merging only those needs no extra reads.
+   Cold scans of the survivors already cost about the dense tree's GETs, so
+   the gain is fewer leaves (cache, GETs per key), not faster scans.
+   Contiguous deletes (TTL, queues) need no merging: their leaves empty and
+   go (`--delete-order prefix --delete-pct 90`: 1,308 leaves to 179).
 5. **Optional conditional writes** (compare-and-set) routed through the
    applier, for workloads that need them.
 

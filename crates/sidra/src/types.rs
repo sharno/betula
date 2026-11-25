@@ -66,8 +66,8 @@ impl fmt::Display for NodePtr {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TreeRoot {
     pub ptr: NodePtr,
-    /// Oldest tombstone in the tree's leaves.
-    pub oldest_tombstone: Option<Ts>,
+    /// When the tree first holds tombstones worth purging (`Node::purge_at`).
+    pub purge_at: Option<Ts>,
     /// Newest version anywhere in the tree.
     pub newest: Option<Ts>,
     pub height: u32,

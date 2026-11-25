@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -486,8 +486,17 @@ async fn run(ops: Vec<Op>, lags: Vec<u64>, faults: Option<(Faults, u64)>) {
     assert_eq!(all, model_range(&model, &KeyRange::all()), "after reopen");
 }
 
+/// `default` cases, or `PROPTEST_CASES` for stress runs (an explicit
+/// `cases` would otherwise override it).
+fn cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: cases(48), ..ProptestConfig::default() })]
     #[test]
     fn matches_model(ops in proptest::collection::vec(op(), 1..250), lags in lags()) {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
@@ -496,9 +505,8 @@ proptest! {
 }
 
 proptest! {
-    // Each retried fault sleeps for the backoff, so cases are slow; raise
-    // with PROPTEST_CASES for stress runs.
-    #![proptest_config(ProptestConfig { cases: 12, ..ProptestConfig::default() })]
+    // Each retried fault sleeps for the backoff, so cases are slow.
+    #![proptest_config(ProptestConfig { cases: cases(12), ..ProptestConfig::default() })]
     /// Same, with store requests failing before and after they apply, and
     /// random delays.
     #[test]
@@ -663,6 +671,49 @@ async fn tombstones_are_dropped_once_safe() {
     let shape = db.tree_shape().await.unwrap();
     assert_eq!(shape.tombstones, 0, "{shape:?}");
     assert_eq!(db.scan(KeyRange::all()).collect().await.unwrap().len(), 20);
+}
+
+/// Deletes buffered above a range nobody writes to again still reach their
+/// leaves and go: the applier checkpoints for the purge with no new entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_tree_purges_buffered_tombstones() {
+    let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let clock = ManualClock::new();
+    let mut cfg = tiny_config();
+    cfg.tree.purge_tombstones_after = Duration::from_secs(10);
+    // Also how often an idle applier retries a purge (real time).
+    cfg.checkpoint.interval = Duration::from_millis(20);
+    let db = Db::builder(ROOT, os.clone())
+        .with_settings(cfg)
+        .with_clock(clock.clone())
+        .build()
+        .await
+        .unwrap();
+    for i in 0..300u32 {
+        clock.tick();
+        db.put(format!("k{i:04}"), "v").await.unwrap();
+    }
+    db.checkpoint().await.unwrap();
+    for i in 0..150u32 {
+        clock.tick();
+        db.delete(format!("k{i:04}")).await.unwrap();
+    }
+    db.checkpoint().await.unwrap();
+    let before = db.tree_shape().await.unwrap();
+    assert!(before.runs_with_tombstones > 0, "{before:?}");
+
+    clock.advance(Duration::from_secs(20));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let after = loop {
+        let shape = db.tree_shape().await.unwrap();
+        if shape.runs_with_tombstones == 0 && shape.tombstones == 0 {
+            break shape;
+        }
+        assert!(Instant::now() < deadline, "not purged: {shape:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(after.leaves < before.leaves, "{before:?} -> {after:?}");
+    assert_eq!(db.scan(KeyRange::all()).collect().await.unwrap().len(), 150);
 }
 
 async fn segment_objects(os: &Arc<dyn ObjectStore>) -> usize {

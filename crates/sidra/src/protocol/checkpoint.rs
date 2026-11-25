@@ -14,6 +14,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::hlc::{Ts, WriterId};
 use crate::manifest::{Frontier, Manifest};
@@ -34,6 +35,8 @@ pub struct Applier<'a> {
     pub epoch: Epoch,
     pub role: ApplierRole,
     pub cleaner: &'a CleanerConfig,
+    /// `TreeConfig::purge_tombstones_after`.
+    pub purge_after: Duration,
 }
 
 /// Leases read: every writer with a lease, and this writer's own floor.
@@ -80,9 +83,6 @@ impl Sealing {
     /// pulled.
     pub fn sealed(self, view: &View, a: Applier, now_ms: u64) -> Plan {
         let victims = segments::pick_victims(&view.manifest.segments, a.cleaner);
-        if view.tails.is_empty() && view.tails.sealed().next().is_none() && victims.is_empty() {
-            return Plan::Nothing;
-        }
         let is_sealed = |w| view.is_sealed(w);
         let Scanned {
             own_floor,
@@ -90,6 +90,23 @@ impl Sealing {
             present,
         } = self.scanned;
         let floor = tombstones::floor(own_floor, &leases, is_sealed);
+        // With nothing new, purging still needs a checkpoint, or an idle
+        // tree keeps its tombstones. Judged by the floor rather than the last
+        // manifest's bound: when only that bound holds a purge back, this
+        // checkpoint publishes a higher one and the next purges.
+        let purge = self.pull == Pull::Complete
+            && tombstones::purge_due(
+                view.manifest.tree.and_then(|r| r.purge_at),
+                floor,
+                a.purge_after,
+            );
+        if view.tails.is_empty()
+            && view.tails.sealed().next().is_none()
+            && victims.is_empty()
+            && !purge
+        {
+            return Plan::Nothing;
+        }
         Plan::Apply(Applying {
             msgs: view.tails.mem().to_sorted_vec(),
             drop_below: tombstones::drop_below(floor, view.manifest.tombstone_bound, self.pull),

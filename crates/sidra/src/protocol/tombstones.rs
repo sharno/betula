@@ -16,7 +16,9 @@
 //! - A writer whose log couldn't be pulled may hold older entries: drop
 //!   nothing until it's reachable.
 
-use crate::hlc::{Ts, WriterId};
+use std::time::Duration;
+
+use crate::hlc::{self, Ts, WriterId};
 use crate::wal::Lease;
 
 /// Leases of other writers that ran out and whose logs aren't sealed yet.
@@ -60,6 +62,28 @@ pub fn drop_below(floor: u64, prev_bound: u64, pull: Pull) -> Ts {
     }
 }
 
+/// Tombstones droppable below `drop_below` are purged (their subtree
+/// rewritten just to drop them) where `Node::purge_at` is below this.
+pub fn purge_below(drop_below: Ts, purge_after: Duration) -> Ts {
+    Ts {
+        hlc: drop_below.hlc.saturating_sub(hlc::span(purge_after)),
+        ..drop_below
+    }
+}
+
+/// Whether a tree whose summary says `purge_at` has tombstones to purge once
+/// tombstones below `floor` are droppable.
+pub fn purge_due(purge_at: Option<Ts>, floor: u64, purge_after: Duration) -> bool {
+    let below = purge_below(
+        Ts {
+            hlc: floor,
+            writer: WriterId(0),
+        },
+        purge_after,
+    );
+    purge_at.is_some_and(|t| t < below)
+}
+
 /// The bound the next manifest publishes. Never decreases.
 pub fn next_bound(prev_bound: u64, floor: u64) -> u64 {
     prev_bound.max(floor)
@@ -79,6 +103,19 @@ mod tests {
             floor_hlc,
             expires_at_ms,
         }
+    }
+
+    #[test]
+    fn purge_waits_purge_after_past_the_floor() {
+        let ts = |ms| Ts {
+            hlc: hlc::at_ms(ms),
+            writer: WriterId(7),
+        };
+        let after = Duration::from_secs(60);
+        assert!(!purge_due(None, hlc::at_ms(1_000_000), after));
+        assert!(!purge_due(Some(ts(950_000)), hlc::at_ms(1_000_000), after));
+        assert!(purge_due(Some(ts(930_000)), hlc::at_ms(1_000_000), after));
+        assert!(purge_due(Some(ts(0)), hlc::at_ms(1), Duration::ZERO));
     }
 
     #[test]

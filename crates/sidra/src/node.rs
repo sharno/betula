@@ -46,8 +46,9 @@ pub struct Internal {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Child {
     pub ptr: NodePtr,
-    /// Oldest tombstone in the subtree's leaves (droppable-tombstone search).
-    pub oldest_tombstone: Option<Ts>,
+    /// When the subtree below `runs` first holds tombstones worth purging
+    /// (`Node::purge_at`), so checkpoints find them without loading it.
+    pub purge_at: Option<Ts>,
     /// Newest version in the subtree (excluding `runs`): a read that already
     /// found something newer stops here.
     pub newest: Option<Ts>,
@@ -63,6 +64,8 @@ pub struct RunRef {
     /// Logical message bytes, for flush decisions without loading the run.
     pub bytes: u32,
     pub newest: Ts,
+    /// Whether the run holds a tombstone.
+    pub tombstones: bool,
     /// The run once loaded. Internal nodes are immutable and shared through
     /// the cache, so a read resolves each run once and later reads skip the
     /// cache lookup. Runs stay alive as long as their parent node does.
@@ -72,7 +75,8 @@ pub struct RunRef {
 
 impl PartialEq for RunRef {
     fn eq(&self, other: &Self) -> bool {
-        (self.ptr, self.bytes, self.newest) == (other.ptr, other.bytes, other.newest)
+        (self.ptr, self.bytes, self.newest, self.tombstones)
+            == (other.ptr, other.bytes, other.newest, other.tombstones)
     }
 }
 
@@ -83,10 +87,29 @@ impl Child {
         self.runs.iter().map(|r| r.bytes as usize).sum()
     }
 
+    /// `purge_at` including this child's own runs.
+    pub fn purge_at_with_runs(&self) -> Option<Ts> {
+        buffer_purge_at(self.runs.iter().map(|r| (r.newest, r.tombstones)))
+            .into_iter()
+            .chain(self.purge_at)
+            .min()
+    }
+
     /// Newest version in the subtree including the buffered runs.
     pub fn newest_with_runs(&self) -> Option<Ts> {
         self.runs.iter().map(|r| r.newest).chain(self.newest).max()
     }
+}
+
+/// When tombstones in a buffer of runs, each given as (newest version,
+/// holds a tombstone), are worth purging: once the buffer has gone quiet,
+/// i.e. at its newest version. A buffer that's still filling flushes on its
+/// own; purging it early would only cost its batching.
+pub fn buffer_purge_at(runs: impl Iterator<Item = (Ts, bool)>) -> Option<Ts> {
+    let (newest, tombstones) = runs.fold((None, false), |(n, t), (newest, tomb)| {
+        (n.max(Some(newest)), t || tomb)
+    });
+    newest.filter(|_| tombstones)
 }
 
 fn newest_in(entries: &[(Bytes, Version)]) -> Option<Ts> {
@@ -94,7 +117,13 @@ fn newest_in(entries: &[(Bytes, Version)]) -> Option<Ts> {
 }
 
 impl Node {
-    pub fn oldest_tombstone(&self) -> Option<Ts> {
+    /// When a checkpoint should rewrite this subtree just to drop its
+    /// tombstones (once this is `purge_tombstones_after` past the tombstone
+    /// floor): a leaf's oldest tombstone, or a buffer's newest version if it
+    /// holds tombstones (`buffer_purge_at`). Buffered tombstones must be
+    /// carried down into their leaf to go, or a range nobody writes to again
+    /// keeps them and the values they delete forever.
+    pub fn purge_at(&self) -> Option<Ts> {
         match self {
             Node::Leaf(l) => l
                 .entries
@@ -102,8 +131,12 @@ impl Node {
                 .filter(|(_, v)| v.msg == Msg::Delete)
                 .map(|(_, v)| v.ts)
                 .min(),
-            Node::Internal(i) => i.children.iter().filter_map(|c| c.oldest_tombstone).min(),
-            // Buffered tombstones are dropped only once carried into a leaf.
+            Node::Internal(i) => i
+                .children
+                .iter()
+                .filter_map(Child::purge_at_with_runs)
+                .min(),
+            // Summarized by the parent's `RunRef`.
             Node::Run(_) => None,
         }
     }

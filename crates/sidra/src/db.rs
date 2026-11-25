@@ -34,7 +34,7 @@ use tokio::time::MissedTickBehavior;
 use crate::error::{Error, Result};
 use crate::follow::{Follower, Scope};
 use crate::gc::{self, GcConfig, GcStats};
-use crate::hlc::{Hlc, Ts, WriterId};
+use crate::hlc::{self, Hlc, Ts, WriterId};
 use crate::location;
 use crate::logs::{Logs, Region, RegionStores};
 use crate::manifest::{self, Manifest, Publish};
@@ -351,14 +351,25 @@ impl Shared {
         Ok(())
     }
 
-    fn should_checkpoint(&self) -> bool {
+    fn checkpoint_due(&self) -> Due {
         let view = self.follower.view();
-        applier::due(
+        let now = self.now();
+        if applier::due(
             &self.cfg.checkpoint,
             view.tails.mem().bytes(),
             view.tails.since_ms,
-            self.now(),
-        )
+            now,
+        ) {
+            Due::Entries
+        } else if tombstones::purge_due(
+            view.manifest.tree.and_then(|r| r.purge_at),
+            hlc::at_ms(now),
+            self.cfg.tree.purge_tombstones_after,
+        ) {
+            Due::Purge
+        } else {
+            Due::No
+        }
     }
 
     /// Every writer's lease, and this writer's floor. Must be read *before*
@@ -442,6 +453,7 @@ impl Shared {
             epoch: app.epoch,
             role: self.cfg.applier,
             cleaner: &self.cfg.cleaner,
+            purge_after: self.cfg.tree.purge_tombstones_after,
         };
         let mut applying = match sealing.sealed(&view, who, self.now()) {
             checkpoint::Plan::Nothing => return Ok(()),
@@ -1186,7 +1198,17 @@ async fn follow_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
+/// Why the applier should checkpoint now.
+enum Due {
+    /// Unapplied entries are big or old enough.
+    Entries,
+    /// Only tombstones are due for purging.
+    Purge,
+    No,
+}
+
 async fn applier_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
+    let mut purge_tried: Option<Instant> = None;
     loop {
         tokio::select! {
             _ = shared.wake_applier.notified() => {}
@@ -1196,8 +1218,20 @@ async fn applier_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) 
         if *shutdown.borrow() {
             return;
         }
-        if !shared.is_applier.load(Ordering::Acquire) || !shared.should_checkpoint() {
+        if !shared.is_applier.load(Ordering::Acquire) {
             continue;
+        }
+        match shared.checkpoint_due() {
+            Due::Entries => {}
+            // Due by the clock, but a lagging floor can still hold it back,
+            // and then the checkpoint finds nothing to do: retry once per
+            // checkpoint interval rather than every poll.
+            Due::Purge
+                if purge_tried.is_none_or(|t| t.elapsed() >= shared.cfg.checkpoint.interval) =>
+            {
+                purge_tried = Some(Instant::now());
+            }
+            Due::Purge | Due::No => continue,
         }
         match shared.checkpoint().await {
             Ok(()) | Err(Error::NotApplier) => {}

@@ -13,7 +13,8 @@ use crate::error::{Error, Result};
 // records the applier. 4: codec byte. 5: leases record log placement.
 // 6: leases record applier candidacy. 7: manifests carry a tombstone bound.
 // 8: log seals, logs under `wal/`, manifests list sealed writers.
-const VERSION: u8 = 8;
+// 9: runs record whether they hold tombstones; purge summaries cover runs.
+const VERSION: u8 = 9;
 const HEADER: usize = 6;
 
 #[derive(Copy, Clone, Debug)]
