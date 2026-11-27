@@ -1,7 +1,8 @@
-//! Hedged reads ("The Tail at Scale", Dean & Barroso): a GET still running
-//! after the recent p95 latency gets a second copy, and the first answer
-//! wins. An object store's slow tail comes from one slow server, connection
-//! or retry, so the second copy rarely hits the same stall.
+//! Hedged requests ("The Tail at Scale", Dean & Barroso): a GET or log PUT
+//! still running after the recent p95 latency gets a second copy, and the
+//! first answer wins. An object store's slow tail comes from one slow
+//! server, connection or retry, so the second copy rarely hits the same
+//! stall.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -15,7 +16,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-/// Whether GETs are hedged.
+/// Whether GETs and log PUTs are hedged.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum Hedge {
@@ -60,16 +61,18 @@ impl From<Fraction> for f64 {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HedgeConfig {
-    /// Latency percentile of recent GETs after which a second copy goes out.
+    /// Latency percentile of recent requests after which a second copy goes
+    /// out.
     pub percentile: Fraction,
-    /// Ceiling on second copies, as a share of GETs. When the store slows
-    /// down as a whole, every GET passes the old threshold until it adapts;
+    /// Ceiling on second copies, as a share of requests. When the store slows
+    /// down as a whole, every request passes the old threshold until it adapts;
     /// this keeps that from doubling the load.
     pub max_extra: Fraction,
-    /// Number of recent GETs the percentile is taken over.
+    /// Number of recent requests the percentile is taken over.
     pub window: NonZeroUsize,
-    /// Threshold until enough GETs are measured. A process that just opened
-    /// has a cold cache, so its first GETs are the ones a stall hurts most.
+    /// Threshold until enough requests are measured. A process that just
+    /// opened has a cold cache, so its first GETs are the ones a stall hurts
+    /// most.
     #[serde(with = "humantime_serde")]
     pub initial: Duration,
 }
@@ -89,15 +92,15 @@ impl Default for HedgeConfig {
 // Checked at compile time.
 const DEFAULT_WINDOW: NonZeroUsize = NonZeroUsize::new(512).unwrap();
 
-/// GETs measured before the threshold follows them.
+/// Requests measured before the threshold follows them.
 const MIN_SAMPLES: usize = 64;
-/// GETs between threshold updates.
+/// Requests between threshold updates.
 const UPDATE_EVERY: usize = 32;
 /// Second copies that may go out back to back once the budget has built up.
 const BURST: f64 = 10.0;
 
-/// Hedges one store's GETs. Each store gets its own: stores in different
-/// regions have different latency.
+/// Hedges one kind of request (GETs, or log PUTs) to one store. Each gets
+/// its own: kinds and stores in different regions have different latency.
 #[derive(Debug)]
 pub enum Hedger {
     Off,
@@ -109,11 +112,11 @@ pub enum Hedger {
 
 #[derive(Debug)]
 pub struct Tracker {
-    /// The latest `window` GET latencies, oldest first.
+    /// The latest `window` latencies, oldest first.
     recent: VecDeque<Duration>,
     since_update: usize,
     threshold: Duration,
-    /// Second copies allowed now; each GET earns `max_extra`. Starts full.
+    /// Second copies allowed now; each request earns `max_extra`. Starts full.
     budget: f64,
 }
 
@@ -185,7 +188,7 @@ impl Hedger {
             Either::Right((Err(_), first)) => first.await,
         };
         // The first copy took at least this long. Recording it even when the
-        // second won keeps slow GETs in the window, so the threshold doesn't
+        // second won keeps slow requests in the window, so the threshold doesn't
         // drift down as hedging hides the tail.
         record(start.elapsed());
         r

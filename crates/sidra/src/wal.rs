@@ -57,9 +57,10 @@ pub async fn write(
     compression: codec::Compression,
 ) -> Result<WalWrite> {
     let data = codec::encode(codec::WAL, &RecordRef::Batch(batch), compression);
-    match store.put_create(&store.wal_path(seq), data.clone()).await? {
+    match store.put_log(&store.wal_path(seq), data.clone()).await? {
         CreateOutcome::Created => Ok(WalWrite::Written),
-        // Our own earlier attempt whose response was lost.
+        // Our own earlier attempt whose response was lost, or the other
+        // copy of a hedged put.
         CreateOutcome::Exists(existing) if existing == data => Ok(WalWrite::Written),
         CreateOutcome::Exists(_) => Ok(WalWrite::Fenced),
     }

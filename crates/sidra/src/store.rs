@@ -33,6 +33,9 @@ pub struct Store {
     root: Path,
     counters: Arc<Counters>,
     hedger: Arc<Hedger>,
+    /// Log PUTs take their own latency window: their size and latency
+    /// differ from GETs'.
+    log_hedger: Arc<Hedger>,
 }
 
 /// Object store requests made by one handle.
@@ -45,6 +48,7 @@ struct Counters {
     lists: AtomicU64,
     deletes: AtomicU64,
     hedges: AtomicU64,
+    log_hedges: AtomicU64,
 }
 
 /// Object store requests made by a handle since it opened.
@@ -59,6 +63,8 @@ pub struct RequestStats {
     /// Second copies of slow GETs (see `Hedge`); also counted in `gets`
     /// when they complete.
     pub hedges: u64,
+    /// Second copies of slow log PUTs; also counted in `puts`.
+    pub log_hedges: u64,
 }
 
 fn bump(c: &AtomicU64, n: u64) {
@@ -87,6 +93,7 @@ impl Store {
             root: root.into(),
             counters: Arc::default(),
             hedger: Arc::new(Hedger::new(hedge)),
+            log_hedger: Arc::new(Hedger::new(hedge)),
         }
     }
 
@@ -97,6 +104,7 @@ impl Store {
             root: root.into(),
             counters: self.counters.clone(),
             hedger: Arc::new(self.hedger.fresh()),
+            log_hedger: Arc::new(self.log_hedger.fresh()),
         }
     }
 
@@ -111,6 +119,7 @@ impl Store {
             lists: l(&c.lists),
             deletes: l(&c.deletes),
             hedges: l(&c.hedges),
+            log_hedges: l(&c.log_hedges),
         }
     }
 
@@ -234,6 +243,20 @@ impl Store {
     /// tell a retried success (whose response was lost) from a lost race.
     pub async fn put_create(&self, path: &Path, data: Bytes) -> Result<CreateOutcome> {
         retry("put if absent", || self.put_create_once(path, data.clone())).await
+    }
+
+    /// Put-if-absent of a log record, hedged like GETs. The log keeps one
+    /// PUT in flight and acks in order, so one stalled PUT holds every write
+    /// behind it. A second copy is safe: it carries the same bytes, so
+    /// whichever lands second finds the first and matches it, as a retry
+    /// whose response was lost does.
+    pub async fn put_log(&self, path: &Path, data: Bytes) -> Result<CreateOutcome> {
+        retry("log put", || {
+            self.log_hedger.run(&self.counters.log_hedges, || {
+                self.put_create_once(path, data.clone())
+            })
+        })
+        .await
     }
 
     async fn put_create_once(&self, path: &Path, data: Bytes) -> Result<CreateOutcome> {

@@ -25,7 +25,11 @@ are different `now` values per process.
   on; a newer writer's fence is `Superseded`. The driver then checks that
   no newer manifest is listed.
 - **`log`** (hot path): batching, slot numbers, put-if-absent,
-  acknowledgement, fenced or unknown outcomes, backpressure input.
+  acknowledgement, fenced or unknown outcomes, backpressure input. The
+  driver hedges a slow put with a second copy of the same bytes; whichever
+  lands second matches the first, as a retry whose response was lost does.
+  A copy that lands after GC collected its slot sits below the applied slot,
+  where nothing reads, and GC deletes it again.
 - **`tail`**: unapplied batches and fences past the manifest, as the writer
   and readers hold them. `Scan` reads the log forward to the first empty
   slot; `Tail::take` picks a checkpoint's prefix.

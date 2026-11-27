@@ -936,14 +936,39 @@ async fn opening_a_writer_fences_the_previous_one() {
     assert_eq!(b.get("y").await.unwrap(), None);
 }
 
-/// Faulty store with log PUTs held in flight, and a writer on it.
+/// Faulty store with log PUTs held in flight, and a writer on it. The
+/// writer doesn't hedge, so the held PUT is its only copy.
 async fn held_writer() -> (Arc<Faulty>, Arc<ManualClock>, Arc<Db>, Arc<faulty::Hold>) {
     let faulty = Arc::new(Faulty::new(Arc::new(InMemory::new()), Faults::NONE, 0));
     let os: Arc<dyn ObjectStore> = faulty.clone();
     let clock = ManualClock::new();
-    let a = Arc::new(open(&os, &clock).await);
+    let cfg = Settings {
+        hedge: sidra::Hedge::Off,
+        ..tiny_config()
+    };
+    let a = Arc::new(open_with(&os, &clock, cfg).await);
     let log = faulty.hold_puts(|p| p.ends_with(".wal"), 1);
     (faulty, clock, a, log)
+}
+
+/// A stalled log PUT gets a second copy, which lands and acks the write;
+/// without it the write would wait for the release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_log_put_is_hedged() {
+    let faulty = Arc::new(Faulty::new(Arc::new(InMemory::new()), Faults::NONE, 0));
+    let os: Arc<dyn ObjectStore> = faulty.clone();
+    let clock = ManualClock::new();
+    let a = open(&os, &clock).await;
+    let log = faulty.hold_puts(|p| p.ends_with(".wal"), 1);
+    clock.tick();
+    a.put("k", "v").await.unwrap();
+    assert_eq!(log.arrived(), 1);
+    assert_eq!(a.metrics().requests.log_hedges, 1);
+    log.release();
+    a.put("k2", "v").await.unwrap();
+    let b = open(&os, &clock).await;
+    assert_eq!(b.get("k").await.unwrap().as_deref(), Some(&b"v"[..]));
+    assert_eq!(b.get("k2").await.unwrap().as_deref(), Some(&b"v"[..]));
 }
 
 /// A log write still in flight when a newer writer opens lands on the

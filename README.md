@@ -63,10 +63,10 @@ max_unapplied_bytes = 536870912  # writes stall past this backlog
 mode = "on"
 retention = "10m"
 [hedge]
-mode = "on"                # a GET slower than the recent p95 gets a second copy
+mode = "on"                # a GET or log PUT slower than the recent p95 gets a second copy
 percentile = 0.95
-max_extra = 0.1            # at most 10% more GETs
-initial = "250ms"          # threshold until 64 GETs are measured
+max_extra = 0.1            # at most 10% more requests
+initial = "250ms"          # threshold until 64 requests are measured
 ```
 
 ```sh
@@ -262,7 +262,11 @@ writer ─► wal/{seq} ─► checkpoint: fold a prefix into tree COW ─► se
   process that just opened uses `hedge.initial` (250 ms) until it has 64
   GETs: its cache is cold, so a stall in its first GETs hurts most. A
   budget caps copies at 10% of GETs, so a store that slows down as a whole
-  doesn't get twice the load. PUTs aren't hedged.
+  doesn't get twice the load. Log PUTs are hedged the same way, over their
+  own window: the log keeps one PUT in flight and acks in order, so one
+  stalled PUT holds every write behind it. The copy carries the same bytes,
+  so whichever lands second finds the first and matches it, as a retry
+  whose response was lost does. Other PUTs aren't hedged.
 
 ## Roadmap
 
@@ -513,15 +517,23 @@ loads every leaf it will rewrite in one parallel round (about 9 ms per leaf
 instead of 35). Once warm, writes can't outrun checkpoints: 37 MiB
 checkpoints in about a second, mostly upload.
 
-With one fenced writer, after the GC retention fix (one LIST after each
-checkpoint publish): acked 27.0 MiB/s, write p50 / p99 / p99.9 305 / 712 /
-3,144 ms, peak unapplied 129 MiB. p99.9 is the longest stall that hit a log
-PUT: the log keeps one PUT in flight and acks in order, so a 0.5–3 s stall
-holds every write queued behind it. Which requests stall varies between
-runs; the run in the table above had no long stall on a log PUT.
+With one fenced writer, two runs each with log PUTs hedged and not (the
+log keeps one PUT in flight and acks in order, so a stalled PUT holds every
+write behind it):
+
+| | hedged log PUTs | not hedged |
+|---|---|---|
+| acked MiB/s | **28.0, 28.2** | 27.3, 26.8 |
+| write p50 / p99 ms | **305 / 606, 303 / 624** | 308 / 656, 312 / 624 |
+| write p99.9 ms | **931, 768** | 3,172, 3,176 |
+| seconds with no write acked | **0, 0** | 2, 2 |
+| PUTs | 1,004, 1,006 | 969, 952 |
+
+Without hedging, p99.9 is the longest stall that hit a log PUT, and which
+requests stall varies between runs.
 
 ```sh
-sidra-bench $B --latency s3 --scans 200 --reads 5000 --ingest-secs 120 --ingest-concurrency 1024
+sidra-bench $B --latency s3 --scans 200 --reads 5000 --ingest-secs 120 --ingest-concurrency 1024   # and --hedge off
 ```
 
 Bulk loading into an empty tree is limited by the writer's
