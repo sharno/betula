@@ -425,8 +425,8 @@ brackets.
 | cold 1,000-key scans/s (p99 ms) | **5.9k (70)** | 3.1k (94) [64/4] |
 | warm 10,000-key scans/s (p99 ms) | **824 (122)** | 711 (121) [256/8] |
 | cold 10,000-key scans/s (p99 ms) | **1.8k (149)** | 663 (231) [256/8] |
-| warm sparse scans/s, 90% deleted (p99 ms) | **80.1k (3.7)** | 19.0k (7.9) [64/4] |
-| cold sparse scans/s, 90% deleted (p99 ms) | **5.2k (47)** | 3.9k (87) [64/4] |
+| warm sparse scans/s, 90% deleted (p99 ms) | **432k (0.66)** | 4.2k (28) [64/4] |
+| cold sparse scans/s, 90% deleted (p99 ms) | **5.6k (75)** | 2.5k (123) [64/4] |
 
 The leaves fit in cache, so most cold scans hit leaves earlier scans
 loaded; p99 shows the scans that went to the store. Leaf readahead took
@@ -448,15 +448,15 @@ short phase. The middle column is sidra with hedged GETs off (`--hedge off`):
 | cold 1,000-key scans | **0.10 / 118 / 195 (4.3k)** | 0.10 / 147 / 1,288 (1.2k) | 15 / 145 / 191 (2.9k) [256/8] |
 | warm 10,000-key scans/s | **818** | 826 | 769 [256/8] |
 | cold 10,000-key scans | **0.95 / 243 / 332 (994)** | 1.1 / 1,356 / 1,573 (292) | 83 / 315 / 2,138 (234) [256/8] |
-| warm sparse scans/s, 90% deleted | **78.2k** | 78.2k | 58.7k [4/1] |
-| cold sparse scans | **0.04 / 102 / 138 (3.7k)** | 0.04 / 125 / 209 (1.1k) | 7.4 / 146 / 242 (2.7k) [256/8] |
+| warm sparse scans/s, 90% deleted | **422k** | 314k | 5.1k [4/1] |
+| cold sparse scans | **0.01 / 130 / 161 (3.8k)** | 0.01 / 158 / 234 (3.2k) | 27 / 232 / 344 (1.0k) [256/8] |
 | mixed reads/s, 40 clients, 5 min | **1.52M** | 1.50M | 1.6k |
 | mixed write p99 / p99.9 ms | 402 / **621** | 395 / 616 | **335** / 654 |
 
 Without hedging, a stalled GET held every scan waiting on the leaves in its
 batch, and a cold phase makes only about 1,000 GETs, so one stall set the
-phase's length. Hedging takes cold-scan p99.9 from 1.3–1.6 s to 138–332 ms
-and throughput up 3–4×, for 0–4% more GETs. Warm phases make no GETs, so
+phase's length. Hedging takes dense cold-scan p99.9 from 1.3–1.6 s to
+142–332 ms and throughput up 3–4×, for 0–4% more GETs. Warm phases make no GETs, so
 their differences are run-to-run noise. SlateDB's mixed reads mostly miss
 its cache, so S3 latency takes them from 290k to 1.6k/s.
 
