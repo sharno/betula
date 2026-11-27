@@ -515,7 +515,10 @@ checkpoints in about a second, mostly upload.
 
 With one fenced writer, after the GC retention fix (one LIST after each
 checkpoint publish): acked 27.0 MiB/s, write p50 / p99 / p99.9 305 / 712 /
-3,144 ms, peak unapplied 129 MiB.
+3,144 ms, peak unapplied 129 MiB. p99.9 is the longest stall that hit a log
+PUT: the log keeps one PUT in flight and acks in order, so a 0.5–3 s stall
+holds every write queued behind it. Which requests stall varies between
+runs; the run in the table above had no long stall on a log PUT.
 
 ```sh
 sidra-bench $B --latency s3 --scans 200 --reads 5000 --ingest-secs 120 --ingest-concurrency 1024
