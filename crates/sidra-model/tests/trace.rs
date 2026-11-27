@@ -3,7 +3,8 @@
 //! opens the first writer, process 1 the one that fences it; see `small`.
 
 use sidra_model::{
-    Checked, Fate, Rule, Sys, Timer, acknowledged_writes_stay_visible, model, small, without,
+    Checked, Fate, Path, Rule, Sys, Timer, acknowledged_writes_stay_visible,
+    durable_writes_stay_visible, model, small, without,
 };
 
 const OLD: usize = 0;
@@ -84,4 +85,39 @@ fn without_last_ts_a_lagging_writer_stamps_before_a_dropped_delete() {
     let s = lagging(&m);
     assert!(s.acked(NEW)[0].1.ts < s.acked(OLD)[0].1.ts);
     assert!(!acknowledged_writes_stay_visible(&m, &s));
+}
+
+/// The old writer's checkpoint is about to publish manifest 2 when the new
+/// writer claims 2, applies the log in two checkpoints, and GC collects
+/// every manifest below the newest. Then the old writer's publish lands in
+/// the collected id.
+fn stalled_checkpoint(m: &Checked) -> Sys {
+    let mut s = m.initial();
+    s = step(m, s, OLD, Timer::Start);
+    s = step(m, s, OLD, Timer::Write);
+    s = m.fire(s, OLD, Timer::Checkpoint);
+    s = m.deliver(s, OLD, Fate::Ok); // loads the tree
+    s = m.deliver(s, OLD, Fate::Ok); // puts its segment
+    s = step(m, s, NEW, Timer::Start);
+    s = step(m, s, NEW, Timer::Write);
+    s = step(m, s, NEW, Timer::Checkpoint);
+    s = step(m, s, NEW, Timer::Checkpoint);
+    s = m.gc(s);
+    assert!(!s.store.contains_key(&Path::Manifest(2)));
+    m.drain(s, OLD)
+}
+
+#[test]
+fn a_checkpoint_stalled_past_gc_lands_as_a_stray_and_stops() {
+    let m = model(small());
+    let s = stalled_checkpoint(&m);
+    assert!(s.is_stopped(OLD));
+    assert!(s.store.contains_key(&Path::Manifest(2)), "the stray landed");
+    let s = m.gc(s);
+    assert!(
+        !s.store.contains_key(&Path::Manifest(2)),
+        "GC deleted the stray"
+    );
+    assert!(acknowledged_writes_stay_visible(&m, &s));
+    assert!(durable_writes_stay_visible(&m, &s));
 }

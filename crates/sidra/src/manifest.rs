@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::hlc::Ts;
 use crate::segments::SegmentTable;
 use crate::store::{CreateOutcome, Store};
-use crate::types::{Epoch, ManifestId, SegmentId, TreeRoot, WalSeq};
+use crate::types::{Epoch, ManifestId, SegmentId, TreeRoot, WalSeq, WriterId};
 
 /// One published database version.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -16,6 +16,13 @@ pub struct Manifest {
     /// put-if-absent fences the previous writer's checkpoints; its fence in
     /// the log fences its writes.
     pub writer_epoch: Epoch,
+    /// The opening that published this manifest: its claim and checkpoints.
+    pub writer: WriterId,
+    /// The opening that published the manifest this one replaced. A writer
+    /// stalled past the GC retention can put a manifest into an id GC
+    /// already collected; the manifest above it then names another parent,
+    /// and GC deletes the stray without acting on it.
+    pub parent: WriterId,
     pub tree: Option<TreeRoot>,
     /// The newest timestamp applied. A new writer's clock starts past it and
     /// past the log it replays, so timestamps grow across writers even when
@@ -44,6 +51,8 @@ impl Manifest {
     pub fn initial(now_ms: u64) -> Self {
         Self {
             writer_epoch: Epoch(0),
+            writer: WriterId(0),
+            parent: WriterId(0),
             tree: None,
             last_ts: Ts::MIN,
             wal_applied: WalSeq::ZERO,
@@ -58,10 +67,12 @@ impl Manifest {
         }
     }
 
-    /// The same tree claimed by the next writer generation.
-    pub fn claimed(&self, now_ms: u64) -> Self {
+    /// The same tree claimed by opening `writer`, the next generation.
+    pub fn claimed(&self, writer: WriterId, now_ms: u64) -> Self {
         Self {
             writer_epoch: self.writer_epoch.next(),
+            writer,
+            parent: self.writer,
             dead: Vec::new(),
             created_at_ms: now_ms,
             ..self.clone()

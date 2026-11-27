@@ -84,4 +84,4 @@ pub use settings::{CheckpointConfig, Gc, ReaderSettings, Settings, WalConfig};
 pub use snapshot::DbIterator;
 pub use store::RequestStats;
 pub use tree::{TreeConfig, TreeShape};
-pub use types::{Epoch, KeyRange, ManifestId, NodePtr, SegmentId, TreeRoot, WalSeq};
+pub use types::{Epoch, KeyRange, ManifestId, NodePtr, SegmentId, TreeRoot, WalSeq, WriterId};

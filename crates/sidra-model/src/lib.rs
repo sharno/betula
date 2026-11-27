@@ -1,12 +1,13 @@
 //! A Stateright model of sidra's protocol that drives the crate's own state
 //! machines (`sidra::protocol`): opening a writer (claiming the manifest,
-//! fencing the log), the writer's log, partial checkpoints, and log GC. One
+//! fencing the log), the writer's log, partial checkpoints, and GC. One
 //! actor plays the object store; the others are processes with independent
 //! clocks, each opening a writer that fences the one before.
 //!
 //! The data plane is abstract: a checkpoint's tree is one segment object
 //! holding the whole key -> version map, and like a leaf it keeps no
-//! tombstones.
+//! tombstones. GC runs as if everything were past the retention, so a
+//! request in flight across it is a process stalled past the retention.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,11 +17,11 @@ use bytes::Bytes;
 use serde::{Serialize, de::DeserializeOwned};
 use sidra::protocol::checkpoint::{self, Applied, Work};
 use sidra::protocol::fence::{self, AfterPlace, AfterRead, Fenced};
-use sidra::protocol::gc::deletable_wals;
+use sidra::protocol::gc::{self, Pair, deletable_wals};
 use sidra::protocol::log::{self, Gate, LogWriter, PutOutcome};
 use sidra::protocol::tail::Tail;
 use sidra::protocol::{FenceAt, Manifest, Msg as Op, Version, WalBatch, WalRecord};
-use sidra::{CleanerConfig, Epoch, ManifestId, NodePtr, SegmentId, TreeRoot, Ts, WalSeq};
+use sidra::{CleanerConfig, Epoch, ManifestId, NodePtr, SegmentId, TreeRoot, Ts, WalSeq, WriterId};
 use stateright::{Model, Property};
 
 // ---------------------------------------------------------------------------
@@ -116,14 +117,19 @@ fn store_step(objects: &mut BTreeMap<Path, Vec<u8>>, req: Request) -> Response {
     }
 }
 
-fn manifest_id(objects: &BTreeMap<Path, Vec<u8>>) -> Option<(u64, Manifest)> {
+/// Stored manifests, by id.
+fn manifests(objects: &BTreeMap<Path, Vec<u8>>) -> Vec<(ManifestId, Manifest)> {
     objects
         .iter()
         .filter_map(|(p, b)| match p {
-            Path::Manifest(id) => Some((*id, decode::<Manifest>(b))),
+            Path::Manifest(id) => Some((ManifestId(*id), decode::<Manifest>(b))),
             _ => None,
         })
-        .max_by_key(|(id, _)| *id)
+        .collect()
+}
+
+fn latest_manifest(objects: &BTreeMap<Path, Vec<u8>>) -> Option<Manifest> {
+    manifests(objects).pop().map(|(_, m)| m)
 }
 
 // ---------------------------------------------------------------------------
@@ -138,9 +144,13 @@ enum Opening {
     Loading(Option<u64>),
     /// Publishing the claimed manifest at this id.
     Claiming(u64, Box<Manifest>),
+    /// Claimed; checking no newer manifest is listed, as there is when a
+    /// newer opener claimed past it or the claim landed in an id GC
+    /// collected.
+    Confirming(Claimed),
     Reading(Claimed, fence::Reading),
     Placing(Claimed, fence::Placing),
-    /// Fenced; checking no newer writer claimed a manifest meanwhile.
+    /// Fenced; checking no newer manifest is listed.
     Checking(Claimed, Fenced),
 }
 
@@ -158,6 +168,8 @@ enum Stage {
     LoadingTree(Work),
     PuttingSegment(Work, SegmentId),
     Publishing(Work, Box<Manifest>),
+    /// Published; checking no newer manifest is listed.
+    Confirming(Box<Manifest>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -184,6 +196,8 @@ enum Phase {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Proc {
+    /// This process's opening, as `Db::start` draws one.
+    writer: WriterId,
     clock: u64,
     /// Hybrid clock: the last timestamp handed out or observed.
     hlc: Ts,
@@ -279,8 +293,9 @@ impl Proc {
 }
 
 /// A process as it starts: its clock at 1 and its start timers armed.
-fn start() -> Proc {
+fn start(index: usize) -> Proc {
     Proc {
+        writer: WriterId(index as u64 + 1),
         clock: 1,
         hlc: Ts::MIN,
         phase: Phase::NotStarted,
@@ -411,26 +426,44 @@ fn open_step(p: &mut Proc, cfg: &Config, resp: Response) {
             let req = opening_request(&o);
             (o, req)
         }
+        // GC collected it since the listing: list again.
+        (Opening::Loading(Some(_)), Response::Got(None)) => {
+            (Opening::Listing, Request::LatestManifest)
+        }
         (Opening::Loading(id), Response::Got(found)) => {
             let current = found.map_or_else(|| Manifest::initial(clock), |b| decode(&b));
-            let o = Opening::Claiming(id.map_or(1, |id| id + 1), Box::new(current.claimed(clock)));
+            let claim = current.claimed(p.writer, clock);
+            let o = Opening::Claiming(id.map_or(1, |id| id + 1), Box::new(claim));
             let req = opening_request(&o);
             (o, req)
         }
-        (Opening::Claiming(id, m), Response::Created) => {
+        // The claim names this process, so an equal one is our own put
+        // whose response was lost.
+        (Opening::Claiming(id, m), resp)
+            if resp == Response::Created || resp == Response::Exists(encode(m.as_ref())) =>
+        {
             let claimed = Claimed {
                 id: ManifestId(id),
                 manifest: Arc::new(*m),
             };
+            let o = Opening::Confirming(claimed);
+            let req = opening_request(&o);
+            (o, req)
+        }
+        // A newer opener claimed past ours, or ours is a stray: stopped.
+        (Opening::Confirming(claimed), Response::Latest(latest))
+            if latest != Some(claimed.id.0) =>
+        {
+            return;
+        }
+        (Opening::Confirming(claimed), Response::Latest(_)) => {
             let reading =
                 fence::Reading::new(claimed.manifest.writer_epoch, claimed.manifest.wal_applied);
             let o = Opening::Reading(claimed, reading);
             let req = opening_request(&o);
             (o, req)
         }
-        // Another writer claimed it first, or one identical to ours (same
-        // clock reading), which can't be told from our own lost response:
-        // start over.
+        // Another writer claimed it first: start over.
         (Opening::Claiming(..), Response::Exists(_)) => (Opening::Listing, Request::LatestManifest),
         (Opening::Reading(claimed, reading), Response::Got(found)) => {
             match reading.record(found.map(|b| decode(&b))) {
@@ -475,14 +508,12 @@ fn open_step(p: &mut Proc, cfg: &Config, resp: Response) {
                 }
             }
         }
-        (Opening::Checking(claimed, fenced), Response::Got(newer)) => {
-            return match newer {
-                Some(_) => {}
-                None => {
-                    let first = fenced.fence.next();
-                    opened(p, cfg, claimed, fenced, first)
-                }
-            };
+        (Opening::Checking(claimed, fenced), Response::Latest(latest)) => {
+            if latest == Some(claimed.id.0) {
+                let first = fenced.fence.next();
+                opened(p, cfg, claimed, fenced, first);
+            }
+            return;
         }
         (o, resp) => unreachable!("{o:?} got {resp:?}"),
     };
@@ -500,7 +531,7 @@ fn opening_request(o: &Opening) -> Request {
         Opening::Placing(_, pl) => {
             Request::PutIfAbsent(Path::Log(pl.at()), encode(&WalRecord::Fence(pl.epoch())))
         }
-        Opening::Checking(c, _) => Request::Get(Path::Manifest(c.id.next().0)),
+        Opening::Confirming(_) | Opening::Checking(..) => Request::LatestManifest,
     }
 }
 
@@ -540,6 +571,12 @@ fn checkpoint_step(p: &mut Proc, resp: Response) {
     let Some(w) = p.writer() else { return };
     let stage = std::mem::replace(&mut w.stage, Stage::Idle);
     let req = match (stage, resp) {
+        // GC collected the tree: a newer writer replaced it. The attempt
+        // fails, as a node load does.
+        (Stage::LoadingTree(_), Response::Got(None)) if w.manifest.tree.is_some() => {
+            p.arm(Timer::Checkpoint);
+            return;
+        }
         (Stage::LoadingTree(work), Response::Got(found)) => {
             let mut tree: Tree = found.map(|b| decode(&b)).unwrap_or_default();
             work.taken.iter().flat_map(|t| &t.msgs).for_each(|(k, v)| {
@@ -570,7 +607,7 @@ fn checkpoint_step(p: &mut Proc, resp: Response) {
                     height: 0,
                 }),
                 segments: Default::default(),
-                dead: Vec::new(),
+                dead: w.manifest.tree.iter().map(|r| r.ptr.seg).collect(),
                 segment_watermark: SegmentId {
                     epoch: w.epoch,
                     seq: w.next_segment,
@@ -583,6 +620,18 @@ fn checkpoint_step(p: &mut Proc, resp: Response) {
             req
         }
         (Stage::Publishing(_, next), Response::Created) => {
+            w.stage = Stage::Confirming(next);
+            Request::LatestManifest
+        }
+        // GC had collected the id, and the publish landed below newer
+        // manifests: this writer is fenced.
+        (Stage::Confirming(_), Response::Latest(latest))
+            if latest != Some(w.manifest_id.next().0) =>
+        {
+            p.phase = Phase::Stopped;
+            return;
+        }
+        (Stage::Confirming(next), Response::Latest(_)) => {
             w.manifest_id = w.manifest_id.next();
             w.tail.prune(next.wal_applied, clock);
             w.manifest = Arc::new(*next);
@@ -602,6 +651,11 @@ fn checkpoint_step(p: &mut Proc, resp: Response) {
             p.arm(Timer::Checkpoint);
             return;
         }
+        // Published: only the check is retried.
+        (Stage::Confirming(next), Response::Failed) => {
+            w.stage = Stage::Confirming(next);
+            Request::LatestManifest
+        }
         (stage, resp) => unreachable!("{stage:?} got {resp:?}"),
     };
     p.send(Purpose::Checkpoint, req);
@@ -613,7 +667,7 @@ fn checkpoint_step(p: &mut Proc, resp: Response) {
 /// What a fresh reader sees for every key: the newest manifest's tree plus
 /// every log batch past its applied slot, up to the first empty one.
 pub fn visible(objects: &BTreeMap<Path, Vec<u8>>) -> Tree {
-    let Some((_, m)) = manifest_id(objects) else {
+    let Some(m) = latest_manifest(objects) else {
         return Tree::new();
     };
     let tree: Tree = m
@@ -697,8 +751,7 @@ pub enum Action {
     Crash {
         proc: usize,
     },
-    /// Deletes the log slots the newest manifest lets go, as if past the
-    /// retention.
+    /// Deletes what GC would, as if everything were past the retention.
     Gc,
 }
 
@@ -716,11 +769,34 @@ pub struct Checked {
     pub cfg: Config,
 }
 
-/// The log slots GC would delete now.
-fn collectable(cfg: &Config, store: &BTreeMap<Path, Vec<u8>>) -> Vec<WalSeq> {
-    let Some((_, m)) = manifest_id(store) else {
-        return Vec::new();
-    };
+/// What GC would delete now, as if every manifest were past the
+/// retention: manifests below the newest with the segments that died in
+/// them (strays alone), and log slots the newest collected one applied.
+fn collectable(cfg: &Config, store: &BTreeMap<Path, Vec<u8>>) -> Vec<Path> {
+    let manifests = manifests(store);
+    let pairs = manifests.windows(2).map(|w| {
+        let ((prev, pm), (cur, cm)) = (&w[0], &w[1]);
+        (
+            *prev,
+            cm,
+            gc::pair((*prev, pm), (*cur, cm), 0, Duration::ZERO),
+        )
+    });
+    let (gone, applied) = pairs.fold(
+        (Vec::new(), None),
+        |(mut gone, applied), (prev, cur, pair)| match pair {
+            Pair::Stray => {
+                gone.push(Path::Manifest(prev.0));
+                (gone, applied)
+            }
+            Pair::Collect => {
+                gone.extend(cur.dead.iter().map(|s| Path::Segment(*s)));
+                gone.push(Path::Manifest(prev.0));
+                (gone, Some(cur))
+            }
+            Pair::Keep => unreachable!("everything is past the retention"),
+        },
+    );
     let stored: Vec<WalSeq> = store
         .keys()
         .filter_map(|p| match p {
@@ -728,10 +804,17 @@ fn collectable(cfg: &Config, store: &BTreeMap<Path, Vec<u8>>) -> Vec<WalSeq> {
             _ => None,
         })
         .collect();
-    match cfg.broken {
-        Some(Rule::KeepFences) => stored.into_iter().filter(|s| *s <= m.wal_applied).collect(),
-        Some(Rule::Fence | Rule::LastTs) | None => deletable_wals(&stored, &m).collect(),
-    }
+    let wals: Vec<WalSeq> = match (applied, cfg.broken) {
+        (None, _) => Vec::new(),
+        (Some(m), Some(Rule::KeepFences)) => {
+            stored.into_iter().filter(|s| *s <= m.wal_applied).collect()
+        }
+        (Some(m), Some(Rule::Fence | Rule::LastTs) | None) => deletable_wals(&stored, m).collect(),
+    };
+    gone.into_iter()
+        .chain(wals.into_iter().map(Path::Log))
+        .filter(|p| store.contains_key(p))
+        .collect()
 }
 
 /// Every acknowledged write is visible or superseded.
@@ -776,6 +859,15 @@ fn a_tombstone_gets_dropped(_: &Checked, s: &Sys) -> bool {
 }
 
 /// A writer got fenced after acknowledging writes.
+/// Non-vacuity: a process stalled past the retention puts a manifest into
+/// an id GC collected.
+fn a_stray_manifest_lands(_: &Checked, s: &Sys) -> bool {
+    manifests(&s.store).windows(2).any(|w| {
+        let ((prev, pm), (cur, cm)) = (&w[0], &w[1]);
+        gc::pair((*prev, pm), (*cur, cm), 0, Duration::ZERO) == Pair::Stray
+    })
+}
+
 fn a_writer_gets_fenced(_: &Checked, s: &Sys) -> bool {
     s.procs
         .iter()
@@ -789,7 +881,7 @@ impl Model for Checked {
     fn init_states(&self) -> Vec<Sys> {
         vec![Sys {
             store: BTreeMap::new(),
-            procs: (0..self.cfg.scripts.len()).map(|_| start()).collect(),
+            procs: (0..self.cfg.scripts.len()).map(start).collect(),
             faults: 0,
         }]
     }
@@ -867,8 +959,8 @@ impl Model for Checked {
             }
             Action::Gc => collectable(&self.cfg, &s.store)
                 .into_iter()
-                .for_each(|seq| {
-                    s.store.remove(&Path::Log(seq));
+                .for_each(|path| {
+                    s.store.remove(&path);
                 }),
         }
         Some(s)
@@ -884,6 +976,7 @@ impl Model for Checked {
             Property::always("log order is timestamp order", log_order_is_timestamp_order),
             Property::sometimes("a tombstone gets dropped", a_tombstone_gets_dropped),
             Property::sometimes("a writer gets fenced", a_writer_gets_fenced),
+            Property::sometimes("a stray manifest lands", a_stray_manifest_lands),
         ]
     }
 }

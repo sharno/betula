@@ -16,6 +16,7 @@
 //! anything the new writer doesn't have.
 
 use std::collections::BTreeMap;
+use std::hash::{BuildHasher, RandomState};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -44,7 +45,9 @@ use crate::settings::{Gc, Settings};
 use crate::snapshot::DbIterator;
 use crate::store::{RequestStats, Store};
 use crate::tree::{self, TreeShape};
-use crate::types::{Epoch, KeyRange, ManifestId, Msg, SegmentId, TreeRoot, Version, WalSeq};
+use crate::types::{
+    Epoch, KeyRange, ManifestId, Msg, SegmentId, TreeRoot, Version, WalSeq, WriterId,
+};
 use crate::wal::{self, WalWrite};
 use std::ops::RangeBounds;
 
@@ -298,8 +301,13 @@ impl Shared {
         let next_id = view.manifest_id.next();
         match manifest::publish(self.store(), next_id, &next).await? {
             // A checkpoint's manifest names its writer's epoch, so a match
-            // is our own attempt whose response was lost.
-            Publish::Published | Publish::Matched => {
+            // is our own attempt whose response was lost. A writer stalled
+            // past the GC retention may have put it into an id GC
+            // collected: a newer manifest is then listed, and this one is a
+            // stray GC deletes.
+            Publish::Published | Publish::Matched
+                if !self.store().manifest_above(next_id).await? =>
+            {
                 let bytes_of = |id: SegmentId| {
                     new.iter()
                         .find(|(s, _, _)| *s == id)
@@ -348,18 +356,21 @@ impl Shared {
                     false => Left::Nothing,
                 })
             }
-            Publish::Conflict => Err(self.fail(Error::Fenced)),
+            Publish::Published | Publish::Matched | Publish::Conflict => {
+                Err(self.fail(Error::Fenced))
+            }
         }
     }
 
     /// Fails with `Fenced` if a newer writer published a manifest.
     async fn check_fenced(&self) -> Result<()> {
-        let next = self.view.read().manifest_id.next();
-        match manifest::load(self.store(), next).await? {
-            // Our own checkpoint may have published it since the read.
-            Some(m) if m.writer_epoch == self.epoch => Ok(()),
-            Some(_) => Err(self.fail(Error::Fenced)),
-            None => Ok(()),
+        // Held so our own checkpoint can't publish between the read and
+        // the listing.
+        let _checkpointing = self.checkpointing.lock().await;
+        let id = self.view.read().manifest_id;
+        match self.store().manifest_above(id).await? {
+            true => Err(self.fail(Error::Fenced)),
+            false => Ok(()),
         }
     }
 }
@@ -405,20 +416,32 @@ impl DbBuilder {
     }
 }
 
-/// Publishes the next manifest with the next writer epoch. A concurrent
-/// opener that publishes first just means trying again on top of it: the
-/// last writer to open wins.
-async fn claim(store: &Store, now_ms: u64) -> Result<(ManifestId, Manifest)> {
+/// Publishes the next manifest with the next writer epoch, for opening
+/// `writer`. A concurrent opener that publishes first just means trying
+/// again on top of it: the last writer to open wins.
+async fn claim(store: &Store, writer: WriterId, now_ms: u64) -> Result<(ManifestId, Manifest)> {
     loop {
         let (id, current) = manifest::load_latest(store)
             .await?
             .unwrap_or_else(|| (ManifestId(0), Manifest::initial(now_ms)));
-        let next = current.claimed(now_ms);
-        // Two openers in the same millisecond claim identical manifests, so
-        // a match may be someone else's: only a fresh put is ours.
+        let next = current.claimed(writer, now_ms);
         match manifest::publish(store, id.next(), &next).await? {
-            Publish::Published => return Ok((id.next(), next)),
-            Publish::Matched | Publish::Conflict => {}
+            // The claim names this opening, so a match is our own put whose
+            // response was lost. A newer manifest listed above it means
+            // this opening lost: a newer opener claimed past it, or it
+            // stalled past the GC retention and put its claim into an id
+            // GC collected (a stray GC deletes). Claiming again instead
+            // would let two openers supersede each other forever.
+            Publish::Published | Publish::Matched => {
+                return match store.manifest_above(id.next()).await? {
+                    false => Ok((id.next(), next)),
+                    true => {
+                        tracing::info!(epoch = next.writer_epoch.0, "superseded while claiming");
+                        Err(Error::Fenced)
+                    }
+                };
+            }
+            Publish::Conflict => {}
         }
     }
 }
@@ -452,10 +475,13 @@ async fn fence_log(
                 // fencing it may have been overtaken: a newer writer
                 // applied that slot and GC deleted it, so the fence landed
                 // where no reader looks. A newer writer claims a later
-                // manifest; any that exists now means this one is out.
-                return match manifest::load(store, claimed.next()).await? {
-                    Some(newer) => Err(superseded(Superseded(newer.writer_epoch))),
-                    None => Ok(fenced),
+                // manifest; any listed now means this one is out.
+                return match store.manifest_above(claimed).await? {
+                    true => {
+                        tracing::info!(epoch = epoch.0, "superseded while fencing");
+                        Err(Error::Fenced)
+                    }
+                    false => Ok(fenced),
                 };
             }
             AfterPlace::More(r) => r,
@@ -493,7 +519,10 @@ impl Db {
         clock: Arc<dyn Clock>,
     ) -> Result<Self> {
         let store = Store::new(os, path, cfg.hedge);
-        let (manifest_id, claimed) = claim(&store, clock.now_ms()).await?;
+        // Random per opening (std's per-process random keys): openers on
+        // the same manifest share an epoch, and GC tells them apart by this.
+        let writer = WriterId(RandomState::new().hash_one(clock.now_ms()));
+        let (manifest_id, claimed) = claim(&store, writer, clock.now_ms()).await?;
         let epoch = claimed.writer_epoch;
         delete_orphans(&store, claimed.segment_watermark, epoch).await?;
         let Fenced { read, fence } =

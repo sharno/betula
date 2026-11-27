@@ -154,9 +154,19 @@ writer ─► wal/{seq} ─► checkpoint: fold a prefix into tree COW ─► se
   put-if-absent, in the first empty slot. Every batch an older writer made
   durable is before the fence, and gets replayed; its next put lands on the
   fence and fails unacknowledged. Its next checkpoint finds the manifest id
-  taken and stops it too. Last, the opener checks that no newer writer
-  claimed a manifest meanwhile: one stalled long enough could otherwise fence
-  a slot GC already cleared.
+  taken and stops it too. Last, the opener checks that no newer manifest is
+  listed: one stalled long enough could otherwise fence a slot GC already
+  cleared.
+- **Stalls past the GC retention.** A claim or checkpoint can put its
+  manifest into an id GC already collected. So after each put the writer
+  lists manifests, and any newer one means it is out: it stops as fenced
+  (`WriterLost`), an opener too. Claiming again instead would let two
+  openers supersede each other forever. Each opening draws a random writer id,
+  and each manifest names the one that published its parent; GC deletes
+  manifests in id order. A stray then sits below every published manifest,
+  and the one above names another parent, so GC deletes the stray without
+  acting on its dead segments. Epochs can't tell them apart: two openers
+  on the same manifest take the same epoch.
 - **One log.** Each write gets a hybrid clock timestamp (physical ms, logical
   counter) and goes to the next log slot (`wal/{seq}`). A write is
   acknowledged once its slot is durable, and readable on the writer right
@@ -219,7 +229,7 @@ writer ─► wal/{seq} ─► checkpoint: fold a prefix into tree COW ─► se
 - **GC.** Once a manifest is past retention, GC deletes the segments that died
   in it, the previous manifest, and log slots the manifest already applied,
   except fences. A fence stays so that a fenced writer's put, however
-  delayed, still finds it.
+  delayed, still finds it. Manifests go one at a time, oldest first.
 
 ## Guarantees and limits
 
@@ -239,9 +249,8 @@ writer ─► wal/{seq} ─► checkpoint: fold a prefix into tree COW ─► se
   overwrites of one key apply backpressure too. `close()` skips it to make
   queued writes durable.
 - Fences stay forever: a few bytes per writer ever opened.
-- A writer stalled past the GC retention mid-checkpoint (between planning
-  and publishing) is assumed not to happen, as for readers: the manifest id
-  it publishes to may have been collected.
+- A writer stalled past the GC retention stops when it next publishes, and
+  an opener stalled past it fails with `WriterLost`. The segments its stray checkpoint uploaded leak.
 - No merging of underfull leaves (only empty ones are removed), so heavy
   deletes leave sparse leaves until rewritten (see the roadmap).
 - Store requests retry transient failures with capped backoff (8 attempts,
@@ -286,8 +295,9 @@ See [`spec/README.md`](spec/README.md):
   rule is shown necessary by a counterexample);
 - a Stateright model (`crates/sidra-model`) that drives the crate's own
   protocol state machines (opening and fencing, the log, partial
-  checkpoints, log GC) through every interleaving of two writers, with
-  lost requests and responses and crashes. Each rule (fence, kept fences,
+  checkpoints, GC of manifests and the log) through every interleaving of
+  two writers, with lost requests and responses, crashes, and requests
+  that land after GC collected what they were based on. Each rule (fence, kept fences,
   `last_ts`) turned off fails a property; `tests/trace.rs` replays each
   scenario;
 - Kani bounded proofs of the core functions;
@@ -306,7 +316,9 @@ See [`spec/README.md`](spec/README.md):
   `PROPTEST_CASES=100000 cargo test --release -p sidra --test model
   simulation`.
 - targeted tests: a fenced writer's in-flight log write fails, also after GC
-  collected the log around its fence; concurrent writes on one key under
+  collected the log around its fence; a checkpoint or claim stalled past
+  the GC retention lands as a stray that GC deletes, and the live tree stays
+  whole; concurrent writes on one key under
   one-batch partial checkpoints end with the newest; an overload simulation
   where writes outpace checkpoints on a slow store stall rather than fail.
 

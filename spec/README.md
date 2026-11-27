@@ -10,26 +10,39 @@ Two layers:
 
 ## Protocol model (TLA+)
 
-The model covers one key, a WAL of put-if-absent slots, the latest manifest
-(`writer_epoch`, tree, `last_ts`, `wal_applied`, `fences`), and writers.
+The model covers one key, a WAL of put-if-absent slots, manifests by id
+(`writer_epoch`, `writer`, `parent`, tree, `last_ts`, `wal_applied`, `fences`),
+and writers. The latest manifest is the highest id present.
 
 A writer is a small state machine: `idle` -> `reading` -> `placing` -> `open`,
 or `dead` (fenced or superseded).
-- **Claim**: publish the next manifest with epoch + 1. A conflict retries, so
-  the model takes the step whole.
+- **ClaimRead / ClaimPut**: read the latest manifest, then put the next one
+  (epoch + 1, a fresh `writer` id, `parent` = the copied manifest's `writer`)
+  put-if-absent. A conflict
+  retries. The put comes later than the read: if GC collected the id, it
+  succeeds below the latest, a stray. The opener then lists; any id above its
+  own (a newer opener's claim, or manifests past a stray) stops it. Retrying
+  instead lets two openers supersede each other forever.
 - **Read / Place**: read the WAL forward from `wal_applied + 1`, replaying
   batches. Put `Fence(epoch)` in the first empty slot. A slot taken since the
   read is read on from. A newer fence supersedes the writer. The put comes
-  later than the read, so the slot may have changed.
+  later than the read, so the slot may have changed. After the fence, any
+  manifest id above the claimed one means stop.
 - **Stamp / Land**: stamp one batch (hybrid clock over replayed timestamps and
   `last_ts`, any clock reading), then put it at the next slot. The puts are
   apart, so one can land after a newer fence and after GC. A taken slot means
   fenced: no ack, the writer stops.
 - **Plan / Publish**: take a prefix of the unapplied tail, apply it (leaves
-  drop tombstones), publish manifest id + 1 put-if-absent with `wal_applied`
-  at the end of the prefix, the fences in it, and `last_ts`. A conflict means
-  fenced.
-- **Gc**: delete WAL slots at or below `wal_applied`, except fences.
+  drop tombstones), put manifest id + 1 put-if-absent with `wal_applied`
+  at the end of the prefix, the fences in it, `last_ts`, and `writer` = `parent`
+  = its own id. A conflict means fenced. If GC collected that id since the
+  plan, the put succeeds (a stray). The writer lists after the put; any id
+  above its own means it stops and does not install the manifest.
+- **Gc**: list manifests in ascending order, take the lowest pair (prev, cur).
+  The newest is never deleted. If `cur.id = prev.id + 1` and
+  `cur.parent = prev.writer`, delete prev and the WAL slots at or below
+  `cur.wal_applied`, except fences. Otherwise prev is a stray: only prev goes.
+  The model treats everything as past retention.
 - Readers: latest manifest, then the WAL from `wal_applied + 1` to the first
   empty slot, skipping fences.
 
@@ -45,14 +58,16 @@ so the invariants catch these mistakes:
 
 | Config | What it checks | Result |
 |---|---|---|
-| `Sidra.cfg` | none disabled, 2 writers | pass, 663k distinct states, 4 s |
-| `Sidra3.cfg` | none disabled, 3 writers | pass, 6.8M distinct states, 36 s |
-| `BugGcFences.cfg` | GC deletes fences: a delayed put lands in a deleted slot | `Correct`, 15 steps |
-| `BugUnfenced.cfg` | the new writer places no fence: an old put lands after the replay | `WriterSees`, 7 steps |
+| `Sidra.cfg` | none disabled, 2 writers | pass, 6.6M distinct states, 51 s |
+| `Sidra3.cfg` | none disabled, 3 writers | pass, 30.2M distinct states, 241 s |
+| `BugGcFences.cfg` | GC deletes fences: a delayed put lands in a deleted slot | `Correct`, 18 steps |
+| `BugUnfenced.cfg` | the new writer places no fence: an old put lands after the replay | `WriterSees`, 8 steps |
 | `BugPartial.cfg` | a partial checkpoint sets `wal_applied` past what it applied | `Correct`, 10 steps |
-| `BugClock.cfg` | the new writer ignores `last_ts` | `Monotone`, 13 steps |
-| `BugOverwrite.cfg` | a checkpoint overwrites the manifest instead of put-if-absent | `NoZombieAck`, 15 steps |
-| `GapStalledFence.cfg` | no check after the fence, 3 writers | `Correct`, 23 steps |
+| `BugClock.cfg` | the new writer ignores `last_ts` | `Monotone`, 14 steps |
+| `BugOverwrite.cfg` | a checkpoint overwrites the manifest instead of put-if-absent | `WriterSees`, 16 steps |
+| `BugParentEpoch.cfg` | a manifest's parent is a writer epoch, not a unique id, 3 writers | `Correct`, 25 steps |
+| `BugConfirmPublish.cfg` | no list after a claim or checkpoint put, 2 writers | `NoZombieAck`, 22 steps |
+| `GapStalledFence.cfg` | no check after the fence, 3 writers | `Correct`, 28 steps |
 
 `GapStalledFence` turns off `CheckAfterFence`: after its fence put, the
 opener looks for manifest id + 1 and stops if it exists. Without it, an
@@ -60,6 +75,16 @@ opener reads an empty slot, then stalls past GC retention. Meanwhile an older wr
 a third writer replays and checkpoints past it, and GC deletes it. The
 opener's fence put then lands in the deleted slot, and its later puts land in
 deleted slots: acknowledged, below a newer fence.
+
+`BugParentEpoch` sets `ParentId = "epoch"`. Epochs are not unique: two openers
+that read the same latest manifest both take epoch + 1. One wins id 1, the
+other stalls. GC collects the low ids. The stalled claim and a stalled
+checkpoint by the first writer land in the collected ids 1 and 2: consecutive,
+and the second names epoch 1 as its parent. GC takes the two strays for a
+chain and deletes WAL slots up to the stray checkpoint's `wal_applied`, past the
+latest manifest's. An acknowledged write is lost. With `ParentId = "writer"`
+each open draws a fresh id (bounded by `MaxOpens`: 5 for two writers, 3 for three, to keep the state space small), so a stray's
+successor never names it.
 
 Partial checkpoints are safe because a checkpoint takes a prefix in slot
 order, and timestamps increase in slot order. Every version left in the WAL is
@@ -103,7 +128,7 @@ cd crates/sidra && cargo kani
   invariant in the proptest.
 - One key. The tree is one version; leaf tombstone drops are modelled, the
   buffer levels are not.
-- Time is not modelled: GC retention, manifest GC, and a writer stalled past
-  retention at a checkpoint publish (its put-if-absent target manifest could
-  be deleted).
+- Time is not modelled: GC retention is "everything is past it". A stall is
+  any gap between a read and its put. The list after a manifest put is atomic
+  with the put.
 - One put in flight per writer; no queue of stamped batches.

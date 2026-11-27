@@ -17,6 +17,13 @@ impl Epoch {
     }
 }
 
+/// One opening of a writer, drawn at random. Epochs don't tell openings
+/// apart: two openers that read the same manifest both take its epoch + 1,
+/// and only one claim is published, but the other's can still land later
+/// in an id GC collected.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct WriterId(pub u64);
+
 /// A checkpoint's output object. The epoch prefix keeps ids unique across
 /// writer generations, and lets a new writer find a crashed writer's orphans
 /// with one ordered listing.

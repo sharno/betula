@@ -5,14 +5,16 @@
 //! Once `m[i]` is older than the retention, nobody may still be reading
 //! `m[i-1]` (readers must refresh within the retention), so `m[i]`'s dead
 //! segments, `m[i-1]` itself, and log slots already folded into `m[i]` can
-//! go. The latest manifest and log fences are never deleted.
+//! go. The latest manifest and log fences are never deleted. Manifests a
+//! stalled writer put into collected ids go at once (see `protocol::gc`).
 
 use std::time::Duration;
 
 use crate::error::Result;
 use crate::manifest::{self, Manifest};
-use crate::protocol;
+use crate::protocol::{self, gc::Pair};
 use crate::store::{Pace, Store};
+use crate::types::ManifestId;
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -61,17 +63,23 @@ pub async fn run(store: &Store, now_ms: u64, retention: Duration, speed: Speed) 
     let mut segments = Vec::new();
     let mut manifests = Vec::new();
     let mut applied: Option<Manifest> = None;
-    for pair in ids.windows(2) {
-        let (prev, cur) = (pair[0], pair[1]);
-        let Some(m) = manifest::load(store, cur).await? else {
+    let mut prev: Option<(ManifestId, Manifest)> = None;
+    for id in ids {
+        let Some(cur) = manifest::load(store, id).await? else {
             break;
         };
-        if !protocol::gc::supersedes_collectably(&m, now_ms, retention) {
-            break;
+        if let Some((prev_id, prev)) = &prev {
+            match protocol::gc::pair((*prev_id, prev), (id, &cur), now_ms, retention) {
+                Pair::Stray => manifests.push(*prev_id),
+                Pair::Collect => {
+                    segments.extend(cur.dead.iter().map(|id| store.segment_path(*id)));
+                    manifests.push(*prev_id);
+                    applied = Some(cur.clone());
+                }
+                Pair::Keep => break,
+            }
         }
-        segments.extend(m.dead.iter().map(|id| store.segment_path(*id)));
-        manifests.push(store.manifest_path(prev));
-        applied = Some(m);
+        prev = Some((id, cur));
     }
     let wals: Vec<_> = match &applied {
         Some(m) => protocol::gc::deletable_wals(&store.list_wals().await?, m)
@@ -84,15 +92,23 @@ pub async fn run(store: &Store, now_ms: u64, retention: Duration, speed: Speed) 
         segments: segments.len(),
         wals: wals.len(),
     };
-    // Manifests go last, so a crash mid-way leaves them to retry the run.
-    let paths: Vec<_> = segments.into_iter().chain(wals).chain(manifests).collect();
     let pace = match speed {
         Speed::Full => Pace::Unlimited,
         Speed::Spread { over, max_per_sec } => {
-            let needed = (paths.len() as f64 / over.as_secs_f64().max(1.0)).ceil() as u32;
+            let total = segments.len() + wals.len();
+            let needed = (total as f64 / over.as_secs_f64().max(1.0)).ceil() as u32;
             Pace::PerSecond(needed.clamp(1, max_per_sec.max(1)))
         }
     };
-    store.delete_paced(paths, pace).await?;
+    store
+        .delete_paced(segments.into_iter().chain(wals).collect(), pace)
+        .await?;
+    // Manifests go last, so a crash mid-way leaves them to retry the run,
+    // and in order, one at a time: an id is gone only once every id below
+    // it is. A stalled writer's put can then land in a collected id only
+    // below every published manifest, where GC sees it as a stray.
+    for id in manifests {
+        store.delete_all(vec![store.manifest_path(id)]).await?;
+    }
     Ok(stats)
 }

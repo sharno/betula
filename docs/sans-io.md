@@ -22,8 +22,8 @@ are different `now` values per process.
 - **`fence`** (typed transitions): opening a writer after it claimed the next
   epoch. `Reading` reads the log forward from the applied slot; at the first
   empty slot it becomes `Placing`, which puts the fence. A taken slot reads
-  on; a newer writer's fence is `Superseded`. The driver then checks for a
-  newer manifest.
+  on; a newer writer's fence is `Superseded`. The driver then checks that
+  no newer manifest is listed.
 - **`log`** (hot path): batching, slot numbers, put-if-absent,
   acknowledgement, fenced or unknown outcomes, backpressure input.
 - **`tail`**: unapplied batches and fences past the manifest, as the writer
@@ -31,24 +31,33 @@ are different `now` values per process.
   slot; `Tail::take` picks a checkpoint's prefix.
 - **`checkpoint`**: whether one is due, what it applies (`plan`), and the
   manifest it publishes (`next_manifest`).
-- **`gc`**: which manifests, segments and log slots may go.
+- **`gc`**: which manifests, segments and log slots may go, and which
+  manifests are strays: put by a writer stalled past the retention into an
+  id GC collected.
 
 ## Stateright model
 
 - Processes each open a writer (fencing the previous one), write a script,
   and checkpoint; one actor is the store (put-if-absent, lost requests and
-  responses); processes crash; GC deletes applied log slots.
+  responses); processes crash; GC deletes old manifests, their dead
+  segments and applied log slots, as if all were past the retention. A
+  request in flight across a GC is a process stalled past the retention.
 - The data plane is abstract: a checkpoint's tree is one key→version map that,
   like a leaf, keeps no tombstones.
 - A store request and its response run as one step (a sound partial-order
   reduction: handling a response touches only the requester's state).
 - Properties: acknowledged and durable writes stay visible to a fresh reader;
-  log order is timestamp order; a tombstone gets dropped and a writer gets
-  fenced (non-vacuity).
-- Exhaustive search of the two-writer scenario: 3.4M states in 11 s, 82.6M
-  with one fault in 6 min (`--ignored`). Turning off a rule (the fence, kept
+  log order is timestamp order; a tombstone gets dropped, a writer gets
+  fenced, and a stray manifest lands (non-vacuity).
+- The model's tree is one segment per checkpoint, so it can't show what a
+  stray does to shared segments or orphans; the library tests do.
+- Exhaustive search of the two-writer scenario: 8.1M states in 15 s, 158M
+  with one fault in 46 min (`--ignored`). Turning off a rule (the fence, kept
   fences, `last_ts`) fails a property within a second; `tests/trace.rs`
   replays each scenario.
 - It found that two openers in the same millisecond could claim
   byte-identical manifests and each take the other's as its own retried
-  claim. A claim now counts only a fresh put as its own.
+  claim. A claim now names its opening's random writer id.
+- It found that an opener retrying when a newer manifest is listed after
+  its claim can be superseded forever by another doing the same (the search
+  never ended). Such an opener now stops.

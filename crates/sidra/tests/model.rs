@@ -992,6 +992,93 @@ async fn fences_survive_gc() {
     assert_eq!(b.get("k").await.unwrap(), None);
 }
 
+/// Writes and checkpoints on `db` while the clock moves past a 60 s
+/// retention, then collects.
+async fn churn_and_collect(db: &Db, clock: &ManualClock) -> sidra::GcStats {
+    for step in 0..3u32 {
+        clock.advance(Duration::from_secs(120));
+        db.put(format!("z{step}"), "v").await.unwrap();
+        db.checkpoint().await.unwrap();
+    }
+    db.run_gc(Duration::from_secs(60)).await.unwrap()
+}
+
+/// A writer stalls past the GC retention with its checkpoint's manifest in
+/// flight, so the put lands in an id GC already collected. The writer finds
+/// a newer manifest listed and stops; GC deletes the stray without acting
+/// on its dead segments.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkpoint_stalled_past_gc_retention_is_a_stray() {
+    let faulty = Arc::new(Faulty::new(Arc::new(InMemory::new()), Faults::NONE, 0));
+    let os: Arc<dyn ObjectStore> = faulty.clone();
+    let clock = ManualClock::new();
+    let a = Arc::new(open(&os, &clock).await);
+    a.put("k", "a").await.unwrap();
+    let publish = faulty.hold_puts(|p| p.ends_with(".mf"), 1);
+    let pending = tokio::spawn({
+        let a = a.clone();
+        async move { a.checkpoint().await }
+    });
+    wait_until("manifest put in flight", || publish.arrived() == 1).await;
+    let b = open(&os, &clock).await;
+    let stats = churn_and_collect(&b, &clock).await;
+    assert!(stats.manifests >= 2, "{stats:?}");
+    publish.release();
+    assert!(matches!(pending.await.unwrap(), Err(Error::Fenced)));
+    let stray = objects(&os, "manifest").await;
+    let stats = b.run_gc(Duration::from_secs(60)).await.unwrap();
+    assert_eq!(stats.manifests, 1, "{stats:?}");
+    assert_eq!(objects(&os, "manifest").await, stray - 1);
+    assert_eq!(b.get("k").await.unwrap().as_deref(), Some(&b"a"[..]));
+    assert_accounting(&b).await;
+}
+
+/// An opener stalls past the GC retention with its claim in flight, so the
+/// claim lands in an id GC already collected. It finds a newer manifest
+/// listed and fails as fenced, instead of opening on the old tree and
+/// deleting the live writer's segments as orphans. The live writer goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_opener_stalled_past_gc_retention_is_fenced() {
+    let faulty = Arc::new(Faulty::new(Arc::new(InMemory::new()), Faults::NONE, 0));
+    let os: Arc<dyn ObjectStore> = faulty.clone();
+    let clock = ManualClock::new();
+    let a = open(&os, &clock).await;
+    a.put("k", "a").await.unwrap();
+    a.checkpoint().await.unwrap();
+    let claim = faulty.hold_puts(|p| p.ends_with(".mf"), 1);
+    let opening = tokio::spawn({
+        let (os, clock) = (os.clone(), clock.clone());
+        async move {
+            Db::builder(ROOT, os)
+                .with_settings(tiny_config())
+                .with_clock(clock)
+                .build()
+                .await
+        }
+    });
+    wait_until("claim in flight", || claim.arrived() == 1).await;
+    let stats = churn_and_collect(&a, &clock).await;
+    assert!(stats.manifests >= 2, "{stats:?}");
+    claim.release();
+    assert!(matches!(opening.await.unwrap(), Err(Error::Fenced)));
+    a.put("late", "a").await.unwrap();
+    let c = open(&os, &clock).await;
+    for (k, v) in [
+        ("k", "a"),
+        ("z0", "v"),
+        ("z1", "v"),
+        ("z2", "v"),
+        ("late", "a"),
+    ] {
+        assert_eq!(
+            c.get(k).await.unwrap().as_deref(),
+            Some(v.as_bytes()),
+            "{k}"
+        );
+    }
+    assert_accounting(&c).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tombstones_go_once_they_reach_leaves() {
     let os: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

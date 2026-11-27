@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 
 # everystate exits non-zero on a violation; the JSON status says which.
 run() {
-  { everystate -workers auto -json -config "$1.cfg" Sidra.tla || true; } | tail -1
+  { everystate -workers "${WORKERS:-auto}" -json -config "$1.cfg" Sidra.tla || true; } | tail -1
 }
 
 status() {
@@ -22,7 +22,7 @@ check() {
 }
 
 for cfg in Sidra Sidra3; do check "$cfg" ok; done
-for cfg in GapStalledFence BugGcFences BugUnfenced BugPartial BugClock BugOverwrite; do
+for cfg in GapStalledFence BugConfirmPublish BugParentEpoch BugGcFences BugUnfenced BugPartial BugClock BugOverwrite; do
   check "$cfg" invariant
 done
 exit $fail

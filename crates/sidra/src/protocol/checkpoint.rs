@@ -60,7 +60,8 @@ pub struct Applied {
     pub segment_watermark: SegmentId,
 }
 
-/// The manifest a checkpoint by writer `epoch` publishes after `prev`.
+/// The manifest a checkpoint by writer `epoch` publishes after `prev`, its
+/// writer's own manifest.
 pub fn next_manifest(
     prev: &Manifest,
     epoch: Epoch,
@@ -70,6 +71,8 @@ pub fn next_manifest(
 ) -> Manifest {
     Manifest {
         writer_epoch: epoch,
+        writer: prev.writer,
+        parent: prev.writer,
         tree: done.tree,
         last_ts: taken
             .iter()

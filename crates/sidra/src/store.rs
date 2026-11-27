@@ -333,6 +333,17 @@ impl Store {
         Ok(ids)
     }
 
+    /// Whether any manifest id above `id` exists (a LIST starting past it).
+    pub async fn manifest_above(&self, id: ManifestId) -> Result<bool> {
+        let names = self
+            .list_names("manifest", Some(self.manifest_path(id)))
+            .await?;
+        Ok(names
+            .iter()
+            .filter_map(|n| parse_num(n, ".mf"))
+            .any(|n| n > id.0))
+    }
+
     pub async fn list_wals(&self) -> Result<Vec<WalSeq>> {
         let mut seqs: Vec<WalSeq> = self
             .list_names("wal", None)
