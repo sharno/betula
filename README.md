@@ -369,89 +369,96 @@ The meter counts multipart upload parts. Earlier versions of this table missed
 them, which undercounted SlateDB's SST writes; the older tables below carry
 that error in their SlateDB byte figures.
 
+Measured with one fenced writer (`31c2b33`); every number in a table comes
+from the same machine on the same day. The machine ran faster than for the
+earlier tables, so compare within a table, not across them.
+
 Current defaults, 1M keys × 256 B, 40 clients, then 15 minutes of mixed
 traffic (80% writes, 20% reads), no added latency. Random (incompressible)
 values:
 
 | | sidra | SlateDB 0.18 |
 |---|---|---|
-| mixed reads/s (p99 ms) | **1.15M (0.01)**, 0.95M–1.27M | 184k (0.69), swings 71k–311k |
-| mixed GETs | **59k** | 2.9M |
-| mixed writes keys/s | **10.2k** | 9.6k |
-| mixed write p99 / p99.9 ms | **150 / 203** | 242 / 304 |
-| MiB written, mixed | 9,702 | **6,796** |
-| load write p99 ms | 133 | **125** |
-| MiB written, load | 884 | **755** |
-| cold reads (50k): GETs, reads/s | **1.3k, 398k** | 37.6k, 19k |
+| mixed reads/s (p99 ms) | **1.41M (0.01)**, 1.02M–1.54M | 290k (0.42), swings 125k–435k |
+| mixed GETs | **39k** | 4.2M |
+| mixed writes keys/s | **10.1k** | 9.7k |
+| mixed write p99 / p99.9 ms | **171 / 231** | 231 / 276 |
+| MiB written, mixed | 9,234 | **6,857** |
+| load write p99 ms | 129 | **127** |
+| MiB written, load | 866 | **755** |
+| cold reads (50k): GETs, reads/s | **1.2k, 522k** | 37.6k, 36k |
 
 JSON-like values, LZ4 on for both engines, 5 minutes mixed:
 
 | | sidra | SlateDB 0.18 |
 |---|---|---|
-| mixed reads/s | **1.18M** | 207k |
-| MiB written, load | **253** | 260 |
-| MiB written, mixed | 927 | **774** |
-| footprint after run | 1,204 MiB | **1,066 MiB** |
+| mixed reads/s | **1.49M** | 296k |
+| mixed write p99 / p99.9 ms | 149 / 924 | **140 / 734** |
+| MiB written, load | **254** | 261 |
+| MiB written, mixed | 912 | **771** |
+| footprint after run | 1,183 MiB | **1,058 MiB** |
 
 SlateDB's compactor keeps rewriting SSTs under mixed traffic and doesn't
 cache its output, so its reads go back to the store.
 
 With compressible data the bytes-written gap narrows to about 1.2× under
 mixed traffic. Sidra's GC spreads each run's deletes over its interval: on
-RustFS, bursts of deletes pushed write p99 to 0.7–1.2 s.
+RustFS, bursts of deletes pushed write p99.9 to 0.7–1.2 s.
 
 Reads and scans with S3-like latency: 1M keys × 256 B, 256 KiB leaves,
 20 ms added to every request (`--latency 20ms`), 64 clients. Warm phases run
 after the warmup, cold ones right after a reopen. SlateDB scans cache their
 blocks like sidra caches leaves. No single SlateDB readahead setting wins
 every row: small fetches suit warm short scans and large ones suit cold
-scans. So each SlateDB scan cell is the best of three settings (read-ahead
-KiB / fetch tasks: 4/1, 64/4, 256/8), shown in brackets.
+scans. An earlier sweep of three settings (read-ahead KiB / fetch tasks:
+4/1, 64/4, 256/8) picked the best per row; each SlateDB scan cell is a
+rerun at that setting (both settings where the sweep was close), shown in
+brackets.
 
 | | sidra | SlateDB 0.18 |
 |---|---|---|
-| warm point reads/s | **831k** | 372k |
-| cold point reads (50k): GETs, reads/s | **1.3k, 81k** | 37.6k, 3.6k |
-| warm 100-key scans/s (p99 ms) | **66.6k** (5.0) | 53.2k (2.7) [4/1] |
-| cold 100-key scans/s (p99 ms) | **5.0k (49)** | 3.5k (85) [64/4] |
-| warm 1,000-key scans/s (p99 ms) | **6.8k (23)** | 5.0k (25) [64/4] |
-| cold 1,000-key scans/s (p99 ms) | **5.9k (71)** | 2.4k (99) [64/4] |
-| warm 10,000-key scans/s (p99 ms) | **662 (120)** | 550 (143) [256/8] |
-| cold 10,000-key scans/s (p99 ms) | **1.4k (166)** | 420 (340) [256/8] |
-| warm sparse scans/s, 90% deleted (p99 ms) | **112k (1.3)** | 3.5k (35) [64/4] |
-| cold sparse scans/s, 90% deleted (p99 ms) | **5.1k (84)** | 2.4k (136) [64/4] |
+| warm point reads/s | **1.15M** | 441k |
+| cold point reads (50k): GETs, reads/s | **1.3k, 92k** | 37.6k, 3.6k |
+| warm 100-key scans/s (p99 ms) | **79.4k** (5.2) | 51.1k (4.6) [4/1] |
+| cold 100-key scans/s (p99 ms) | **5.4k (46)** | 3.8k (70) [64/4] |
+| warm 1,000-key scans/s (p99 ms) | **8.0k (20)** | 6.9k (18) [64/4] |
+| cold 1,000-key scans/s (p99 ms) | **5.9k (70)** | 3.1k (94) [64/4] |
+| warm 10,000-key scans/s (p99 ms) | **824 (122)** | 711 (121) [256/8] |
+| cold 10,000-key scans/s (p99 ms) | **1.8k (149)** | 663 (231) [256/8] |
+| warm sparse scans/s, 90% deleted (p99 ms) | **80.1k (3.7)** | 19.0k (7.9) [64/4] |
+| cold sparse scans/s, 90% deleted (p99 ms) | **5.2k (47)** | 3.9k (87) [64/4] |
 
 The leaves fit in cache, so most cold scans hit leaves earlier scans
 loaded; p99 shows the scans that went to the store. Leaf readahead took
 sidra's cold 10,000-key scans from 538 to 1.4k/s. SlateDB's cold scans vary
-up to 2× between runs; the table keeps its best run.
+up to 2× between runs.
 
 With simulated S3 latency (`--latency s3`, see above) instead of a fixed
 20 ms; same setup, SlateDB scan settings picked the same way. Cold scans show
 p50 / p99 / p99.9 ms and scans/s, because one stall can set the length of a
-short phase. The middle column is sidra before hedged GETs (`--hedge off`):
+short phase. The middle column is sidra with hedged GETs off (`--hedge off`):
 
 | | sidra | sidra, no hedging | SlateDB 0.18 |
 |---|---|---|---|
-| warm point reads/s | **870k** | 895k | 323k |
-| cold point reads/s (p99 / p99.9 ms) | **70k (32 / 86)** | 60k (34 / 101) | 2.6k (122 / 281) |
-| warm 100-key scans/s | **65.5k** | 70.5k | 47.5k [4/1] |
-| cold 100-key scans | **0.24 / 107 / 139 (3.6k)** | 0.06 / 125 / 1,362 (1.1k) | 13 / 158 / 191 (2.1k) [256/8] |
-| warm 1,000-key scans/s | **6.6k** | 6.8k | 5.0k [64/4] |
-| cold 1,000-key scans | **0.13 / 130 / 167 (4.0k)** | 0.13 / 147 / 1,434 (1.2k) | 24 / 184 / 238 (2.0k) [256/8] |
-| warm 10,000-key scans/s | **662** | 669 | 505 [64/4] |
-| cold 10,000-key scans | **1.9 / 273 / 306 (1,055)** | 1.4 / 295 / 1,525 (293) | 138 / 419 / 2,163 (231) [256/8] |
-| warm sparse scans/s, 90% deleted | **107k** | 105k | 2.8k [4/1] |
-| cold sparse scans | **0.16 / 140 / 189 (3.8k)** | 0.17 / 153 / 278 (3.1k) | 34 / 271 / 590 (1.5k) [256/8] |
-| mixed reads/s, 40 clients, 5 min | **1.16M** | 1.18M | 1.7k |
-| mixed write p99 / p99.9 ms | **322 / 498** | 366 / 586 | 402 / 1,790 |
+| warm point reads/s | **971k** | 1.18M | 432k |
+| cold point reads/s (p99 / p99.9 ms) | **69k (32 / 87)** | 61k (33 / 102) | 2.6k (121 / 275) |
+| warm 100-key scans/s | **79.9k** | 78.4k | 53.1k [4/1] |
+| cold 100-key scans | **0.08 / 91 / 142 (3.8k)** | 0.04 / 133 / 1,375 (1.2k) | 6.9 / 138 / 188 (981) [256/8] |
+| warm 1,000-key scans/s | 8.3k | 8.4k | **8.4k** [64/4] |
+| cold 1,000-key scans | **0.10 / 118 / 195 (4.3k)** | 0.10 / 147 / 1,288 (1.2k) | 15 / 145 / 191 (2.9k) [256/8] |
+| warm 10,000-key scans/s | **818** | 826 | 769 [256/8] |
+| cold 10,000-key scans | **0.95 / 243 / 332 (994)** | 1.1 / 1,356 / 1,573 (292) | 83 / 315 / 2,138 (234) [256/8] |
+| warm sparse scans/s, 90% deleted | **78.2k** | 78.2k | 58.7k [4/1] |
+| cold sparse scans | **0.04 / 102 / 138 (3.7k)** | 0.04 / 125 / 209 (1.1k) | 7.4 / 146 / 242 (2.7k) [256/8] |
+| mixed reads/s, 40 clients, 5 min | **1.52M** | 1.50M | 1.6k |
+| mixed write p99 / p99.9 ms | 402 / **621** | 395 / 616 | **335** / 654 |
 
 Without hedging, a stalled GET held every scan waiting on the leaves in its
 batch, and a cold phase makes only about 1,000 GETs, so one stall set the
-phase's length. Hedging takes cold-scan p99.9 from 1.4–1.5 s to 139–306 ms
+phase's length. Hedging takes cold-scan p99.9 from 1.3–1.6 s to 138–332 ms
 and throughput up 3–4×, for 0–4% more GETs. Warm phases make no GETs, so
 their differences are run-to-run noise. SlateDB's mixed reads mostly miss
-its cache, so S3 latency takes them from 184k to 1.7k/s.
+its cache, so S3 latency takes them from 290k to 1.6k/s.
 
 Commands (SlateDB alone with `--engines slatedb --slatedb-read-ahead-kib N
 --slatedb-fetch-tasks N`):
@@ -506,8 +513,9 @@ loads every leaf it will rewrite in one parallel round (about 9 ms per leaf
 instead of 35). Once warm, writes can't outrun checkpoints: 37 MiB
 checkpoints in about a second, mostly upload.
 
-These tables were measured before the move to one fenced writer, with one
-writer; that path is unchanged.
+With one fenced writer, after the GC retention fix (one LIST after each
+checkpoint publish): acked 27.0 MiB/s, write p50 / p99 / p99.9 305 / 712 /
+3,144 ms, peak unapplied 129 MiB.
 
 ```sh
 sidra-bench $B --latency s3 --scans 200 --reads 5000 --ingest-secs 120 --ingest-concurrency 1024
